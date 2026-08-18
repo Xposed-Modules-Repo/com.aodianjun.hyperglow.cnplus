@@ -229,7 +229,8 @@ class AodStateProjectorTest {
         assertEquals("hello world", out.original)
         assertEquals("roma", out.romanized)
         assertEquals("tr", out.translated)
-        assertTrue(out.lineLevelSync) // 活动行 LINE 模式开启行级同步
+        // LINE 有活动行 → 保持行级同步(整行扫光)；无真实词级数据时不合成，words 为空
+        assertTrue(out.lineLevelSync)
         assertEquals(1_000L, out.lineStartMs)
         assertEquals(3_000L, out.lineEndMs)
         assertTrue(out.alignedRight)
@@ -253,9 +254,9 @@ class AodStateProjectorTest {
             lineEndMs = 2_000L
         )
         val out = project(s)
-        // 有活动歌词行时显示歌词,words 保留
+        // 有活动歌词行时显示歌词;words 透传供"当前词微光"叠加,行级同步保持水平扫光
         assertEquals("hello", out.original)
-        assertFalse(out.lineLevelSync) // SYLLABLE 且有 words → 音节级同步
+        assertTrue(out.lineLevelSync) // 行级同步(整行水平扫光)
         assertEquals(2, out.words.size)
     }
 
@@ -492,6 +493,59 @@ class AodStateProjectorTest {
         val none = state(lyricKind = LyricKind.NONE, hasTimedLyrics = false, line = "", lineIndex = -1)
         // "♪" 非空 → visible=true
         assertTrue(project(none).visible)
+    }
+
+    // --- 集成：LINE 无 words 时仅整行扫光（不合成逐字）；有真实 words 时透传叠加 ---
+
+    @Test
+    fun lineKind_withoutWords_pureScanLight_noWordOverlay() {
+        // 普通 LRC（lyricinfo 源）只有行级时间、无词级数据 → words 为空，纯整行扫光，
+        // 不合成逐字；lineLevelSync 保持 true 以保留扫光发光
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "hello world",
+            lineIndex = 0,
+            words = null,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_400L
+        )
+        val out = project(s)
+        assertEquals("hello world", out.original)
+        assertTrue(out.lineLevelSync) // LINE 保持行级同步(整行扫光)
+        assertTrue(out.words.isEmpty()) // 无真实词级数据 → 不合成
+    }
+
+    @Test
+    fun lineKind_existingWords_passedThroughWithLineLevelSync() {
+        // 真实词级数据透传供"当前词微光"叠加，同时保持行级同步(整行水平扫光)
+        val words = listOf(LyricWord("hello", "", 1_000L, 1_500L, false))
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "hello world",
+            lineIndex = 0,
+            words = words,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_400L
+        )
+        val out = project(s)
+        assertEquals(1, out.words.size) // words 透传
+        assertEquals("hello", out.words[0].text)
+        assertTrue(out.lineLevelSync) // 行级同步(整行水平扫光)
+    }
+
+    @Test
+    fun lineKind_noActiveLine_wordsEmpty() {
+        // 无活动行（lineIndex=-1）→ 无歌词，words 保持为空
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "hello world",
+            lineIndex = -1,
+            words = null,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_400L
+        )
+        val out = project(s)
+        assertTrue(out.words.isEmpty())
     }
 
     // --- shouldKeepAodAliveFor 顶层函数 ---

@@ -140,16 +140,18 @@ internal fun projectToDisplay(
         persistentKeepAlive = persistentKeepAlive
     )
 
-    // --- 行级同步标志（原 isEffectiveLineLevelSync(document.type, presentedRow.words.size)）---
-    // LINE → true；SYLLABLE && 无 words → true；SYLLABLE && 有 words → false；NONE/UNSYNCED → false。
-    val lineLevelSync = hasActiveLine && !showLargeMetadata && when (kind) {
-        LyricKind.LINE -> true
-        LyricKind.SYLLABLE -> state.words.isNullOrEmpty()
-        else -> false
-    }
+    // --- per-word（透传真实词级数据）---
+    // 真实词级时间戳随 words 下发：统一扫光管线以其计算整块进度（无行级时间时），
+    // 逐字卡拉OK路径（逐字源+关闭发光）以逐词时间驱动缩放/渐变。
+    val effectiveWords = if (showLargeMetadata || !hasActiveLine) emptyList() else state.words.orEmpty()
 
-    // --- per-word / ruby / layoutGroup（原 presentedRow.words/ruby/layoutGroups）---
-    val words = if (showLargeMetadata || !hasActiveLine) emptyList() else state.words.orEmpty().map(::toDisplayWord)
+    // --- 行级同步标志（统一走整行水平扫光）---
+    // 有活动歌词行时一律行级同步，以整行水平扫光为主要效果；
+    // NONE/UNSYNCED 无活动行 → false。
+    val lineLevelSync = hasActiveLine && !showLargeMetadata
+
+    // --- ruby / layoutGroup（原 presentedRow.words/ruby/layoutGroups）---
+    val words = if (showLargeMetadata || !hasActiveLine) emptyList() else effectiveWords.map(::toDisplayWord)
     val ruby = if (showLargeMetadata || !hasActiveLine) emptyList() else state.ruby.map(::toDisplayRuby)
     val layoutGroups = if (showLargeMetadata || !hasActiveLine) emptyList() else state.layoutGroups.map(::toDisplayLayoutGroup)
 

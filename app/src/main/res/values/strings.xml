@@ -8,6 +8,7 @@
     <string name="language_system_default">System default</string>
     <string name="language_english">English</string>
     <string name="language_simplified_chinese">简体中文</string>
+    <string name="language_traditional_chinese">繁體中文</string>
     <string name="dialog_language_summary">Changes HyperGlow only.</string>
     <string name="action_cancel">Cancel</string>
     <string name="action_restart">Restart</string>
@@ -24,9 +25,21 @@
     <string name="label_android_version">Android version</string>
     <string name="label_device_model">Device model</string>
     <string name="label_compatibility">Compatibility</string>
+    <string name="action_check_update">Check for updates</string>
+    <string name="action_check_update_short">Check</string>
+    <string name="update_checking">Checking…</string>
+    <string name="update_check_up_to_date">You are on the latest version</string>
+    <string name="update_check_failed">Check failed. Please check your network connection</string>
+    <string name="update_dialog_title">Update available</string>
+    <string name="update_dialog_summary">A newer version v%1$s is available. Download and install it from the release page.</string>
+    <string name="update_mismatch_dialog_title">Installed version differs from release</string>
+    <string name="update_mismatch_dialog_summary">The installed APK fingerprint does not match the official release. It may be an older or non-official build. Download and install the latest release.</string>
+    <string name="action_download">Download</string>
     <string name="label_systemui_aod">System UI / AOD</string>
     <string name="label_aod_lyrics">AOD lyrics</string>
     <string name="label_lockscreen_lyrics">Lock screen lyrics</string>
+    <string name="label_lockscreen_preview">Lock screen preview</string>
+    <string name="label_aod_preview">Always-on display preview</string>
     <string name="label_diagnostic_logging">Diagnostic logging</string>
     <string name="summary_diagnostic_logging_available">Can reduce performance.</string>
     <string name="summary_diagnostic_logging_unavailable">This build does not include diagnostic logging.</string>
@@ -42,7 +55,7 @@
     <string name="lyric_source_lyricon">Lyricon</string>
     <string name="lyric_source_superlyric">SuperLyric</string>
     <string name="lyric_source_lyricinfo">LyricInfo</string>
-    <string name="summary_lyric_source_spicy">In-process bridge bundled with HyperGlow. Always available.</string>
+    <string name="summary_lyric_source_spicy">Feeds lyrics from Spotify via Spicy EX. Requires Spicy EX installed and playing a track.</string>
     <string name="summary_lyric_source_lyricon">Uses the Lyricon Xposed module in SystemUI for callback-driven lyrics.</string>
     <string name="summary_lyric_source_superlyric">Uses the SuperLyric Xposed module, which pushes active lines over Binder.</string>
     <string name="summary_lyric_source_lyricinfo">Uses the LyricInfo Xposed module, reading lyrics injected into MediaSession metadata.</string>
@@ -63,6 +76,9 @@
     <string name="projection_state_idle">Idle</string>
     <string name="projection_state_paused">Paused</string>
 
+    <string name="title_spicy_setup">Spicy EX not connected</string>
+    <string name="summary_spicy_not_connected">Spicy EX is selected but not publishing lyrics. Install Spicy EX and play a track in Spotify to feed lyrics in real time.</string>
+    <string name="action_open_spotify_for_spicy">Open Spotify</string>
     <string name="title_lyricon_setup">Finish Lyricon setup</string>
     <string name="summary_lyricon_not_connected">Lyricon is selected but not connected. Make sure the Lyricon Xposed module is installed and active in SystemUI, then restart System UI.</string>
     <string name="action_lyricon_guide">Lyricon setup guide</string>
