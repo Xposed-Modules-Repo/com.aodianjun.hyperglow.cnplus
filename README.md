@@ -21,13 +21,39 @@ Requires root, LSPosed and a lyrics source ([Spicy EX](https://github.com/amarin
   - **Lyricon** (popular Chinese music apps — QQ Music, NetEase Cloud Music, Kugou, etc.).
   - **SuperLyric** (active-line push via Binder, works with many music apps).
   - **LyricInfo** (injects elrc/lrc lyrics into the media session metadata of supported apps).
-- Line-, word- and syllable-synchronized karaoke.
-- Transliteration and translation with Spicy EX Full.
+- Line-, word- and syllable-synchronized karaoke, including the **BetterLyrics** word animation
+  preset (long syllables light up and scale up with a glow; unplayed syllables sink and rise as
+  they are sung) and per-word karaoke for the auxiliary line.
+- Transliteration, translation and romaji where the source provides them (Spicy EX Full,
+  Lyricon, LyricInfo translation/romaji lanes).
+- Duet lyrics: a second singing line that overlaps the main one is drawn side by side, each with
+  its own word-by-word sweep — with optional (男)/(女)/(合) side detection and section-marker
+  stripping.
+- Auxiliary text: an optional second lyric line rendered as auxiliary text (a four-row layout),
+  toggled independently for the lock screen and AOD.
+- Song info and artwork: choose and order title/artist/album, set a per-slot separator, and show
+  the current track's album art (square, or circular with rotation).
+- Configurable line-transition animations (30 built-in exit/enter presets plus an Auto mode that
+  follows the lyric source), with Slowest/Slow/Normal/Fast/Fastest speed tiers.
+- Per-document lyric time offset (±5 s in 50 ms steps).
+- HyperLyric-compatible plugins, with an in-app lyric-enhancement section (plugin settings) and
+  plugin cache management; the plugin chain covers every lyrics source. Four official plugins ship
+  as separate ZIPs from the
+  [`plugins` release](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins):
+  **lyricfetch** (online lyrics: NetEase word-level, QQ, LRCLIB), **scriptconvert**
+  (Simplified ⇄ Traditional), **amll-ttml** (AMLL TTML word-level lyrics with duet, harmony and
+  translation) and **ai-translation** (any OpenAI-compatible endpoint).
 
-- AOD clock placement and burn-in movement.
+- AOD clock placement, anchored clock positioning and burn-in movement.
+- AOD lyrics rotate with the device (landscape/reverse), optionally hiding the stock AOD content
+  in landscape and going full-screen, centred with a configurable safe-area inset.
 - Keep AOD active while lyrics are visible.
 - Keep the lock screen awake while music is playing.
 - Raise to show AOD instead of the full lock screen.
+- Appearance settings: theme colour (default/dynamic/custom), background image with dimming and
+  blur, glass (translucent) top bar/cards/navigation, text colour and font.
+- Built-in diagnostics (guided capture, locally generated report ready for a GitHub issue) and
+  settings backup/restore.
 
 ## Requirements
 
@@ -46,6 +72,12 @@ APK from [Releases](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/
 > [!TIP]
 > Also available on the [LSPosed Modules Repository](https://modules.lsposed.org) under
 > **HyperGlow CN+** (`com.aodianjun.hyperglow.cnplus`), which tracks each release automatically.
+
+> [!TIP]
+> Optional plugins (online lyrics lookup, Simplified ⇄ Traditional conversion, AMLL TTML
+> word-level lyrics, AI translation) are distributed as separate ZIPs on the
+> [`plugins` release](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins);
+> install them in-app from the plugin management page (**Install from local ZIP**).
 
 1. Enable HyperGlow in LSPosed.
 2. Enable your lyrics source:
@@ -115,13 +147,22 @@ before opening a pull request:
   - **Lyricon**（热门国内音乐软件 —— QQ音乐、网易云音乐、酷狗音乐等）。
   - **SuperLyric**（通过 Binder 实时推送当前歌词行，支持众多音乐软件）。
   - **LyricInfo**（向受支持应用的媒体会话元数据注入 elrc/lrc 歌词）。
-- 支持逐行、逐词、逐音节同步的卡拉OK。
-- 搭配 Spicy EX Full 支持音译与翻译。
+- 支持逐行、逐词、逐音节同步的卡拉OK，含 **BetterLyrics** 逐字动画档（长音节整块亮起并放大、带辉光；未唱字下沉、唱到后上浮）与辅助行的逐字效果。
+- 音译、翻译与罗马音随歌词源提供（Spicy EX Full、Lyricon、LyricInfo 的翻译/罗马音 lane）。
+- 对唱歌词：与主行重叠的第二条唱词行并排显示、各画各的逐字扫光，可选自动识别（男）/（女）/（合）并剥离段落标记。
+- 辅助文字：可选的第二行歌词以辅助文字形态绘制（四行呈现），锁屏与息屏各自独立开关。
+- 歌曲信息与歌曲图片：歌名/歌手/专辑可选可排序、分隔符逐槽设置，并可显示当前曲目的专辑图（方形，或可旋转的圆形）。
+- 可配置的换行动画（内置 30 种退场/进场预设，另有跟随歌词源的 Auto 档），速率支持 Slowest/Slow/Normal/Fast/Fastest 五档。
+- 文档级歌词时间偏移（±5 秒、50ms 档）。
+- HyperLyric 兼容插件，应用内提供「歌词增强」（插件设置）板块与插件缓存管理；插件链覆盖全部歌词源。四个官方插件以独立 ZIP 从 [`plugins` 发行](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins) 下载：**lyricfetch**（在线取词：网易云逐字 / QQ / LRCLIB）、**scriptconvert**（简 ⇄ 繁）、**amll-ttml**（AMLL TTML 逐字歌词，含对唱/和声/翻译）、**ai-translation**（任意 OpenAI 兼容接口）。
 
-- AOD 时钟位置与防烧屏位移。
+- AOD 时钟位置、锚定式时钟定位与防烧屏位移。
+- AOD 歌词跟随设备横竖屏旋转（横屏/反向横屏），可选隐藏横屏下的系统息屏内容并全屏化居中，安全区内边距可调。
 - 歌词显示时保持 AOD 常亮。
 - 播放音乐时保持锁屏常亮。
 - 拿起手机显示 AOD 而非完整锁屏。
+- 外观设置：主题色（默认/动态取色/自定义）、背景图与压暗/模糊、玻璃化（半透明）顶栏/卡片/导航、文字颜色与字体。
+- 内置诊断（引导采集、本地生成报告并可一键组装 GitHub issue）与设置备份/恢复。
 
 ## 环境要求
 
@@ -140,6 +181,11 @@ before opening a pull request:
 > [!TIP]
 > 也已在 [LSPosed 模块仓库](https://modules.lsposed.org)上架（**HyperGlow CN+**，包名
 > `com.aodianjun.hyperglow.cnplus`），会自动同步每个新版本。
+
+> [!TIP]
+> 可选插件（在线取词、简 ⇄ 繁转换、AMLL TTML 逐字歌词、AI 翻译）以独立 ZIP 发布在
+> [`plugins` 发行](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins)，
+> 在应用内「插件管理」页 **从本地 ZIP 安装** 即可。
 
 1. 在 LSPosed 中启用 HyperGlow。
 2. 启用你的歌词源：
