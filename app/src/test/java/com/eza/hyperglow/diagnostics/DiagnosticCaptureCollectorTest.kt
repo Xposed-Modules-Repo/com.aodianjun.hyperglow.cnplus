@@ -19,7 +19,118 @@ class DiagnosticCaptureCollectorTest {
         assertEquals("metadata_only_root_denied", result.outcome)
         assertEquals("denied", result.rootAccessStatus)
         assertEquals(1, commands)
-        assertTrue(result.logs.isEmpty())
+        // 镜像不依赖 root:拒绝路径仍带 app_trace 段,默认读取器为空时也要声明状态。
+        assertEquals("app_trace=empty\n", result.logs)
+    }
+
+    @Test
+    fun rootProbeOutlivesTheCommandTimeoutBecauseARootPromptWaitsForTheUser() {
+        var probeTimeout = 0L
+        val collector = DiagnosticCaptureCollector { _, timeoutMs ->
+            probeTimeout = timeoutMs
+            DiagnosticRootCommandResult(exitCode = 1, output = "permission denied")
+        }
+
+        collector.collect(0L)
+
+        assertEquals(DiagnosticLimits.ROOT_PROBE_TIMEOUT_MS, probeTimeout)
+        assertTrue(DiagnosticLimits.ROOT_PROBE_TIMEOUT_MS > DiagnosticLimits.COMMAND_TIMEOUT_MS)
+    }
+
+    @Test
+    fun rootBinarySearchMovesOnOnlyWhenTheBinaryCannotBeSpawned() {
+        val attempted = mutableListOf<String>()
+        val granted = DiagnosticRootCommandResult(0, "0\n")
+
+        val result = runFirstRootBinary(listOf("su", "/data/adb/ap/bin/su")) { binary ->
+            attempted += binary
+            if (binary == "su") null else granted
+        }
+
+        assertEquals(listOf("su", "/data/adb/ap/bin/su"), attempted)
+        assertEquals(granted, result)
+    }
+
+    @Test
+    fun rootBinarySearchStopsOnARefusalAndOnATimeout() {
+        for (answer in listOf(
+            DiagnosticRootCommandResult(exitCode = 1, output = "permission denied"),
+            DiagnosticRootCommandResult(exitCode = -1, output = "", timedOut = true)
+        )) {
+            var attempts = 0
+            val result = runFirstRootBinary(listOf("su", "/data/adb/ap/bin/su")) { _ ->
+                attempts++
+                answer
+            }
+
+            assertEquals(answer, result)
+            assertEquals(1, attempts)
+        }
+    }
+
+    @Test
+    fun rootBinarySearchReportsNoBinaryWhenEveryCandidateIsMissing() {
+        val result = runFirstRootBinary(listOf("su", "/data/adb/ap/bin/su")) { null }
+
+        assertEquals(-1, result.exitCode)
+        assertTrue(result.output.isBlank())
+        assertEquals("error", checkDiagnosticRootAccess { _, _ -> result })
+    }
+
+    @Test
+    fun rootDenialStillCarriesTheAppTraceSection() {
+        val collector = DiagnosticCaptureCollector(
+            runner = { _, _ -> DiagnosticRootCommandResult(1, "permission denied") },
+            appTraceReader = { "2026-09-08T10:05:00.000 I [Area] app decision" }
+        )
+
+        val result = collector.collect(0L)
+
+        assertEquals("metadata_only_root_denied", result.outcome)
+        assertTrue(result.logs.contains("app_trace=present"))
+        assertTrue(result.logs.contains("App process trace:"))
+        assertTrue(result.logs.contains("app decision"))
+    }
+
+    @Test
+    fun grantedCaptureAppendsRedactedAppTraceAfterLogcat() {
+        val collector = DiagnosticCaptureCollector(
+            runner = { command, _ ->
+                if (command == "id -u") DiagnosticRootCommandResult(0, "0\n")
+                else DiagnosticRootCommandResult(0, "")
+            },
+            appTraceReader = { "2026-09-08T10:05:00.000 W [Area] track=spotify:track:abc123" }
+        )
+
+        val result = collector.collect(0L)
+
+        assertEquals("captured", result.outcome)
+        assertTrue(result.logs.contains("app_trace=present"))
+        assertTrue(result.logs.contains("App process trace:"))
+        assertTrue(result.logs.contains("spotify:track:<redacted>"))
+        // trace 段位于 logcat 段之后:组合截断保尾时,失败瞬间的 App 侧最新日志优先保留。
+        assertTrue(
+            result.logs.indexOf("app_trace=present") > result.logs.indexOf("systemui_processes=")
+        )
+        assertFalse(result.logs.contains("app_trace=present truncated"))
+    }
+
+    @Test
+    fun oversizedAppTraceIsTruncatedWithAStatusMarker() {
+        val filler = "a".repeat(400)
+        val lines = (1..400).joinToString("\n") { "2026-09-08T10:05:00.000 I [Area] $filler" }
+        val collector = DiagnosticCaptureCollector(
+            runner = { command, _ ->
+                if (command == "id -u") DiagnosticRootCommandResult(0, "0\n")
+                else DiagnosticRootCommandResult(0, "")
+            },
+            appTraceReader = { lines }
+        )
+
+        val result = collector.collect(0L)
+
+        assertTrue(result.logs.contains("app_trace=present truncated"))
+        assertTrue(result.logs.contains("TRUNCATED"))
     }
 
     @Test
@@ -41,6 +152,7 @@ class DiagnosticCaptureCollectorTest {
     @Test
     fun captureFiltersCrashPackagesAndLsposedIdentity() {
         var lsposedCommand = ""
+        var logsCommand = ""
         var processCommand = ""
         var frameworkCommand = ""
         val collector = DiagnosticCaptureCollector { command, _ ->
@@ -90,7 +202,10 @@ class DiagnosticCaptureCollectorTest {
                         """.trimIndent()
                     )
                 }
-                else -> DiagnosticRootCommandResult(0, "08-01 I HyperGlow: safe event")
+                else -> {
+                    logsCommand = command
+                    DiagnosticRootCommandResult(0, "08-01 I HyperGlow: safe event")
+                }
             }
         }
 
@@ -106,6 +221,8 @@ class DiagnosticCaptureCollectorTest {
         assertFalse(result.lsposedLines.contains("secret"))
         assertTrue(lsposedCommand.contains("tail -c 524288"))
         assertTrue(lsposedCommand.contains("head -n 1"))
+        assertTrue(logsCommand.contains("-T '"))
+        assertFalse(logsCommand.contains("-t 4000"))
         assertTrue(processCommand.contains("com\\.android\\.sys"))
         assertTrue(frameworkCommand.contains("/data/adb/modules"))
         assertTrue(frameworkCommand.contains("zygisk"))
@@ -214,5 +331,21 @@ class DiagnosticCaptureCollectorTest {
         assertTrue(cancel.deletePendingDraft)
         assertFalse(timeout.diagnosticLoggingEnabled)
         assertTrue(timeout.deletePendingDraft)
+    }
+
+    @Test
+    fun redactsPrivateDataAndStoragePaths() {
+        // Bridge SensitiveFieldRedactor 同集合:私有目录与外部存储绝对路径不进报告,
+        // 避免暴露用户目录结构与媒体文件名(路径本体已含 uid/包名,整体脱敏)。
+        val line = sanitizeDiagnosticLines(
+            "scan /data/user/0/com.spotify.music/shared_prefs/x.xml " +
+                "and /sdcard/Music/song.mp3 plus /storage/emulated/0/Android/media/a.flac"
+        )
+        assertTrue(line.contains("/data/user/<redacted>"))
+        assertTrue(line.contains("/sdcard/<redacted>"))
+        assertTrue(line.contains("/storage/emulated/0/<redacted>"))
+        assertFalse(line.contains("com.spotify.music"))
+        assertFalse(line.contains("song.mp3"))
+        assertFalse(line.contains("a.flac"))
     }
 }

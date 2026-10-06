@@ -13,9 +13,20 @@ class HyperGlowApplication : Application() {
         super.onCreate()
         DiagnosticCaptureManager.expireIfNeeded(this)
         DiagnosticDraftStore.load(this)
-        DiagnosticLoggingRuntime.setEnabled(DiagnosticLoggingPreferences.read(this))
+        // 总闸开关、写入等级与详细档的 SystemUI 侧镜像一并接线。
+        syncDiagnosticLoggingRuntime(this)
+        // 保留期限在进程启动即修剪:日志关闭时也清理上次会话遗留的镜像。
+        DiagnosticTraceFile.setRetentionDays(DiagnosticLoggingPreferences.readRetentionDays(this))
+        DiagnosticTraceFile.prune(filesDir)
+        // 空镜像和从未打开的镜像无法区分;空闲进程在播放开始前一行都不会写。
+        AppLog.i(
+            "Diagnostics",
+            "trace ready versionCode=${BuildConfig.VERSION_CODE} pid=${android.os.Process.myPid()}"
+        )
         LyricProducers.start(this)
         AodProjectionEngine.start(this)
+        // 插件运行时随 App 启动恢复已安装插件并接入投影链(总开关默认关闭)。
+        com.eza.hyperglow.plugin.PluginPipeline.start(this)
         // 把 AodLyricBridgeService 提升为前台服务,避免 MIUI GreezeManager 在息屏时
         // 反复冻结进程导致 AOD/锁屏歌词不更新。SystemUI 通过 bindService 绑定时,
         // service 不会自动进入前台,必须显式 startForegroundService 激活。

@@ -4,8 +4,11 @@ import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.HookRegistry
 import com.eza.hyperglow.root.aod.AodRenderedClockBounds
 import com.eza.hyperglow.root.hierarchyField
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
@@ -13,27 +16,37 @@ import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 
 internal object SystemUiClockMorphHook {
+    private const val FEATURE_ID = "clock-morph"
     private var clockViewRef = WeakReference<View>(null)
     private var morphingToAod = false
     private val clockScratch = Rect()
     private val rootLocation = IntArray(2)
 
     fun install(module: XposedModule, classLoader: ClassLoader) {
-        val helperClass = classLoader.loadClass(ANIMATION_HELPER_CLASS)
-        val method = helperClass.getDeclaredMethod(
-            "doAnimationToAod",
-            Boolean::class.javaPrimitiveType,
-            Boolean::class.javaPrimitiveType,
-            Boolean::class.javaPrimitiveType
-        ).apply { isAccessible = true }
+        val method = SymbolResolver.resolveMethod(
+            classLoader,
+            FEATURE_ID,
+            SymbolRequest.method(
+                ANIMATION_HELPER_CLASS,
+                "doAnimationToAod",
+                "boolean",
+                "boolean",
+                "boolean"
+            )
+        ) ?: return
+        val helperClass = SymbolResolver.resolveClass(
+            classLoader, FEATURE_ID, ANIMATION_HELPER_CLASS
+        ) ?: return
         val clockAnimationField = hierarchyField(helperClass, "mClockAnima") ?: return
         val clockViewField = hierarchyField(helperClass, "mClockView") ?: return
-        val allContainerField = hierarchyField(
-            classLoader.loadClass(CLOCK_BASE_ANIMATION_CLASS),
-            "mAllContainer"
+        val baseAnimationClass = SymbolResolver.resolveClass(
+            classLoader, FEATURE_ID, CLOCK_BASE_ANIMATION_CLASS
         ) ?: return
-        module.deoptimize(method)
-        module.hook(method).intercept(
+        val allContainerField = hierarchyField(baseAnimationClass, "mAllContainer") ?: return
+        HookRegistry.hook(
+            module,
+            FEATURE_ID,
+            method,
             AnimationHooker(clockAnimationField, clockViewField, allContainerField)
         )
         HookLogger.i(TAG, "SystemUI clock morph geometry hook installed")

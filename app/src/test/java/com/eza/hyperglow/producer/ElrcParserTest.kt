@@ -1,6 +1,7 @@
 package com.eza.hyperglow.producer
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -97,6 +98,60 @@ class ElrcParserTest {
     }
 
     @Test
+    fun parsesMillisecondPrecisionBeyondThreeDigits() {
+        // 毫秒 1 至 6 位:4-6 位此前不匹配 → 行时间戳整行丢弃(整句歌词消失)。
+        // 超过 3 位截到毫秒,不足 3 位右侧补零。
+        val lrc = "[00:01.2345]A\n[00:02.234567]B\n[00:03.5]C"
+
+        val lines = ElrcParser.parse(lrc)
+
+        assertEquals(3, lines.size)
+        assertEquals(1_234L, lines[0].startMs)
+        assertEquals(2_234L, lines[1].startMs)
+        assertEquals(3_500L, lines[2].startMs)
+    }
+
+    @Test
+    fun parsesTimestampsWithoutFraction() {
+        // 毫秒段可省略:此前 [mm:ss] 不匹配 → 整行被丢弃(标准 LRC 常见写法)。
+        val lrc = "[00:01]A\n[00:02]B"
+
+        val lines = ElrcParser.parse(lrc)
+
+        assertEquals(2, lines.size)
+        assertEquals(1_000L, lines[0].startMs)
+        assertEquals(2_000L, lines[1].startMs)
+    }
+
+    @Test
+    fun parsesWordMarkersWithExtendedFraction() {
+        // 词标记与行时间戳同语法:4-6 位小数此前不匹配 → 标记残留为歌词正文、逐字丢失。
+        val lrc = "[00:01.000]<00:01.0000>He<00:02.123456>llo"
+
+        val lines = ElrcParser.parse(lrc)
+
+        assertEquals(1, lines.size)
+        assertEquals("Hello", lines[0].text)
+        val words = lines[0].words!!
+        assertEquals(2, words.size)
+        assertEquals("He", words[0].text)
+        assertEquals(1_000L, words[0].startMs)
+        assertEquals("llo", words[1].text)
+        assertEquals(2_123L, words[1].startMs)
+    }
+
+    @Test
+    fun rejectsTokensOutsideTheTimestampGrammar() {
+        // 分钟 4 位、秒 3 位、缺冒号:都不算时间戳(行丢弃 / 标记按普通字符保留)。
+        assertEquals(emptyList<ElrcParser.TimedLine>(), ElrcParser.parse("[1234:00.000]Not a timestamp"))
+        assertEquals(emptyList<ElrcParser.TimedLine>(), ElrcParser.parse("[00:123.000]Not a timestamp"))
+
+        val lines = ElrcParser.parse("[00:01.000]<05>literal")
+        assertEquals("<05>literal", lines[0].text)
+        assertTrue(lines[0].words!!.isEmpty())
+    }
+
+    @Test
     fun ignoresLinesWithoutLeadingTimestamp_andEmptyInput() {
         assertEquals(emptyList<ElrcParser.TimedLine>(), ElrcParser.parse("no timestamp here"))
         assertEquals(emptyList<ElrcParser.TimedLine>(), ElrcParser.parse(""))
@@ -123,5 +178,103 @@ class ElrcParserTest {
     @Test
     fun activeLineAt_emptyReturnsNull() {
         assertNull(ElrcParser.activeLineAt(emptyList(), 1_000))
+    }
+
+    // --- activeLinePastEndOrNull (结尾歌词尾奏清空) ---
+
+    @Test
+    fun activeLinePastEndOrNull_clearsAfterLastLineEnd() {
+        // 最后一行 end = 10000 + 4000(defaultLineDurationMs) = 14000。
+        val lines = ElrcParser.parse("[00:01.000]One\n[00:05.000]Two\n[00:10.000]Three")
+
+        assertEquals("Three", activeLinePastEndOrNull(lines, 10_000L)?.text)
+        assertEquals("Three", activeLinePastEndOrNull(lines, 13_999L)?.text)
+        assertNull(activeLinePastEndOrNull(lines, 14_000L)) // 越过最后一行 end
+        assertNull(activeLinePastEndOrNull(lines, 99_000L))
+    }
+
+    @Test
+    fun activeLinePastEndOrNull_keepsLineWithinInterlude() {
+        // 中间行之间的间奏（position 超过上一行 end 但未到下一行 begin）仍返回上一句，
+        // 与 activeLineAt 的「最后一条 start <= pos」语义一致，仅兜住真正的结尾。
+        val lines = ElrcParser.parse("[00:01.000]One\n[00:05.000]Two\n[00:10.000]Three")
+        assertEquals("One", activeLinePastEndOrNull(lines, 4_999L)?.text)
+    }
+
+    // --- 零宽字符剥离(Bridge LyricTextSanitizer 同集合,issue #68) ---
+
+    @Test
+    fun stripsZeroWidthCharacters_fromLineAndWordText() {
+        val lrc = "[00:01.000]Hel\u200Blo\uFEFF\n[00:05.000]<00:05.000>W\u2060o"
+        val lines = ElrcParser.parse(lrc)
+
+        assertEquals("Hello", lines[0].text)
+        assertTrue(lines[0].words!!.isEmpty())
+        assertEquals("Wo", lines[1].text)
+        assertEquals("Wo", lines[1].words!![0].text)
+    }
+
+    // --- 词级时间轴可疑降级(Bridge LyricTimingRepair 同启发) ---
+
+    @Test
+    fun downgradesNonIncreasingWordTiming_toLineLevel() {
+        // 词起点乱序(09.000 < 10.000):词时间轴整体不可信 → 降级为行级。
+        val lines = ElrcParser.parse("[00:10.000]<00:10.000>A<00:09.000>B")
+
+        assertEquals(1, lines.size)
+        assertEquals("AB", lines[0].text)
+        assertTrue(lines[0].words!!.isEmpty())
+    }
+
+    @Test
+    fun downgradesSuspiciousInlineWordGap_toLineLevel() {
+        // 4 词、单个 9s 行内间隙且占比 9*3 >= 11*2:伪逐字形态 → 降级。
+        val lines = ElrcParser.parse(
+            "[00:10.000]<00:10.000>前<00:11.000>奏<00:20.000>间<00:21.000>奏"
+        )
+
+        assertTrue(lines[0].words!!.isEmpty())
+    }
+
+    @Test
+    fun keepsDenseWordTiming_withLongTailNote() {
+        // 7 词、9s 尾间隙但占比 9*3=27 < 15*2=30:真实的两段式长句,保留逐字。
+        val starts = listOf(0L, 1_000L, 2_000L, 3_000L, 4_000L, 5_000L, 6_000L, 15_000L)
+        assertFalse(ElrcParser.shouldDowngradeWordTiming(starts))
+    }
+
+    @Test
+    fun shouldDowngradeWordTiming_predicateContract() {
+        // 单词不判;乱序/同刻判;8s+ 间隙且词数 <=4 判;短间隙不判。
+        assertFalse(ElrcParser.shouldDowngradeWordTiming(listOf(0L)))
+        assertTrue(ElrcParser.shouldDowngradeWordTiming(listOf(3_000L, 1_000L)))
+        assertTrue(ElrcParser.shouldDowngradeWordTiming(listOf(1_000L, 1_000L)))
+        assertTrue(ElrcParser.shouldDowngradeWordTiming(listOf(0L, 9_000L)))
+        assertFalse(ElrcParser.shouldDowngradeWordTiming(listOf(0L, 1_000L)))
+    }
+
+    // --- 占位行判定与丢弃(Bridge LyricTextSanitizer.isPlaceholderOnly 同语义) ---
+
+    @Test
+    fun placeholderOnlyPredicateTruthTable() {
+        // 空串/纯空白/纯零宽字符 → 占位;任何可见字形 → 非占位。
+        assertTrue(ElrcParser.isPlaceholderOnly(""))
+        assertTrue(ElrcParser.isPlaceholderOnly(" \t "))
+        assertTrue(ElrcParser.isPlaceholderOnly("\u200B\uFEFF\u2060"))
+        assertTrue(ElrcParser.isPlaceholderOnly(" \u200B "))
+        assertFalse(ElrcParser.isPlaceholderOnly("♪"))
+        assertFalse(ElrcParser.isPlaceholderOnly("词"))
+    }
+
+    @Test
+    fun parseDropsPlaceholderOnlyLines_andTimeaxisSpansTheGap() {
+        // 中间的空白占位行被丢弃;前一行 endMs 直接衔接到下一行 startMs。
+        val lines = ElrcParser.parse(
+            "[00:01.000]歌词\n[00:05.000]   \n[00:09.000]\uFEFF\n[00:13.000]第二句"
+        )
+        assertEquals(2, lines.size)
+        assertEquals("歌词", lines[0].text)
+        assertEquals(13_000L, lines[0].endMs)
+        assertEquals("第二句", lines[1].text)
     }
 }

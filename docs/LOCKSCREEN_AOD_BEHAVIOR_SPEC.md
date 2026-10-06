@@ -1,9 +1,12 @@
 # Lockscreen + AOD Behavior Spec
 
+# English / 英文
+
 Status: implementation contract
 
-This document extends `PARITY-SPEC.md`. AOD rendering continues to follow the existing parity
-contract. This spec defines surface visibility, privacy, continuity, customization, and fallback.
+This document extends `PARITY-SPEC.md` (private doc, not in the public tree). AOD rendering continues
+to follow the existing parity contract. This spec defines surface visibility, privacy, continuity,
+customization, and fallback.
 
 ## Shared snapshot
 
@@ -14,8 +17,34 @@ contract. This spec defines surface visibility, privacy, continuity, customizati
 - Stale expiry, Binder death, caller failure, or invalid payload hides every subscriber. A hidden
   state explicitly marked as a real Spotify pause may retain the last valid lyric snapshot under the
   shared bounded policy below. Terminal hidden state clears it.
+- Stale snapshots are dropped at the delivery boundary, before any subscriber sees them. The
+  producer publishes a full snapshot or a keepalive on a 1.5 s cadence, while MIUI doze may freeze
+  SystemUI for ~20 s at a time, so one unfreeze can deliver the whole backlog (measured: 12
+  snapshots inside 19 ms with karaoke positions spanning ~18 s of playback). A visible snapshot
+  older than 1.5 s is discarded and only the newest state in the batch is applied. Track-generation
+  changes, hidden and pause-retention edges, and the first snapshot after bind are always
+  delivered; a dropped snapshot still advances the revision watermark and applies its
+  keepalive/wake scalars when they differ from the held state, so the keepalive chain is never
+  broken.
 - State/configuration carry the app user ID; a SystemUI user switch clears/rebinds and rejects the
   previous user's cached payload.
+- Transliteration, translation, timed reading fragments, and ruby come from the current matching
+  producer document once it arrives. Before that document exists (untimed tracks, or a document
+  still in flight), scalar state may keep the original lyric line visible and may supply its
+  auxiliary lines — a deliberate CN+ divergence from upstream v0.3.97, which drops scalar
+  auxiliary lines entirely.
+- Translation is a redundant pair (text + word list; either may arrive alone) on every producer
+  and plugin boundary. When only the word list is present, the effective translation text is
+  assembled from it — non-blank text always wins and the words never overwrite existing text —
+  and the word list crosses the plugin bridge unchanged (`PluginLyricLine.translationWords`). The
+  reverse path applies a plugin result that declares only translation words the same way. A
+  word-level translation is never dropped at a boundary.
+- A Chinese document carrying kana ruby is language-inconsistent producer data. Projection keeps
+  the original lyric and rejects that row's ruby, whole-line romanization, and per-word
+  romanization; it does not classify the lyric again or synthesize a replacement reading.
+- A row fill end must remain inside the track duration. A producer fill end past that row's active
+  window is clamped to the active end for rendering; this bounded mismatch does not discard the
+  otherwise valid timed document or release keepalive.
 - AOD keepalive and lockscreen screen-on policy remain independent. Neither can activate from the
   other surface alone.
 - `playbackActive` comes only from the UID-validated Spotify bridge and is transported explicitly.
@@ -23,6 +52,15 @@ contract. This spec defines surface visibility, privacy, continuity, customizati
 - Live lyrics require `playbackActive=true`. The one shared `After Spotify pauses` setting applies to
   lockscreen and AOD: clear immediately, 5 seconds, 10 seconds, 30 seconds, or keep indefinitely.
   The default is 5 seconds. Other media players cannot start or extend the timer.
+- Lyric source selection applies one fault predicate to the preferred and fallback paths alike: a
+  stale-but-paused producer state is a frozen state, not a fault. When the preferred source is
+  unusable, a fallback source holding such a frozen state is forwarded while it carries content (a
+  non-blank line or word timing), so a paused session keeps its last line instead of blanking
+  beside an empty fallback. Healthy (connected, non-stale) fallback candidates win first in enum
+  order — the frozen state is a last resort. A stale state that is still playing, or a stale-paused
+  state with no content, is never forwarded. Stall diagnostics are de-duplicated by the same
+  structural picture (with a 30 s heartbeat) so a long stall cannot rotate the bounded diagnostic
+  mirror away.
 
 ## Lockscreen visibility and privacy
 
@@ -48,7 +86,20 @@ accessibility-focusable. Xiaomi parent alpha/visibility remains authoritative.
 The default lockscreen scene uses Xiaomi's `getClockBottom()` anchor. The optional built-in card
 scrim is vertically tight to currently rendered rows, unions outgoing/incoming bounds during lyric
 transitions, and follows visible media-card width when available. A bounded 92% width and dark-card
-opacity are used when native media width is unavailable.
+opacity are used when native media width is unavailable. The scene rect height is content-adaptive:
+it measures the content row stack at the resolved content width and sizes the card to that stack
+plus progress spacing and card padding. The height setting remains the upper bound and the bounded
+minimum remains the floor; the settings-based height estimate only backs pre-content placement.
+Rendered rows never sit flush against the canvas content clip: the block reserves the vertical
+overdraw of its outermost rows — the glow halo radius (36% of the text size) and the `BetterLyrics`
+unsung-word sink — before the clip edge, so the halo and float of a first or last row are not cut
+flat at the canvas edge. The leading row gap already provides part of that room and is credited
+against it; the trailing edge has none and is charged in full, which grows the measured card height
+by the same amount. Rows that draw no such effect (song info, next line) and surfaces with the
+effects off reserve nothing.
+
+Notification geometry uses an 8 dp dead band against the last applied bounds. Smaller animation
+jitter keeps the current lyric-card placement; larger movement updates collision placement normally.
 
 Lockscreen card lifetime follows Xiaomi's stock Spotify media player:
 
@@ -101,6 +152,11 @@ first, lyrics shrink to the bounded minimum, and insufficient/unknown geometry f
   leaves native-content translation to Xiaomi while HyperGlow observes the exact target and keeps
   the lyric canvas clear. Fixed and moving choices make HyperGlow the translation authority for the
   same clock-or-image container with the selected pattern.
+- Managed-position exhaustion fallback (upstream `1537c58`) releases managed control so the scene
+  follows Xiaomi's stock geometry only while `real-time clock follow` (实时跟随系统时钟) is
+  enabled. In the anchored (clock-pinned) mode the integral pin keeps clock authority regardless
+  of the selected pattern: exhaustion is logged without releasing control or latching, and clock
+  behavior stays unchanged.
 - Xiaomi movement callbacks remain observed so its latest natural target is cached, but their
   translation is suppressed during module ownership. The default `static_bottom` pattern moves the
   native clock-or-image container to the verified bottom zone once and holds it there while lyrics
@@ -180,17 +236,26 @@ first, lyrics shrink to the bounded minimum, and insufficient/unknown geometry f
   so no separate SystemUI timer exists. The duration is lifetime policy only; it does not
   alter wake identity, presentation leases, content capability, pause retention, or renderer state.
   Draw-wake renewal remains a separate renderer concern.
+- The validated lifetime guard also owns one narrow brightness override. In exact Xiaomi
+  `DOZE_AOD`, a low nonzero request through `MiuiDozeBrightnessTimeoutAdapter` is clamped to Xiaomi's
+  own positive `CommonUtils.BRIGHTNESS_ON` value. Requests at or above that value pass through.
+  Zero/off requests and every request in `DOZE_AOD_PAUSING`, `DOZE_AOD_PAUSED`, plain `DOZE`, pulse,
+  finish, unknown state, or inactive guard pass through unchanged. This keeps pocket and proximity
+  pause authoritative. Guard activation and release re-submit Xiaomi's last raw request through the
+  stock adapter, so Xiaomi keeps its native brightness timeout behavior and regains control on the
+  stock adapter's normal delay when lyric keepalive ends.
 - A transient hidden edge explicitly marked as Spotify still playing starts a bounded 30-second
   power grace after any snapshot carrying validated keepalive intent. Timed lyrics and untimed
   sessions held by `Also keep AOD active without timed lyrics` are equally eligible; lyric timing is
   content capability and never gates lifetime policy. The next visible snapshot cancels the grace
   without replaying Xiaomi hide policy. Paused/non-playing state releases immediately. This prevents short
-  producer/status gaps from turning AOD off mid-song; stale/disconnect still releases immediately.
+  producer/status gaps from turning AOD off mid-song. Projection stale retains an already-active
+  validated keepalive request; disconnect, explicit clear, pause, and grace expiry still release it.
 - A non-playing `loading` edge during song replacement is projected as that bounded still-playing
   transport gap. Every other non-playing edge is provisional: Spotify reports the ending track as
   `ready`/not playing roughly a second before the next generation arrives, so the edge is first
   projected as the same still-playing transport gap and only becomes real pause retention when the
-  producer is still non-playing on the same session after a bounded 1.5-second confirmation window.
+  producer is still non-playing on the same session after a bounded 5-second confirmation window.
   A resumed producer or a new session inside that window cancels the pending pause, so a song change
   never releases AOD lifetime or replays Xiaomi hide policy. The window opens once per session; a
   producer that keeps publishing while paused must not reopen it.
@@ -218,6 +283,22 @@ first, lyrics shrink to the bounded minimum, and insufficient/unknown geometry f
   shared configured timeout, until Xiaomi sleeps, or until the stock media player is removed,
   whichever ends presentation first.
 - Lockscreen attachment or visibility alone never suppresses Xiaomi hide policy.
+- The HyperOS dynamic island window must not render while the device is non-interactive. Xiaomi's
+  island hide path is transition-event driven (a keyguard-showing change collects into the island
+  temp-hidden state), so a sleep followed within seconds by a policy-initiated wake and
+  trusted-device unlock can consume the pending lock transition and leave the expanded island
+  composited over AOD with pre-screen-off content. While `PowerManager.isInteractive` is false, the
+  island guard captures the island window root
+  (`miui.systemui.dynamicisland.window.DynamicIslandWindowView`, loaded from the MIUI SystemUI
+  plugin class loader), forces it GONE with a restore ledger, re-asserts on a bounded one-second
+  interval, and rewrites host visibility requests on that root to GONE while recording the
+  host's latest non-GONE intent. The rewrite is enforced at both the `View.setVisibility` and
+  `View.setFlags` seams: a live doze occurrence (2026-10-02) showed the host re-asserting the
+  root visible at a higher rate than once per second, so a poll alone leaves visible gaps while
+  the synchronous call-site rewrite holds the root GONE without flicker. On the next interactive
+  observation the recorded belief state is
+  restored and stock events keep authority. Missing symbols disable the whole guard, interactive
+  behavior is untouched, and every enforcement is logged.
 
 ## Lockscreen customization gestures
 
@@ -283,16 +364,351 @@ first, lyrics shrink to the bounded minimum, and insufficient/unknown geometry f
   transliteration, and translation remain static. The whole-block option alone preserves the current
   simultaneous sweep across all visible lyric rows and must not normalize to main-only. Each surface
   profile independently selects bright or dimmed secondary-text presentation. Word/syllable-level
-  synchronization is unchanged.
+  synchronization is unchanged. The line-sync flag is true whenever an active line is presented
+  outside the large-metadata intro state, for word-timed and line-level sources alike. One shared
+  decision — read by the device canvas (lockscreen and AOD render through the same canvas) and by
+  the in-app preview — resolves the main line's render path from that flag, the source kind, the
+  line window, the word-animation mode, and the glow preference: static all-bright (the `Minimal`
+  mode or the `None` effect), the word-karaoke path, or the shared sweep block. The whole-block
+  sweep therefore occurs only when that mode is explicitly selected, never as a fallback for
+  word-timed sources.
+- Word animation accepts a fixed `Minimal`/`Gradient`/`BetterLyrics` vocabulary per surface profile.
+  `BetterLyrics` (modeled after jayfunc/BetterLyrics) renders sources through the shared word-karaoke
+  renderer, used by both the device canvas and the in-app preview: word/syllable-timed sources use
+  the real word windows; line-level (untimed) sources synthesize per-character windows whose advance
+  front coincides with the row-level sweep geometry, so the effects apply to both kinds of source —
+  this mode decides the in-word sweep per word block under scope B: a long syllable (≥700 ms) does
+  no in-word sweep — it lights up solid in the sung colour the moment it starts being sung, with no
+  fill front (the halo still hangs on the long block only) — while every other syllable keeps the
+  historical in-word fill band (scope history: long syllable only, 2026-10-04 → the row carrying
+  one, 2026-10-04 night → whole preset, 0.3.156 (183) → this restore, 2026-10-05, now that the
+  four jump causes behind 183 are fixed); unplayed syllables sit about 10% of the line height
+  lower and rise back to the baseline over ≈450 ms as they are sung; long syllables (≥700 ms; on
+  synthesized sources the synthesized per-block duration decides — CJK per character, Western per
+  word — short blocks scale or glow not at all) scale up to 1.15 while playing and fall back to
+  rest size when sung; and — only when the glow preference is on — the playing long syllable
+  carries a glow-colored halo (radius ≈ 36% of the text size). Short syllables keep the base
+  scaling motion (peak 1.0505); with glow off that motion is unchanged and only the halo is gone. The line-progress
+  effect `None` still resolves to the static all-bright presentation; the AOD-only concurrent duet
+  line keeps the shared sweep pipeline; a `BetterLyrics` profile never takes the shared
+  line-level sweep — word-timed sources carrying a line window included — and always renders
+  through the word-karaoke path; unknown profile values still normalize to `Gradient`.
+- Frame scheduling follows the same cadence contract: while a timed line is animating, the canvas
+  redraws on the configured frame interval (16 ms by default, or the user's render refresh rate
+  cap). The AOD canvas additionally steps the karaoke sweep coarsely — a 200 ms interval, ≈5 fps —
+  while the battery is low and discharging (≤15%) or the device reports thermal status
+  ≥ MODERATE, keeping the sweep readable while draw power drops sharply. That drop is gated by a
+  user switch (`aodPowerSaver`, default on) delivered through the compiled customization: with the
+  switch off the canvas never drops below the configured cap. An older producer that omits the
+  field means on (the historical behaviour) and must never silently change cadence. The drop is
+  AOD-only; the lockscreen canvas always keeps the configured cadence.
+- Upstream emits the same line in two stages (whether a pushed line carries `words` depends on that
+  particular push), and the layout engine takes two different paths depending on the word list
+  (word layout vs. balanced group wrapping), so switching forms re-flows the whole block and swaps
+  the fill mapping — measured frame by frame on device: at the line change the next line drops by
+  one row height (80 px) and the fill front retreats and re-fills. The canvas therefore stabilises
+  enhancements by line identity: a line keeps the wrap form it was first seen with, accepting a
+  "words appear" upgrade only inside the 300 ms grace window before the line starts (nothing has
+  been sung yet, so the re-flow is invisible); "words disappear" downgrades and mid-line word-text
+  changes are rejected (`shouldAdoptLineEnhancements`). The next-line text is stabilised the same
+  way: when it equals the main line's text it is treated as "not ready" (the previous next line was
+  just promoted and the following one has not been pushed yet — measured on device: the two are
+  identical for ~0.5 s after a line change), so the previously shown text is kept and the row's
+  text/height cannot re-flow the block right after the transition (`isNextLineStale`).
+- Render-mode values shown on a surface are resolved from the compiled per-surface profile first,
+  and only fall back to the lyric producer's reported render modes when no compiled profile is
+  available (degraded / legacy document). The in-app preview renders from that same compiled
+  profile, so both ends must read one source; a setting that only ever travels inside the
+  producer's render modes is a parity defect, not a source-specific default. The fields covered are
+  weight, text size and its custom percentage, secondary-text mode, word animation, glow,
+  line-progress effect, overflow, font family, line-change animation (the profile's `Auto` resolving
+  to the default), main alignment, song-info anchor, and adaptive sectioning. Producers must not
+  report an animation value that the AOD value normalizer would rewrite — the historical
+  `Karaoke fill` is not part of the current vocabulary.
+- The built-in demo lyric lines shown by the in-app preview (used whenever no live lyric state is presented) follow the interface language: an English interface shows the English demo track, and every other selection (system default / Simplified Chinese) shows the Chinese demo track. Only an explicit English selection switches; a device set to English while the user explicitly picks Simplified Chinese keeps the Chinese demo.
+- The built-in demo lines carry complete auxiliary content, so the auxiliary-text and furigana settings stay visible in the preview under either interface language: every demo line carries both a transliteration and a translation (the English track a phonetic reading and a Chinese translation, the Chinese track pinyin and an English translation), and the Chinese track's ruby annotates the whole line — never a leading fragment, which would leave a stray pinyin cluster above the first characters.
+- The in-app preview falls back to the built-in demo lyric lines whenever no **playing** lyric
+  state is available. The arbiter deliberately keeps a paused state forwarded (a paused position
+  feed is silent by nature, not a fault), so a paused transport must not keep the preview pinned
+  to the last lyric line sung before the pause; when playback resumes the live state takes the
+  preview back. This is a preview-only rule: the lockscreen/AOD presentation keeps its own
+  paused-retention semantics unchanged.
+- Each surface profile may also show the upcoming lyric line (second lyric line) as secondary text.
+  That presentation borrows the secondary-text sizing and the profile's bright/dim secondary
+  selection but keeps the next-line color setting; when enabled it replaces the standalone next-line
+  row instead of stacking with it, and when it is off the standalone next-line presentation is
+  unchanged.
+- Each surface profile may additionally show the second lyric line's own auxiliary text
+  ("Show auxiliary text for the second line"): when enabled, the second lyric line carries its own
+  transliteration and/or translation rows (selected by the secondary-text mode, present only when
+  the source provides them) — four rows in order: first line, its auxiliary text, second line, the
+  second line's auxiliary text. The second lyric line itself uses the secondary-text form (the
+  switch implies that form even with "Show second line as secondary text" off, since showing the
+  second line is the premise), its auxiliary rows reuse the auxiliary-row sizing/brightness and the
+  shared second-line alignment, and their wrap budget follows the rendered line count of the second
+  line itself (never the main line's), and with the switch off the two existing second-line
+  presentations are byte-for-byte unchanged. Sources whose upcoming line carries no auxiliary text
+  simply render the rows they have.
+- Auxiliary secondary-text rows (transliteration, translation, and the second lyric line in
+  secondary-text form) render at roughly half the effective main lyric size. Their absolute
+  readability floors are capped relative to the effective main size, so the auxiliary form stays
+  visibly smaller than the main line at every size setting and never renders as a second main
+  line.
+- Auxiliary text can light up word by word ("word-by-word auxiliary text": a per-surface switch,
+  default off). When it is on, the first line's auxiliary rows (transliteration and translation)
+  are drawn through the same shared karaoke renderer as the main line, so their bright/dim
+  progression and sweep — and in the `BetterLyrics` mode the float, long-block scale and glow
+  (that mode sweeps every block except long ones: a long block lights up solid) — follow the main line,
+  while the rows keep the auxiliary color and the bright/dim auxiliary setting. Rows whose source carries word-level romanization light up on those real word windows;
+  everything else is synthesized across the row's own line window with the same geometric front as
+  the synthesized main-line karaoke (CJK per character, western per word, one shared highlight
+  progress per block). A concurrent (duet) line's own auxiliary rows use that line's window. Rows
+  belonging to the second line — the secondary-form second line and its own auxiliary rows — never
+  take the effect (their playback window has not started). The switch is independent of the main
+  line's progress effect: with `None` the main line stays static while the auxiliary rows still
+  animate (and keep the frame clock running). With the switch off the auxiliary rows
+  are byte-for-byte unchanged.
+- Song info and the second lyric line each carry their own per-surface alignment choice (`auto`,
+  `start`, `center`, `end`). `auto` follows the resolved main lyric alignment (the main `auto` still
+  right-aligns right-to-left lyrics); explicit values align that row independently of the main
+  lyric. Both second-line presentations (secondary-text form and standalone next-line row) share the
+  one second-line alignment choice.
+- Duet left/right split is a per-surface switch (default on). When it is on, a line whose per-line
+  `alignedRight` is set draws on the right side; when it is off, every line resolves from the main
+  alignment instead. The per-line side comes from the lyric source: an explicit per-line flag (Spicy
+  `alignedRight`, Lyricon `isAlignedRight`, plugin `isAlignedRight`) always wins, otherwise it is
+  derived from per-line singer-identity metadata (`agent` / `amll:agent` / `vocal` / `amll:vocal`,
+  plus the type keys `amll:agent-type` / `agent:type` / `agentType` / `vocal:type`) — the first
+  singer stays left and later singers go right; with explicit types, `group` stays left while `other`
+  starts right and flips on each singer change. Songs without singer metadata keep the plain
+  main-alignment behaviour.
+- Duet marker recognition is a document-level switch (default on). When it is on, a leading
+  （男）/（女）/（合） text marker on a lyric line is recognized as singer identity: the marker text is
+  hidden on screen (main line, next line and the karaoke word list alike) and, where line metadata
+  carries no singer identity, feeds the duet left/right derivation above; （合） never alternates and
+  keeps the source side. Section markers such as （副歌）/（间奏） are recognized the same way (a run of
+  stacked or compound markers like （男·RAP） strips as one), but only hide their text — they never
+  act as singer identity and never move a line's side. Parenthesized text outside the marker
+  vocabulary stays as lyric content. A line that is only markers keeps displaying as-is. When the
+  switch is off, lines display as-is and markers take no part in the split.
+  Explicit per-line sides still win in either state.
+- Show concurrent lines (duet) is a per-surface switch (default on; lockscreen and AOD independent — CN+ extends upstream's AOD-only scope to the lockscreen card): producers holding a
+  whole-song line list (Spicy document, Lyricon, LyricInfo) pre-compute the concurrent candidate —
+  a sung line whose playback window overlaps the primary line by at least one second (pure
+  time-overlap; no singer metadata is involved and interlude rows never join). Projection only
+  applies the switch and converts the candidate; it never re-selects rows. When the switch is on
+  and the snapshot carries the candidate, the AOD canvas stacks the concurrent line as a same-size
+  section adjacent to the primary block (top-anchored layouts keep the primary's position stable;
+  bottom-anchored and centered layouts redistribute the stack), each section with its own karaoke
+  sweep. A joining line fades in muted over 180 ms; an ended overlap is held until the primary line
+  ends (exit buffer), so a duet section never collapses mid-passage. When the combined stack exceeds
+  the lyric area the whole block scales by one shared factor with a 0.3 absolute floor (below the
+  floor the overflow clips). While a concurrent line is present it replaces the standalone
+  next-line row. The projection carries the candidate while either surface wants it, and each
+  surface renders the concurrent section only when its own switch is on. SuperLyric (a line-push source
+  without a whole-song view) never produces a concurrent candidate. The upstream slot-inheritance
+  and per-section transition machinery is intentionally simplified in this port (v1); the selection
+  semantics otherwise match upstream 99ba119d4.
+- The producer ingest normalizes line windows against their word windows before selection and
+  rendering, treating only self-contradictory shapes while a normal tail stays byte-identical:
+  (1) when the word window extends beyond its line window the line window expands to the union
+  (`lineStart = min(word start, line start)`, `lineEnd = max(word end, line end)`); (2) when the
+  line window far exceeds the plausible singing span of its text (gap-swallowing artifacts of
+  synthesized word timing, observed seconds off on real tracks) and the word span is plausible,
+  the window is re-anchored to its words (first-word begin / last-word end) — when the word span
+  is equally damaged the line window stays untouched and suspect word timing is dropped to
+  line-level fill, with a head-attached window starting at `end - estimated sing duration`;
+  (3) every other shape, a normal tail (line window longer than the word union within the normal
+  range) included, is returned unchanged. A line delivered without a word table has nothing to
+  normalize and keeps its window as-is. Normal rows are untouched. The head clamp only engages
+  when a track shows at least two damaged rows (real damage is systemic, while a genuine held note
+  is an isolated long window); an isolated long-window row keeps its exact original window.
+  Estimation ignores leading markers, which are not sung; a line that is only markers counts as
+  zero sung characters.
+- The plugin chain keeps field-level priority — a processor result's declared
+  `changedFields`/`changedLyricFields` decide which host fields it overrides, and a result that
+  declares `WORDS` takes its word table (text and timestamps) wholesale — while the merged
+  document itself stays self-consistent: after the merge, when an accepted result declared
+  `WORDS`, every row's line window runs through the same producer-ingest normalization above (a
+  word window beyond the line window expands the line to the union; a line window far beyond the
+  plausible singing span with a plausible word span re-anchors to the words; every other shape, a
+  normal tail included, is returned byte-identical; a row without words has nothing to normalize).
+  Without a `WORDS` declaration the merged document is handed downstream exactly as merged — the
+  host word table already passed the ingest normalization, and the host never infers changes by
+  comparing DTOs. Plugin word timestamps therefore keep priority without ever contradicting the
+  line windows they land in.
+- A seek observed by one producer is forwarded to the others (`onExternalSeek`), so a producer
+  whose own position source froze or dropped its seek callback snaps to the authoritative
+  position at once instead of lagging behind.
+- Lyric time offset is a document-level slider (default 0 ms, range ±5 s, quantized to 50 ms;
+  semantics reference HyperLyric's lyric time offset): timeline producers (Lyricon, LyricInfo,
+  Spicy) evaluate line selection and emit `positionMs`, line windows, word timings and
+  `nextLineStartMs` on the display timeline `position − offset` — positive values show lyrics
+  later, negative values earlier. The machinery layer (extrapolation, residual rejection, seek
+  detection and cross-source seek forwarding, song-end clamping) keeps raw media coordinates;
+  only the emitted display coordinates shift, so the karaoke sweep stays coherent with the
+  selected line. Changing the slider takes effect immediately (producers refresh on
+  customization change). SuperLyric is a line-push source (a line is shown when it arrives) and
+  is not affected. The offset applies to both surfaces; the plugin chain's whole-song snapshot
+  keeps the raw timeline.
+- Line-change animation is selectable per surface profile from a fixed vocabulary: `Auto`, the
+  historical modes `Fade up`, `Crossfade`, `Slide up`, `Slide left`, `Zoom`, the 25 HyperLyric
+  line-change presets by their original ids (`fade_out_fade_in`, `fade_out_up_fade_in_up`,
+  `fade_out_down_fade_in_down`, `fade_out_left_fade_in_right`, `fade_out_left_fade_in_up`,
+  `fade_out_left_zoom_in`, `fade_out_left_landing`, `fade_out_right_fade_in_left`,
+  `fade_out_right_fade_in_up`, `fade_out_right_zoom_in`, `fade_out_right_landing`,
+  `fade_out_left_zoom_in_right`, `fade_out_right_zoom_in_left`, `slide_out_left_slide_in_right`,
+  `slide_out_left_fade_in_up`, `slide_out_left_zoom_in`, `slide_out_left_landing`,
+  `slide_out_right_slide_in_left`, `slide_out_right_fade_in_up`, `slide_out_right_zoom_in`,
+  `slide_out_right_landing`, `flip_out_x_flip_in_x`, `flip_out_y_flip_in_y`,
+  `rotate_out_rotate_in`, `zoom_out_zoom_in`), or `None`. `Auto` keeps the lyric source's own
+  preference; any explicit choice overrides the source preference, including `None`. `None`
+  performs no line enter/exit animation. `Fade up` is the historical default and must remain
+  pixel-identical to it. A transition draws the frozen outgoing rows against the incoming rows;
+  for the historical modes the outgoing layer completes in 130 ms and the incoming layer in 210 ms
+  from one elapsed anchor (the two overlap), and motion is limited to fade, upward/leftward
+  translation, and content-centered zoom scale. The row layer covers the whole lyric block: the
+  main lyric, the auxiliary text (transliteration/translation), and the next-line row enter and
+  leave in one layer, and the auxiliary text changes lines together with the main lyric rather
+  than popping instantly. When the line advances normally, the second lyric line and its own
+  auxiliary rows (the "show auxiliary text for the second line" feature) form the
+  content-continuation group: they neither exit with the main-line group nor re-enter —
+  the second line promotes to the main slot while its auxiliary rows translate (without
+  scaling, at constant auxiliary brightness) to the new main's auxiliary slots. Exit and enter progress each pass through a cubic curve (ease-in on
+  exit, ease-out on enter) before frame recipes are sampled; the metadata fade stays linear. The
+  HyperLyric presets replicate the reference implementation (HyperLyric `YoYoPresets` with
+  daimajia AndroidAnimations 2.4) as sequential out-then-in switching: the outgoing rows finish
+  first (200/250/300 ms per preset) and the incoming rows then play (300–700 ms per preset).
+  Their per-preset motion is kept identical to the reference — fade drift at a quarter of the
+  row-block width/height (the layer's own row-box bounds: main lyric plus auxiliary and
+  next-line rows, excluding the song-info row, with the outgoing layer using the old block and
+  the incoming layer the new one — never the canvas content clip frame), full-width/height
+  slides, flips and rotations about the content center, zoom/landing keyframes; per-preset
+  easing likewise (exit `FastOutLinearIn`; enter `OvershootInterpolator` 1.0–2.0,
+  `QuintEaseOut`, or `FastOutSlowIn`); travel may momentarily
+  pass the settle position while alpha stays clamped at 1. `Fade left`, `Landing`, and
+  `Slide swap` are compatibility short names for `fade_out_left_fade_in_right`,
+  `fade_out_left_landing`, and `slide_out_left_slide_in_right` and normalize to those ids.
+  The transition clock is lyric-position-driven, not wall-clock: the start position is captured
+  when the transition starts (the canvas's own `projectedPosition()`) and each phase advances by
+  the position delta over its own duration, so content arriving late (position / line window /
+  `nextLine`) can no longer re-target a flight in progress. Samples between frames are rate-limited:
+  the raw projected position is followed at no more than the playback rate (elapsed wall time ×
+  `speed`), so a doze batch jump — two positions ~2 s apart delivered within the same millisecond —
+  is consumed at real time and each phase advances smoothly over its own duration instead of
+  finishing inside one frame (device frame-strip tracking measured isolated single-frame spikes of
+  -68 px, 8× the 8 px criterion; the post-fix A/B re-verification still measured -76 px because the
+  promotion travel itself was still scheduled by a fixed 132–220 ms duration — a peak-velocity cap
+  was then tried and later dropped because it erased the speed scale; the first-frame jump is
+  fixed by position smoothing plus the start-pose continuity below). A frozen position (pause) freezes the transition at its current
+  progress; a position jump (seek/drag) clamps progress and ends the transition immediately instead
+  of chasing the new position, while a position-feed stall/resume drift within the 300 ms tolerance
+  never rewinds the animation. The raw-position high-water is tracked separately from the
+  rate-limited position, so a rewind seek is still detected immediately after a batch jump, and a
+  pause-resident position change (speed 0, only possible via seek/refresh) keeps the historical
+  jump semantics instead of freezing mid-flight. The promotion travel is scheduled by the
+  configured duration, not by a velocity cap: its duration is
+  `max(220 ms × speed scale, distance / 3000 px·s⁻¹ × 1000)`, where `distance` is the largest
+  baseline delta between the start layout's next-line rows and the target layout's main-line rows
+  (main pair plus auxiliary pairs, all of which advance under the same easing). The speed scale
+  applies in full — 216 px: `Slowest` 440 ms, `Slow` 330 ms, `Normal` 220 ms, `Fast` 132 ms,
+  `Fastest` 88 ms, so the rate is visible end to end — and only a very long travel engages the
+  average-velocity guard (1500 px → 500 ms floor, measured on the average rather than on the ease
+  peak; the 216 px guard floor of 72 ms never dominates the 220 ms × scale). The historical
+  peak-velocity cap is removed because it erased the speed scale for typical pitches (216 px:
+  ≈ 1.19 s at Normal and Fast alike, ≈ 1.78 s at Slow) — on hardware it read as "changing the
+  rate does nothing, and everything is too slow". When the row-delta distance is unavailable
+  (0/invalid) the configured 220 ms × speed base is used. The promotion's start pose is continuous with the previous frame
+  (round 3): the drawn placement (`lineTransitionMovePlacement`) anchors the promoted row's
+  first-line baseline — `baseline = target + (from − target) × (1 − eased)`, with the scale pivot
+  on that same baseline — so progress 0 draws exactly the last frame's geometry (the old
+  next-line row in place, at its own size) instead of the old translate-then-scale-about-the-
+  target-box-center composition, whose composite offset pulled the first move frame tens of pixels
+  up (device frame-strip recwalk4: −38 px on the first frame while the following frames measured
+  ~9 px). Wrap/line-count changes (old next line 1 visual line ↔ new main line 2 wrapped lines)
+  ride the same placement: the first line never jumps, the block grows with the scale. The
+  position clock additionally re-anchors the transition start when the move segment first begins
+  (`moveStartAnchorPosition`): when the first drawn frame lands past the exit phase (low cadence /
+  doze batch), the start is snapped to `smoothed position − exit duration` so that frame renders
+  moveProgress = 0 and the travel plays its full duration from the on-screen pose instead of
+  jumping into the segment; the anchor is skipped when the position advance is not rate-limited,
+  so pause/seek keeps the instant-settle / instant-end semantics. The transition never chases old backlog as a
+  hard cut: when the incoming snapshot is older than the whole transition timeline (exit +
+  promotion + enter), or a second line-changing snapshot arrives within the same frame, the full
+  transition is skipped and the canvas plays a compressed replay of the same three-phase sequence
+  — the on-screen geometry captured as the start, the last snapshot's geometry as the target
+  (both frozen at start), the same segment order/easing/frame recipes, with exit and enter
+  compressed into the ~140 ms budget (every segment ≥ 40 ms) while the promotion travel keeps its
+  configured duration (220 ms × speed scale, with the long-travel average-velocity guard) — so a doze batch, where several snapshots of different lines and
+  positions arrive inside one frame, reads as "quick but continuous" instead of a one-frame pop.
+  The compressed replay is the one path timed by wall clock (the stale snapshot's position anchor
+  is meaningless: its position delta far exceeds the replay), and a seek/drag still ends it
+  immediately on the raw-position high-water.
+  Animation speed only scales the per-mode durations. Unknown profile values normalize to `Auto`;
+  legacy lowercase source aliases `continuity`, `crossfade`, and `none` map to `Fade up`,
+  `Crossfade`, and `None`, and an unknown wire value is fail-safe `Fade up` — never a novel
+  animation.
+- Line-change animation speed is selectable per surface profile from a fixed vocabulary, ordered
+  slowest to fastest: `Slowest` (2.0× duration), `Slow` (1.5×), `Normal` (1.0×), `Fast` (0.6×),
+  `Fastest` (0.4×). Speed scales every timed segment of the line change — the exit/enter durations
+  (historical base 130/210 ms; the HyperLyric presets scale their own 200/250/300 ms and
+  300–700 ms bases the same way) and the promotion travel base (220 ms) — and never changes frame
+  recipes, easing curves, or motion parameters; with `None` animation there is no animation for
+  speed to act on. The legacy `Slow`/`Normal`/`Fast` values and their multipliers are unchanged
+  (stored configurations keep their behavior). Speed is a pure visual preference with no
+  follow-source semantics. Unknown profile values normalize to `Normal`.
 - Main lyrics accept a per-surface wrap limit of 1, 2, 3, 4, 5, or no user limit. Text size up to 200%
   must use the selected limit rather than the old fixed three-line ceiling. Safe-area geometry,
   optional-row removal, bounded minimum size, and fail-closed placement remain authoritative.
 - Each surface profile stores metadata size from 50% to 200% and ruby-reading visibility. Ruby is
   shown by default and, when disabled, reserves no drawing or layout height.
-- During the generation-bound song intro, matching one-line title/artist text suppresses the duplicate
+- Song info content is a document-level setting shared by both surfaces: which slices to show
+  (title, artist, album), the order they render in, and one separator per adjacent pair. Selection
+  order is display order (the selected order is preserved; unselected and blank slices are dropped;
+  `·` inside a slice still marks a slice boundary). Two or more selected slices mean one separator
+  slot per adjacent pair, each chosen independently from the same vocabulary — `newline` (one slice
+  per line, the historical default) or an inline join (` · `, ` - `, ` | `, `、`, ` / `). The
+  separator sequence normalizes to exactly the slot count implied by the selected parts: missing or
+  invalid slots fall back to `newline`, extra slots are truncated, and a single selected part has no
+  slots. Documents saved before this change carry the single legacy `metadataSeparator`, which is
+  expanded across every slot on first read and then cleared, so the seeding happens only once. The
+  canvas splits the assembled metadata into lines on line breaks only — never on the separator text
+  — and never renders more than three metadata lines. Unknown parts/separator values normalize to
+  the defaults. Each surface profile additionally carries a hide-album-when-it-matches-the-title
+  toggle (a surface that leaves it unset inherits the document-level default): when enabled and the
+  album text equals the title after trimming, the album slice is dropped from the assembled song
+  info, so the album slot produces nothing; a different or blank album is unaffected.
+- Song artwork is a per-surface setting, configured independently for AOD and lockscreen (show
+  toggle, square/circle shape, adaptive-vs-fixed size, circle-only rotation); each surface profile
+  stores its own values, so toggling one surface never moves the other. When shown, exactly one
+  artwork slot sits immediately left of the song-info block: the slot side is adaptive by default —
+  1.6× the metadata text size, scaling with the metadata size — or, when the per-surface adaptive
+  switch is off, a fixed custom side length (12–96 dp, default 22 dp, which equals the adaptive side
+  at 100% metadata size) that ignores the text size; a 6dp gap separates the slot from the text, and
+  the row's alignment resolves the artwork+text group as one unit while lines inside the text block
+  keep their own alignment. The song-info band is max(text block, slot side): a slot taller than the
+  text block grows the band with the text block kept vertically centered in it, so the slot is never
+  clipped by the content box or the lockscreen card, and the band height feeds the measured card
+  height and the metadata widget budget — the static widget budget reserves the slot side plus an
+  8dp vertical allowance, so a large custom slot is never clipped. The slot and the text block share one
+  vertical center — the optical middle of the text (baseline midpoint + (ascent + descent)/2).
+  The circle spin freezes while playback is paused — no per-frame work during pause retention —
+  unless the per-surface keep-spinning-while-paused switch is on. Frames are fail-closed: only the
+  album art of the verified current playing
+  music software's current track (a playing media session whose package and track identity match
+  the displayed song) is ever shown — stale playback-window art, other packages, or ambiguous
+  matches display nothing. Frames are bounded (≤ 24 KiB JPEG from a ≤ 192px downsample) and
+  decoded once per frame key. Square shape never rotates; circle rotation is a uniform 12s/turn
+  spin driven by the same effective-cadence gates as timed lyrics (no frames while the surface is
+  hidden). Unknown shape values normalize to square; rotation applies only to circle. Documents
+  saved before the per-surface move seed both profiles once from the stored global values. Privacy:
+  artwork bytes never leave the device and are excluded from diagnostics; power: static artwork
+  adds no per-frame work and the spin stops with the existing cadence gates (surface hidden, or
+  paused unless keep-spinning-while-paused is on).
+- During the generation-bound song intro, matching one-line song-info text suppresses the duplicate
   metadata row and morphs into the persistent metadata position and size after three seconds.
   Incompatible or wrapped geometry uses bounded crossfade. Neither path changes whole-surface alpha,
-  stock-clock brightness, or placement authority.
+  the keepalive brightness policy, or placement authority.
 - Imported data cannot name classes, resources, methods, paths, URLs, commands, or external bitmap
   sources.
 - Reset restores the built-in safe profile.
@@ -304,8 +720,11 @@ Enabled fixed registry:
 - media_progress on lockscreen only.
 
 Artwork accent, status text, spacer, and divider remain rejected until each has a real bounded
-renderer, placement contract, privacy/power analysis, and device evidence. AOD progress/artwork
-remain sanitized out.
+renderer, placement contract, privacy/power analysis, and device evidence. Song artwork (the
+metadata-companion image described above) is the one accepted artwork form: it ships with a
+bounded renderer (24 KiB JPEG cap, single left-of-song-info slot), a placement contract, and a
+privacy/power analysis. AOD progress remains sanitized out; song artwork rides the wire as a
+bounded frame and is hidden whenever verification fails.
 
 AOD policy may further reduce luminance, bright area, animation, artwork, component count, or scene
 size regardless of user/imported values.
@@ -353,3 +772,208 @@ Matching includes SystemUI/AOD package versions and exact required symbol signat
 missing symbols disable only dependent behavior. Stock UI is never hidden, replaced, reparented,
 remeasured, or restyled. Clock translation control is allowed only by the verified AOD scene policy
 above and must fail back to Xiaomi's original target.
+
+---
+
+# 中文 / Chinese
+
+状态：实现契约
+
+本文档是 `PARITY-SPEC.md`（私有文档，未随公开树发布）的扩展。AOD 渲染继续遵循既有的 parity 契约。本规范定义 surface 可见性、隐私、连续性、自定义与 fallback。
+
+## 共享 snapshot
+
+- SystemUI 使用一个经过校验的 Binder 客户端和一个不可变的、surface 中立的歌词 snapshot。Binder 状态在投递到主线程之前，同步解码为自有不可变数据，并遵守共享的数量、UTF-8 与编码体积限制。
+- 锁屏与 AOD 基于相同的内容、行、时间锚点与曲目 generation 渲染各自的视图。
+- 新附加的 surface 会立即收到缓存的最新 snapshot。
+- 过期、Binder 死亡、调用方失败或无效 payload 会隐藏所有订阅方。被显式标记为真实 Spotify 暂停的隐藏状态，可以按照下文的共享有界策略保留最后的有效歌词 snapshot。终态隐藏状态会将其清除。
+- 过期 snapshot 在投递边界、订阅方看到之前就被丢弃。producer 按 1.5 秒节奏发布全量快照或心跳，而 MIUI doze 可能把 SystemUI 一次冻结约 20 秒，因此单次解冻会整批投递积压（真机实测：19ms 内 12 条，卡拉OK 位置跨度约 18 秒播放内容）。可见快照年龄超过 1.5 秒即丢弃，一批里只有最新状态会落地。换歌/换源（track generation 变化）、隐藏与暂停驻留边沿、以及绑定后的首条快照恒投递；被丢快照仍推进 revision 水位，并在其 keepalive/wake 标量与持有态不同时按最新值更新，keepalive 链绝不因此断开。
+- 状态/配置携带应用用户 ID；SystemUI 用户切换时会清除/重新绑定，并拒绝前一用户的缓存 payload。
+- 音译、翻译、带时值的朗读片段与注音（ruby）来自当前匹配的生产者文档（一旦到达）。在该文档存在之前（未带时值的曲目，或文档仍在传输中），标量状态可以保持原歌词行可见，并可以提供其辅助行——这是相对上游 v0.3.97 的一个有意的 CN+ 分歧，上游会完全丢弃标量辅助行。
+- 翻译在每个生产者/插件边界上都是冗余对（文本 + 词表，二者皆可单独出现）：只带词表时按词表拼出兜底译文（非空文本恒优先，词表不覆盖已有文本），词表原样穿过插件桥（`PluginLyricLine.translationWords`）；回向对只声明词表的插件结果同规则回填。词级翻译不得在任何边界被丢弃。
+- 携带假名注音（kana ruby）的中文文档属于语言不一致的生产者数据。Projection 保留原歌词，并拒绝该行的 ruby、整行罗马音与逐词罗马音；不会重新对歌词进行语言分类，也不会合成替代朗读。
+- 行填充结束点必须保持在曲目时长之内。超出该行生效窗口的生产者填充结束点，在渲染时会被钳制到生效结束点；这一有界失配不会导致本来有效的带时值文档被丢弃，也不会释放 keepalive。
+- AOD keepalive 与锁屏亮屏策略保持相互独立。任一策略都不能仅凭另一 surface 的状态而激活。
+- `playbackActive` 仅来自经过 UID 校验的 Spotify bridge，并被显式传输。其他媒体播放器无法激活歌词 keepalive。
+- 实时歌词要求 `playbackActive=true`。唯一的共享设置 `After Spotify pauses` 同时适用于锁屏和 AOD：立即清除、5 秒、10 秒、30 秒或无限期保留。默认为 5 秒。其他媒体播放器无法启动或延长该计时器。
+- 歌词源选择在首选与回退两条路径上使用同一故障谓词：stale 但暂停的生产者状态是冻结态、不是故障。首选源不可用时，回退源持有的此类冻结态只要带内容（非空歌词行或词级时间戳）就会被转发——暂停的会话保住最后一行歌词，而不会在空回退源旁清屏。健康（已连接、非 stale）回退候选按枚举顺序优先，冻结态只是兜底档。stale 且仍在播、或 stale 暂停但无内容的状态绝不转发。停滞诊断按同一结构画面去重（30 秒心跳），长时间停滞不会把有界诊断镜像刷掉。
+
+## 锁屏可见性与隐私
+
+对现有用户而言，锁屏歌词默认关闭。在锁定状态下显示媒体文本需要显式选择加入。
+
+锁屏场景只有在所有条件都通过时才可见：
+
+```text
+feature enabled
+supported package versions and required symbol signatures
+default Xiaomi lockscreen theme
+primary display
+keyguard showing
+not bouncer/auth entry
+fresh visible snapshot
+minimum safe scene area
+```
+
+该视图仅为视觉呈现：不可点击、不可聚焦、不可长按、不拦截触摸、不可被无障碍聚焦。Xiaomi 父视图的 alpha/可见性始终是权威来源。
+
+默认锁屏场景使用 Xiaomi 的 `getClockBottom()` 锚点。可选的内置卡片 scrim 在垂直方向与当前渲染的行紧密贴合，在歌词过渡期间对离场/入场边界取并集，并在可用时跟随可见的媒体卡片宽度。当原生媒体宽度不可用时，使用有界的 92% 宽度与深色卡片不透明度。场景矩形高度自适应内容：按已定内容宽实测内容行堆叠高度（含进度条间距与卡片上下留白）定高，「高度」设置仍是上限，有界最小高度仍是下限；基于设置的高度估算仅在内容就绪前兜底位置。渲染行不会贴住画布内容裁剪框：内容块按最外侧两行的绘制外扩量（辉光光晕半径 = 字号 × 36%，以及「BetterLyrics」档未唱字下沉量）预先让出垂直余量，首/末行的辉光与浮动不会被切平在画布边缘。顶部已由首行行前距提供的部分不重复计入；底部块尾与裁剪沿之间没有留白，按全额计入并同步计入实测卡片高度。不画这类效果的行（歌曲信息、下一行）与效果关闭的曲面不产生余量。
+
+通知几何对上次应用的边界采用 8 dp 死区。较小的动画抖动保持当前歌词卡片的位置不变；较大的移动则正常更新碰撞位置。
+
+锁屏卡片生命周期遵循 Xiaomi 原生 Spotify 媒体播放器：
+
+```text
+visible MiuiMediaHeaderView + current valid lyric snapshot -> show live card
+visible MiuiMediaHeaderView + eligible Spotify pause inside configured timeout -> show frozen card
+MiuiMediaHeaderView hidden -> hide lyric card
+MiuiMediaHeaderView removed -> discard frozen card
+projection disconnect/stale/invalid state -> discard frozen card
+```
+
+冻结卡片在收到符合条件的 Spotify 暂停时对播放位置做一次投影，随后使用 `speed=0`。0 秒超时立即清除。有限计时器使用原始暂停沿，不会因重放的隐藏消息或另一个播放器而延长。无限期保留仍会在上述终止条件下清除。
+只有当显式的保持唤醒设置已启用、锁屏歌词场景与原生 Spotify 媒体播放器可见、播放处于活动状态、且不存在 bouncer/认证 UI 时，锁屏才可能抑制自动变暗/休眠。暂停、播放器移除、bouncer 进入、surface 丢失、切换到 AOD 或禁用功能，都会立即释放亮屏请求。手动电源键休眠始终具有最高权威。AOD 单独保留最后可见 snapshot 与位置跟随状态，因此歌词场景和受管时钟不会在暂停时立即回跳。已确认的 Spotify 暂停会释放 AOD keepalive 与策略隐藏抑制；Xiaomi 可以正常休眠，同时冻结的视觉 snapshot 仍然可用。恢复播放或新的可见 snapshot 会正常替换它。
+
+当通知存在时，碰撞几何来自 Xiaomi 的栈内（stack-local）子项布局状态，而不是全屏栈宿主或经父变换的全局矩形。行高度使用 `actualHeight` 加上可用的裁剪量/边界。不可见/alpha 为零的子项仅在 linkage 过渡进行期间保持占位；稳定的过期行会被忽略。`avoid` 将歌词卡片放置在测得的原生通知块下方、剩余的底部安全区域内。原生通知的顶部内边距、位移、动画、测量与滚动从不被修改。可选行先隐藏，歌词收缩到有界最小值，几何不足/未知时按 fail-closed 处理。
+
+## AOD 可见性与生命周期
+
+- 既有的 AOD 显示行为与迁移得到保留。
+- 渲染器使用 AOD 根部内侧 overlay，绝不进入原生时钟测量。
+- 原生 AOD 位置更新触发合并后的歌词几何刷新。受管控制器目标是移动/调度权威。碰撞判定权威优先选择可见的精确 `AnimationHelper` 时钟视图，其次是可见的精确 `AODUpdatePositionController.mTargetView`，再次是受管请求目标。这同时覆盖 SystemUI 的亮屏形变与 AOD 插件在 `DOZE` 之后延迟/交叉淡化的渲染。递归的渲染后代并集仍然被禁止。
+- 自定义图像与不受管的 AOD 场景可以在控制器更新之前使用测得的原生内容几何。原生 linkage 场景在亮屏阶段立即渲染，使用精确的 SystemUI 时钟形变边界或有界的 35% fallback，然后在经验证的暗屏接缝处采用确定性的受管几何。
+- 在精确验证的普通/linkage 位置模式下，实验性场景协调器仅在歌词处于活动状态时，才可能平移 Xiaomi 的原生 AOD 内容容器并接管 burn-in 计时。在普通模式下，该容器同时包含原生时钟样式与自定义图像样式。
+- `AOD clock or image` 设置将既有策略呈现为一个选项。`Follow Xiaomi` 将原生内容平移留给 Xiaomi，HyperGlow 只观察精确目标并保持歌词画布干净。固定与移动选项则让 HyperGlow 成为同一时钟或图像容器的平移权威，并应用所选模式。
+- 受管位置重试耗尽的回落（上游 `1537c58`）仅在开启「实时跟随系统时钟」时释放托管控制、让场景跟随 Xiaomi 原厂几何。锚定（时钟钉住）模式下 integral pin 始终拥有时钟权威（与所选图案无关）：耗尽仅记日志，不释放托管控制、不置 latch，时钟行为保持不变。
+- Xiaomi 的移动回调仍被监听，以便缓存其最新自然目标，但在模块接管期间其平移被抑制。默认的 `static_bottom` 模式将原生时钟或图像容器一次性移动到经验证的底部区域，并在歌词活动期间保持在那里。可选的有界计时器可按 30 秒、1 分钟、2 分钟或 5 分钟的间隔选择六分区、四角或垂直交换位置。
+- Xiaomi linkage 的零号槽位及后续 burn-in 位置都是固定网格坐标，并非随机。模块在 AOD 根附加时注册位置控制器，并在有效布局后推导初始自然目标，而不是等待 Xiaomi 延迟的首次 `updateTranslation()` 回调。
+- 歌词在物理上与权威时钟边界相对的空闲区域内解析。受管动态区域变更是事务性的：歌词淡出 150 毫秒，等待 Xiaomi 精确的 `DozeHost.updatePosition()` 动画完成回调，一次性应用目标几何，然后歌词淡入 180 毫秒。若错过 OEM 回调，有界的 1500 毫秒超时会向前失败（fails forward）。画布不会持续穿越时钟路径。静态受管位置无需该移动事务即可保持可见。
+- 原生 linkage 有两个物理所有权阶段。当显示屏保持 `ON` 时，SystemUI 锁屏渲染器仍是 Xiaomi 形变锁屏时钟旁边的语义源。因为 Xiaomi 可能提前隐藏该源父视图，准备好的 AOD 渲染器会立即可见，位于从 `AnimationHelper.mClockAnima.mAllContainer`（fallback 到 `mClockView`）捕获的精确渲染边界的对侧区域。只有在该精确视图不可用时，位置才会保留保守的顶部 35%。当 `DozeService.setDozeScreenState(DOZE)` 应用暗屏显示状态，或附加的 AOD 根观察到物理显示状态 `DOZE`/`DOZE_SUSPEND` 时，权威直接落定为正常 AOD 几何，而没有第二次模块滑动动画。AOD 根会注册显示监听器，而不是仅依赖 OEM hook。不存在计时器驱动的视觉转移：如果错过 OEM 回调，已可见的亮屏安全布局保持不变，而不是提前移动或消失。在变暗之前唤醒会取消并回到锁屏源。自定义图像 AOD 保留其既有过渡行为。
+- 亮屏时钟碰撞状态是物理呈现状态，而不是语义上的歌词 linkage 状态。当播放暂停且当前 projection 被隐藏、但已授权保留的 AOD snapshot 被恢复时，该状态仍保持活动。`SNAPSHOT_NOT_VISIBLE`、已禁用的锁屏歌词或其他语义交接拒绝，都不能让受管暗屏几何覆盖仍在形变的亮屏时钟。每一次观察到的默认显示状态变更都会合并一次几何刷新，因此进入 `DOZE` 时即使没有语义过渡在进行，也会离开保守的亮屏槽位。
+- 在受管位置之外，自定义图像与不受管的 AOD 场景仍可使用紧凑测量的原生时钟边界。在受管位置期间，禁止渲染/控制器边界并集，因为 Xiaomi 交叉淡化后代与过期采样可能预留无关内容，或在移动中途切换几何权威。精确物理边界采用严格优先级：SystemUI 形变视图、AOD 控制器目标视图、受管目标。当该精确视图或任一祖先变为隐藏/透明时，对应物理边界即被清除。
+- Xiaomi 可能在亮屏 linkage 完成之前隐藏原生媒体行。仅当锁屏渲染器是活动的前向交接源时，才允许在没有原生媒体存在的情况下保留已授权的冻结/最新 snapshot；正常稳定的锁屏隐私策略保持不变。
+- 超级壁纸、翻盖、未知模式、无效几何、缺失符号或非活动歌词，均原样通过 Xiaomi 的原始平移。
+- 禁用功能、原生 Spotify 媒体播放器移除、projection 过期/断开、Binder 失败或 surface 资格校验失败，会释放静态/移动所有权，取消任何模块计时器，并恢复 Xiaomi 上一次未被修改的平移目标。符合条件的 Spotify 暂停仅在共享的配置超时内保留冻结的 AOD 场景与当前受管时钟位置。
+- 播放中的曲目 generation 变更会启动一个 8 秒的呈现租约并发出一次 wake 事件，使已同步与未同步的曲目都能短暂呈现换歌元数据。呈现策略以歌词字号显示标题和艺术家 3 秒，随后（在启用时）形变或交叉淡化到持久的小号曲目信息；否则移除标题/艺术家。正在活动的开场歌词或短于 3 秒的开场间隙，会将一整段 intro 推迟到下一个可用时间不少于 3 秒的 interlude。该状态绑定于 generation，每首歌曲最多消耗一次。它不改变播放、暂停保留、wake 身份、keepalive 或 AOD 生命周期策略。该 generation 的第一个被接受的带时值文档会发出第二个 wake 事件，允许已同步曲目在前一个未同步曲目超时后恢复 AOD。精确验证的 wake broker 仅在设备处于非交互状态时调用 Xiaomi 的 `DozeHost.fireAodState(true, "reason_keycode_goto")`。
+- 默认 keepalive 还额外要求存在包含至少一个正时长行的 `Line` 或 `Syllable` 文档。带时值文档到达会将当前呈现租约升级为持久 keepalive，且不产生虚假间隙。静态、缺失、加载中、无歌词以及退化的零时长文档在租约到期时自然释放。`Also keep AOD active without timed lyrics` 将这些未带时值状态升级为持久 keepalive。主保持唤醒偏好必须开启，租约、带时值与覆盖模式才能生效。
+- `Keep AOD active for` 将连续 Spotify 播放的生命周期会话限定为 5 分钟、10 分钟、30 分钟、1 小时、2 小时或无限期；默认为无限期。有限计时器在 keepalive 首次于连续播放段内变为活动时启动。切歌、文档变更、wake 事件、transport grace 与新鲜度心跳都不会重置它，同一播放段内的呈现租约间隙也不会重新锚定它。到期会释放 Xiaomi 生命周期抑制，播放可以继续；Spotify 暂停/停止仍然立即释放。该非播放沿之后的下一个符合条件的播放会话可以启动新计时器。
+- Xiaomi 生命周期抑制独立于画布可见性、布局与 linkage 所有权。它只要求已附加的 AOD surface、经校验的 keepalive 意图以及精确的生命周期能力。所配置时长的到期会在 projection 处撤回该 keepalive 意图，因此不存在单独的 SystemUI 计时器。该时长仅属于生命周期策略；它不改变 wake 身份、呈现租约、内容能力、暂停保留或渲染器状态。绘制唤醒的续期仍是渲染器侧的独立关注点。
+- 经校验的生命周期守卫还拥有一个窄幅亮度覆盖。在精确的 Xiaomi `DOZE_AOD` 状态下，通过 `MiuiDozeBrightnessTimeoutAdapter` 的较低非零请求会被钳制到 Xiaomi 自身的正 `CommonUtils.BRIGHTNESS_ON` 值。达到或高于该值的请求直接通过。零/关闭请求，以及 `DOZE_AOD_PAUSING`、`DOZE_AOD_PAUSED`、普通 `DOZE`、pulse、finish、未知状态或非活动守卫中的所有请求，均原样通过。这使口袋与接近传感暂停保持权威。守卫激活与释放时会通过原生适配器重新提交 Xiaomi 的上一次原始请求，因此 Xiaomi 保持其原生亮度超时行为，并在歌词 keepalive 结束时按原生适配器的正常延迟重新获得控制。
+- 一个被显式标记为 Spotify 仍在播放的瞬态隐藏沿，会在任何携带经校验 keepalive 意图的 snapshot 之后启动一个有界的 30 秒电源 grace。带时值歌词与由 `Also keep AOD active without timed lyrics` 保持的未带时值会话同样符合条件；歌词时值属于内容能力，绝不作为生命周期策略的门控。下一个可见 snapshot 会取消该 grace 而不重放 Xiaomi 隐藏策略。暂停/非播放状态立即释放。这防止短暂的生产者/状态间隙在歌曲中途中关闭 AOD。Projection 过期会保留已活动的经校验 keepalive 请求；断开连接、显式清除、暂停与 grace 到期仍然会释放它。
+- 换歌期间的非播放 `loading` 沿被投影为该有界的仍在播放 transport 间隙。其他所有非播放沿都是暂定的：Spotify 会在下一个 generation 到达前大约一秒将结束曲目报告为 `ready`/未播放，因此该沿首先被投影为同样的仍在播放 transport 间隙，只有在有界的 5 秒确认窗口之后、生产者仍在同一会话上处于非播放状态时，才成为真正的暂停保留。在该窗口内恢复的生产者或新会话会取消待定暂停，因此切歌永远不会释放 AOD 生命周期或重放 Xiaomi 隐藏策略。该窗口每会话只打开一次；在暂停时仍持续发布的生产者不得重新打开它。
+- ready、loading 与无歌词的可见播放都接收相同的 4 秒新鲜度心跳；未变化的 fallback snapshot 会被刷新，而不是在 5 秒后过期。
+- wake broker 将最近验证的 `DozeHost` 保留为一个有界的恢复引用，跨越 AOD 插件卸载周期。如果持久会话没有附加的 AOD surface，每个有界心跳都可以重试相同的 wake 身份，直到 Xiaomi 重建该 surface。交互式亮屏请求保持被抑制，系统 AOD 总开关设置保持权威。
+- 在 Xiaomi 已经开始隐藏 AOD 时到达的 keepalive 沿无法被抑制：策略隐藏已经执行，其 alarm 已无法取消，动画中途送达的 wake 只会重新武装 Xiaomi 自己的计时器。这一唯一竞态会在"非活动→活动"生命周期沿之后的有界隐藏动画窗口内、第一个 AOD 显示关闭沿上，一次性重新断言当前 wake 身份，且仅当 surface 保持附加时如此。恢复仅在该守卫沿发生时 AOD 仍在呈现的情况下被武装，由第一个关闭沿消耗，并需要新的守卫激活才能重新武装。从未派发过 wake 的会话不携带身份，也不会恢复。
+- 显示电源除此之外归 Xiaomi 所有。传感器或口袋暂停、主动休眠、过期会话与已释放的租约都会到达同一个显示关闭沿，重新唤醒它们会与 Xiaomi 形成自我维持的循环，每隔几秒重新点亮面板。Keepalive 从不把已关闭的 AOD 显示当作持续的唤醒理由，wake broker 的最小请求间隔也不能替代该约束。
+- 已确认的 Spotify 暂停会释放生命周期守卫一次，最迟在该沿之后一个确认窗口内；其冻结卡片仅可在共享的配置超时内、直到 Xiaomi 休眠或直到原生媒体播放器被移除之前保留，以最先结束呈现者为准。
+- 仅锁屏附加或可见本身绝不会抑制 Xiaomi 隐藏策略。
+- 超级岛（DynamicIslandWindow）在设备处于非交互状态时不得渲染。Xiaomi 的岛隐藏链路完全由状态迁移事件驱动（keyguard-showing 变化 collect 进岛的 tempHidden 状态），因此息屏后数秒内若发生一次系统策略发起的唤醒加蓝牙信任解锁，未落地的锁定迁移会被该次事件流吞掉，展开态的岛就会带着息屏前的内容留在 AOD 画面上。当 `PowerManager.isInteractive` 为 false 时，岛守卫捕获岛窗口根视图（`miui.systemui.dynamicisland.window.DynamicIslandWindowView`，来自 MIUI SystemUI 插件 classloader），按台账强制 GONE，以有界的 1 秒周期复断言，并把宿主对该根的可见性请求改写为 GONE、同时记录宿主最近的非 GONE 意图。改写同时落在 `View.setVisibility` 与 `View.setFlags` 两条接缝上：一次真实息屏现场（2026-10-02）实测宿主以高于每秒一次的频率把岛根重新置回可见，仅靠轮询会在两次压制之间留下可见间隙，只有调用点同步改写才能让根在 doze 期间持续保持 GONE、无闪烁。下一次交互态观察时按记录的信念态恢复，存量事件保持权威。符号缺失时整个守卫不安装，交互态行为不受影响，每次强制动作都记日志。
+
+## 锁屏自定义手势
+
+- `Block lock screen customization` 默认关闭，且独立于歌词可见性。
+- 在精确验证的 Xiaomi profile 上，抑制仅限于 `KeyguardEditorHelper.onTouchEvent(MotionEvent)`、最终的 `tryStartEditActivity()` 启动门，以及 `LockScreenMagazineController.handleSingleClickEvent()`。
+- 该设置屏蔽编辑器长按与壁纸轮播单击预览。
+- 不替换任何通用锁屏触摸监听器。滑动、通知、媒体、电源、指纹、生物识别与无障碍路径保持原生。
+- 方法缺失、包版本未知或设置已禁用时，均原样通过。
+
+## 抬起手势重映射
+
+- HyperOS 的 `Raise to wake` 仍是传感器主开关。模块不会强制启用它，也不会注册第二个拾起传感器。
+- 当 `Raise to show AOD` 在精确验证的 profile 上启用时，仅 detail 为 `com.android.systemui:PICK_UP` 的 SystemUI 唤醒调用会被重映射。模块首先通过已验证的 Xiaomi `DozeHost.fireAodState(true, "reason_keycode_goto")` 状态机接缝请求 AOD，然后总是抑制完整唤醒。如果 AOD 已由活动歌词维持，该请求实际上是冗余的，现有 AOD 保持可见。
+- 该重映射对此机主设备是全局的，不依赖 Spotify、歌词、媒体状态或任一歌词 surface 的启用状态。
+- 电源键、指纹、双击、通知、生物识别、相机与应用唤醒原因始终原样通过。
+- 在该设置启用时，唤醒宿主不可用会使设备保持非交互状态，而不是进入锁屏。wake hook 符号缺失、包版本未知、模块设置禁用或 HyperOS `Raise to wake` 禁用时，均保留原生行为。
+
+## 连续性
+
+- Linkage 使用相互独立的锁屏与 AOD 渲染器；不做视图重新父级化（reparenting）。
+- 交接状态是有界的、可逆的，并受单调令牌保护。
+- 行选择最多可冻结 600 毫秒，同时逐字/填充时值仍从同一 elapsed 时间锚点继续。
+- 曲目 generation 变更会立即取消冻结。
+- 源与目标矩形以窗口坐标捕获。几何缺失时退化为仅 alpha 交接；目标缺失时退化为原生附加/分离可见性。
+- 反向交接仅等待一个短的有界目标几何稳定期，然后从较小的正 Y 偏移启动锁屏歌词，并在 Xiaomi 显示父视图的同时向上滑动。目标动画不得在歌词视图仍不可见时完成。
+- 前向交接在几何与 wake 刷新期间保持 AOD 目标 alpha 动画；布局/wake 回调不得在过渡中途将目标重置为 alpha `1`。
+- 正常的行进入/退出动画在交接期间被抑制，并在稳定后恢复。
+- Xiaomi 原生锁屏父视图动画从不被覆盖。
+- 锁屏显示动画将完整卡片容器作为一个整体。文本、自适应背景、描边与媒体进度共享同一 alpha 与向上平移时间线。
+
+## 声明式自定义
+- 换行动画可在每个 surface profile 中从固定词表选择：`Auto`、历史档 `Fade up`、`Crossfade`、`Slide up`、`Slide left`、`Zoom`、HyperLyric 换行预设 25 档（沿用原 id：`fade_out_fade_in`、`fade_out_up_fade_in_up`、`fade_out_down_fade_in_down`、`fade_out_left_fade_in_right`、`fade_out_left_fade_in_up`、`fade_out_left_zoom_in`、`fade_out_left_landing`、`fade_out_right_fade_in_left`、`fade_out_right_fade_in_up`、`fade_out_right_zoom_in`、`fade_out_right_landing`、`fade_out_left_zoom_in_right`、`fade_out_right_zoom_in_left`、`slide_out_left_slide_in_right`、`slide_out_left_fade_in_up`、`slide_out_left_zoom_in`、`slide_out_left_landing`、`slide_out_right_slide_in_left`、`slide_out_right_fade_in_up`、`slide_out_right_zoom_in`、`slide_out_right_landing`、`flip_out_x_flip_in_x`、`flip_out_y_flip_in_y`、`rotate_out_rotate_in`、`zoom_out_zoom_in`）或 `None`。`Auto` 保持歌词源自身的偏好；任何显式选择一票否决源偏好，包括 `None`。`None` 不执行任何行进入/退出动画。`Fade up` 是历史默认。换行按「内容是否延续」逐行分流、严格序列「退场 → 晋级位移 → 入场」，任意时刻至多一段在播，同一句歌词只在一个层出现——旧行未走完新行已进场、同一句歌词在两层各画一次的「歌词重叠」由结构消除（历史档此前退场/入场共用 elapsed 锚点叠加进行，即该重叠来源）：1) 离场行组（旧行组 = 主歌词 + 辅助文字音标/翻译）播所选档的退场半段（如「向上渐隐＆向上渐现」的「向上渐隐」），历史档退场 130 毫秒、预设档各档 200/250/300 毫秒，运动仅限于淡入淡出、上移/左移位移与绕内容中心的缩放；2) 内容延续的行（旧「下一行」即新「主行」，仅常规前进一行时存在）不播退场/入场半段，只做槽位平移：自旧「下一行」槽位平移到当前行槽位，按两槽字号比等比放大、自旧行亮度升至全亮，FastOutSlowIn 缓动、缩放枢轴取行块中心；位移段按**配置时长**定时长而不是速度上限——时长 = `max(220ms × 速率倍率, 距离 / 3000px·s⁻¹ × 1000)`，距离取起点布局「下一行」与目标布局「主行」逐行基线差（主行对 + 辅助行对）的最大值：216px 五档 = 440/330/220/132/88 毫秒，速率档全程可见；仅 1500px 级横屏大位移触到 500 毫秒平均速度护栏（按平均速度计，不再按缓动峰值计）；历史上曾按峰值速度 500px/s 上限把 216px 拉长到 ~1.2 秒（Slow 档 1.78 秒），且末尾 max 把速率倍率整条抹掉（Normal 与 Fast 恒等，真机表现「改速率没用 + 太慢」），该限速已撤——起步不跳由位置限速平滑与起点几何锚定保证，不靠慢；取不到行位差（0/非法）时回退配置时长 220 毫秒 × 速率倍率；晋级位移的**起点几何与上一帧连续**（round 3）：绘制放置（`lineTransitionMovePlacement`）把首行基线锚在两槽基线之间——`首行基线 = 目标主行基线 + (旧下一行基线 − 目标主行基线) × (1 − 已缓动进度)`，缩放枢轴取该基线——progress=0 画出的就是过渡前最后一帧的几何（旧「下一行」原位、原字号），不再出现旧实现「先 translate 再绕目标行盒中心缩放」的复合偏移（目标行盒中心离旧槽位多远就偏多少；真机 recwalk4 逐帧实测起步第一帧 -38px、其后相邻帧 ~9px）；行数变化（旧下一行 1 行 ↔ 新主行 2 行折行）由同一式接管：首行不跳、块高随缩放进度增长。位置式时钟同步做「位移段起点锚定」（`moveStartAnchorPosition`）：delta 首次越过退场段时把过渡起点重锚到「当前平滑位置 − 退场时长」，使位移段第一帧 moveProgress 恰为 0、从屏上实际形态起步再按自身时长平滑推进——首帧晚到（低节拍/doze 批投递）不再把起步一帧跳进位移段；位置推进不限速（暂停/seek）时不重锚，瞬间落位/立即结束语义保持；第二行歌词的辅助行（音标/翻译）与被晋级的「下一行」同属内容延续组——不随主行组退场，随晋级平移到新主行的辅助槽位（不缩放、恒定辅助亮度），第二行辅助文字的换行动画跟随第二行歌词；3) 新到行（新下一行及其辅助行；晋级时新主行及其辅助行由晋级层呈现，不重复入场）播所选档的入场半段（如「向上渐现」），历史档入场 210 毫秒、预设档各档 300–700 毫秒；跳行/拖动/跨曲/无「下一行」行时无晋级段，旧行组整体退场、新行组整体进场。词表每档的「X＆Y」两半段分别作用于离场行与进场行；歌曲信息行（固定行）不参与，歌曲信息仅在其内容变化时线性淡入淡出（含切换形变）。退场/入场进度先经各档缓动（历史档退场 easeIn、入场 easeOut）再查帧配方。HyperLyric 预设档的退场/入场时长与帧配方复刻参考实现（HyperLyric `YoYoPresets` 与 daimajia AndroidAnimations 2.4）；运动逐项对齐参考实现——Fade 族按行块宽（高）的 1/4 淡出漂移/淡入、Slide 族整宽（高）滑出滑入、翻转/旋转绕内容中心、缩放/着陆关键帧；行块宽（高）取该层行块自身边界（离场层 = 旧行组主歌词 + 辅助文字行盒的包围盒、入场层 = 新到行行盒的包围盒，均不含歌曲信息行），与参考实现把位移施加在歌词行视图上（`target.getHeight()/4`）同义，不得改用画布内容裁剪框；缓动逐项对齐（退场 `FastOutLinearIn`；入场 `OvershootInterpolator` 1.0–2.0、`QuintEaseOut` 或 `FastOutSlowIn`）；位移可短暂越过落位点、alpha 钳制 1。`Fade left`、`Landing`、`Slide swap` 为 `fade_out_left_fade_in_right`、`fade_out_left_landing`、`slide_out_left_slide_in_right` 的兼容短名，归一到对应预设 id。过渡进度由歌词位置推导而非挂钟计时：过渡开始时记下当时的歌词位置（画布同源 `projectedPosition()`），各段按位置推进量在自身时长上换算——内容（位置/行窗/`nextLine`）晚到不再「飞着改目标」；采样间限速：裸位置只按播放速率（帧间隔 × `speed`）跟随，doze 批投递的位置跳变（真机实测同一毫秒两条位置、跨度约 2 秒）按实时速率补齐，各段以自身时长平滑播完而不是一帧推完（逐帧条带实测孤立尖峰 -68px/帧；首轮修复后真机 A/B 复验仍有 -76px/帧——固定时长下 FastOutSlowIn 中段峰值瞬时速度可达平均速度的 ~2.7 倍；起步不跳最终由位置限速平滑与起点几何锚定保证，位移段本身以配置时长为准）。暂停（位置冻结）时过渡冻结在当前进度；位置跳变（seek/拖动）时立即结束过渡、不反向「追」新位置，位置源 stall/resume 的采样回漂（容差 300ms）不算跳变、不倒带动画；原始位置高水位与限速后的平滑位置分开跟踪——批跳变后的倒退 seek 仍立即命中，暂停驻留期（speed=0）的位置变化只可能来自 seek/刷新，保持既有跳变语义而不冻在半路。过渡不追旧账：来料快照年龄超过整条过渡时间线（退场 + 晋级位移 + 入场），或同一帧内到达 ≥2 条换行快照时，不再一帧硬切，改播压缩补播——起点取屏上现有旧快照几何、目标取最后一条快照几何（均在起点定死），同一三段序列（段顺序/缓动/帧配方不变）：退场/入场压缩到 ~140ms 预算内、每段 ≥40ms，位移段保留配置时长（不再压到 40ms 一帧跳完）；补播是唯一按挂钟计时的路径（过期快照的位置推进量远超补播时长，位置锚无意义），seek/拖动仍按原始位置高水位立即结束。doze 批投递下多条不同行、不同位置的快照挤在同一帧到达，正是该判据的现场来源。动画速率只缩放各档时长。profile 未知值规范化为 `Auto`；历史小写来源别名 `continuity`、`crossfade` 与 `none` 分别映射为 `Fade up`、`Crossfade` 与 `None`，wire 未知值 fail-safe 为 `Fade up`——绝不引入新动画。
+- 换行动画速率可在每个 surface profile 中从固定词表选择（由慢到快五档）：`Slowest`（2.0 倍时长）、`Slow`（1.5 倍时长）、`Normal`（1.0 倍时长）、`Fast`（0.6 倍时长）、`Fastest`（0.4 倍时长）。速率等比缩放换行动画各段时长（退场/入场：历史档基准 130/210 毫秒、预设档各档 200/250/300 与 300–700 毫秒；晋级位移段基准 220 毫秒），不改变帧配方、缓动曲线与运动参数；`None` 换行动画下无动画，速率无从生效。历史三档 `Slow`/`Normal`/`Fast` 的值与倍率保持不变（已存配置行为不变）。速率是纯视觉偏好，没有「跟随源」语义。profile 未知值规范化为 `Normal`。
+
+- 文档是带版本的数据，而不是插件。
+- 应用进程编译执行迁移、规范化、能力过滤、限制与稳定的 revision 哈希。SystemUI 会再次校验。
+- 配置目标大小低于 32 KiB；硬性上限为 64 KiB。
+- 组件总数目标最多为 8；AOD 可见组件最多为 4。
+- 未知组件会被丢弃。不存在有效歌词组件时，退回到内置安全 profile。
+- 锁屏 `backgroundStyle` 仅接受 `auto`、`card` 或 `none`；AOD 始终将其解析为 `none`。
+- 行级进度保留 `None`、`Top to bottom` 与仅主歌词的 `Left to right` 近似模式，另加一个独立的显式整块兼容模式。近似从左到右进度将所有换行的主歌词行视为一个连续序列：先自左向右完成一个视觉行，然后在下一行继续。正常的渐变/进度动画只作用于主歌词；ruby、音译与翻译保持静态。仅整块选项保留当前对所有可见歌词行的同时扫过效果，且不得规范化为仅主歌词。每个 surface profile 独立选择亮色或暗色的次要文本呈现。逐字/音节级同步保持不变。行级同步标志在有活动行且不处于大元数据引导态时为真——逐字源与行级源一视同仁。主行的渲染路径（静态全亮＝`Minimal` 档或 `None` 效果、词级卡拉OK、共享扫光块）由同一个共享决策给出，实机画布（锁屏与息屏共用同一画布）与 App 内预览读同一份，输入为行级同步标志、源类型、行窗、逐字动画档与发光偏好。因此整块横扫只在显式选择该档时出现，绝不作为逐字源的回退。
+- 逐字动画接受 `Minimal`/`Gradient`/`BetterLyrics` 的固定词表（每个 surface 独立选择）。`BetterLyrics` 档（参考 jayfunc/BetterLyrics）把歌词源交给共享逐字卡拉OK渲染核心（实机画布与 App 内预览同源）：逐字/音节级时间源用真实词窗；行级（无逐字时间）源按字符合成时间窗——推进前缘与行级扫光几何完全一致，因此效果对两类源同样适用：**该档按口径 B 逐词块判定扫光**——长音节（≥700ms）「开始唱即整块按已唱色亮起」、不出现填充前缘（辉光仍只挂长音节词块），其余音节恢复历史词内扫光带（口径沿革：只关长音节（2026-10-04）→ 关「含长音节的整行」（2026-10-04 晚）→ 0.3.156 (183) 整档关闭 → 本次恢复短音节扫光（2026-10-05），当初逼出整档关闭的跳变成因已由同行形态稳定化 / 下一行文本稳定化 / 位置时钟过渡 / 摄取归一修掉）；未唱音节下沉约 10% 行高、唱到时在约 450ms 内上浮回基线；长音节（≥700ms；合成源按合成块时长判定——中文逐字块、西文按词块——短词块不放大不发光）演唱中放大到 1.15、唱完回落原大，长音节块内字符共享块级进度、整块同步放大/辉光；仅在发光偏好开启时，演唱中的长音节带 glow 色光晕（半径约为字号的 36%）。短音节保留既有放大运动（峰值 1.0505）；发光关闭时该运动不变、光晕消失（长音节整块亮起不变）。「行进度效果=None」仍解析为静态全亮；仅息屏的对唱并发行保留共享扫光管线；`BetterLyrics` 档绝不走共享行级扫光（带行窗的逐字源也不例外），恒走词级卡拉OK路径；profile 未知值仍规范化为 `Gradient`。
+- 帧调度遵循同一节拍契约:时序行播放期间画布按配置的帧间隔重绘(默认 16ms,或用户选择的渲染刷新率上限档)。息屏画布在此之上还有一档粗粒度降帧——电量低且未充电(≤15%)或设备热状态 ≥ MODERATE 时,逐字扫光降到 200ms(约 5fps)的粗粒度步进:扫光仍可读,而绘制功耗大幅下降。该降帧由用户开关(`aodPowerSaver`,默认开启)经编译配置门控:开关关闭时画布绝不降到帧上限以下。旧生产者不带该字段时按开启处理(保持历史行为),绝不静默换档。该降帧仅作用于息屏画布;锁屏画布恒按配置节拍渲染。
+- 同一行会被上游两阶段下发（逐行源推来的行里带不带词表取决于它那一笔），而折行引擎按「有无词表」走两条不同路径（词行布局 / 分组均衡折行），形态切换会重排整块并更换填充映射——真机录屏逐帧实测：换行瞬间下一行被顶下去一行高（80px）、填充前缘中途倒退重填。画布按行身份稳定增强数据：同一行只认第一次的折行形态，仅在行开始前的 300ms 宽限窗内接受「无词→带词」升级（此时尚未演唱、重排不可见）；「带词→无词」回退与演唱中的词表文本变化一律拒绝（见 `shouldAdoptLineEnhancements`）。下一行文本同样稳定化：与主行同文即视为「未就绪」（旧下一行刚被晋级、新下一行尚未推来，真机实测换行后 0.5s 内两者同文），沿用上一版文本，避免换行后行集合/行高随文本切换重排（见 `isNextLineStale`）。
+- 渲染面上呈现的渲染模式取值，一律先从编译后的 per-surface profile 解析，仅在没有编译产物时（降级 / 旧文档）才回落到歌词源上报的 renderModes。App 内预览渲染的正是这份编译产物，两端必须读同一个来源；只经由歌词源 renderModes 传递的设置属于同源契约破口，不是某个源的特例默认值。没有**正在播放**的歌词状态时，App 内预览一律回退到内置演示歌词行：仲裁器有意保留暂停时的冻结状态（暂停的位置流天然静默，不是故障），因此暂停后预览不得继续钉在暂停前那句歌词上，恢复播放后实时状态重新接管预览。本条只约束 App 内预览——锁屏/息屏的暂停保留语义不变。覆盖字段：字重、字号档与其自定义百分比、辅助文字模式、逐字动画、发光、行进度效果、折行裁剪、字体族、换行动画（profile 的 `Auto` 退默认解析）、主对齐、歌曲信息锚点、自适应分节。生产者不得上报会被息屏取值归一化改写的逐字动画值——历史遗留的 `Karaoke fill` 不在现行词表内。
+- App 内预览的内置演示歌词行（没有实时歌词状态可呈现时使用）跟随界面语言：English 显示英文演示曲，其余选择（跟随系统 / 简体中文）显示中文演示曲。仅显式 English 才切换；设备语言为英文但用户显式选择「简体中文」时保留中文演示曲。
+- 内置演示歌词行带完整的辅助内容，让「辅助文字」与「显示振假名」开关在两种界面语言下都能在预览里看出效果：每一行都带音译与翻译（英文演示曲用音标 + 中译，中文演示曲用拼音 + 英译）；中文演示曲的注音覆盖整行，不得只标行首一小段——半截注音会在预览里于首字上方留下一簇孤立的拼音。
+- 每个 surface profile 还可以把下一行歌词（第二行歌词）作为辅助文字呈现。该呈现仅在第一行辅助文字实际显示时生效（第一行按「辅助文字」模式没有可显示的辅助文字行时，本开关不产生第二行呈现）；呈现沿用辅助文字的字号与该 profile 的亮/暗辅助文字选择，但颜色仍使用「下一行颜色」设置；生效时取代独立的下一行歌词行而不与之叠加，不生效时独立下一行呈现保持不变。
+- 「显示第二行辅助文字」（每个 surface 独立，以第二行歌词行实际显示为前提——「显示下一行歌词」或「辅助文字显示第二行歌词」任一开启时露出；两者都关时没有第二行歌词行，该开关不露出）：开启后第二行歌词自身也带出它的辅助文字行（音标/翻译，按辅助文字模式取用，源无内容则不出）——四行呈现，顺序为第一行歌词、第一行辅助文字、第二行歌词、第二行辅助文字。开启时第二行歌词行本身也按辅助文字形态呈现（即使「辅助文字显示第二行歌词」关闭——此时以「显示下一行歌词」为前提）；第二行歌词行以独立下一行行呈现时同样追加其辅助文字行（实机与预览同源）。其辅助文字行沿用辅助文字行的字号/亮度档与第二行歌词对齐，折行档跟随第二行歌词自身呈现的行数（不得沿用主行行数）；关闭时第二行歌词行按其所属开关的形态呈现、不追加辅助行。源没有下一行的辅助文字时只呈现有内容的部分。
+- 辅助文字行（音译、翻译与辅助文字形态的第二行歌词）以约为有效主行字号一半渲染；其可读性下限按有效主行字号等比封顶（不超过约 0.62 倍），任何字号档下辅助形态都必须明显小于主行，不得渲染成第二条主行。
+- 辅助文字可逐字点亮（「辅助文字逐字效果」，每个 surface 独立开关，默认关）：开启后第一行辅助行（音译与翻译）与主行共用同一逐字渲染核心——亮/暗推进与扫光随主行，「BetterLyrics」档下浮动、长块放大与辉光同样随主行；行本身仍取辅助行颜色与「高亮辅助文字」亮度档。源带词级音译时间时按真实词窗点亮；其余按该行自身的行窗口 + 行内几何合成（中文逐字、西文按词，块内共享一个高亮进度），推进前缘与主行行级合成源同式。并发行（对唱）自己的辅助行取并发行窗口。属于第二行的行——辅助文字形态的第二行歌词与其自身的辅助行——不参与（其播放窗口尚未开始）。本开关独立于主行行进度效果：进度效果选 `None` 时主行静态，辅助行照常逐字点亮并维持帧时钟。开关关闭时辅助行逐字节不变。
+- 歌曲信息与第二行歌词各自携带每个 surface 独立的对齐选择（`auto`、`start`、`center`、`end`）。`auto` 跟随主歌词对齐的解析结果（主对齐 `auto` 时仍按歌词方向右对齐）；显式值使该行独立于主歌词对齐。第二行歌词的两种呈现形态（辅助文字形态与独立下一行行）共用同一个第二行对齐选择。
+- 对唱分侧是每个 surface 独立的开关（默认开启）。开启时，行级 `alignedRight` 置位的行绘制在右侧；关闭时忽略该位，所有行按主对齐解析。行级分侧位来源于歌词源：源显式标记（Spicy `alignedRight`、Lyricon `isAlignedRight`、插件 `isAlignedRight`）恒优先，否则由行级演唱者身份元数据（`agent`/`amll:agent`/`vocal`/`amll:vocal`，类型键 `amll:agent-type`/`agent:type`/`agentType`/`vocal:type`）推导——首位歌手居左、其余居右；带显式类型时 `group` 恒左、`other` 起右并随歌手切换翻转。无演唱者信息的曲目保持纯主对齐行为。
+- 识别对唱标记是每个 surface 独立的开关（默认开启；未显式设置的曲面继承文档级默认值）。开启时，歌词行首的（男）/（女）/（合）文本标记被识别为演唱者身份：显示时隐去标记文本（主行、下一行与逐字词表同源处理），行级元数据没有演唱者身份时作为对唱分侧推导的兜底输入；「合」不参与交替、保持源值。快照为息屏/锁屏共用，只携带原始行文本与两套预计算分侧（元数据身份版、标记识别版），隐去标记与选用分侧的决策推迟到各渲染面按本面开关执行——改一面的开关不联动另一面。（副歌）/（间奏）等段落标记同样识别（连写或复合如（男·RAP）的标记串整串剥离），但只隐去文本——不作为演唱者身份、不改动行的分侧。词表外的括号内容按歌词原样保留。纯标记行保留原样显示。关闭时原样显示，标记不参与分侧。源显式分侧在两种状态下恒优先。
+- 显示并发歌词(对唱)是每个 surface 独立的开关(默认开启,锁屏与息屏各自独立;上游为 AOD-only,CN+ 扩展到锁屏卡片):持有整首行表的生产者(Spicy 文档、Lyricon、LyricInfo)在发射前预计算并发行候选——与主行播放窗口重叠达到 1 秒的另一唱词行(纯时间轴重叠判定,不依赖任何歌手标记;间奏行不参与)。投影层只做开关与格式转换,不从原始行表选行。开关开启且快照携带候选时,息屏画布把并发行作为与主行同尺寸的段落紧邻主行块堆叠(锚顶布局主行位置保持稳定;锚底/居中布局整块重排),各画各的逐字扫光;并发行加入时 180ms 静音淡入;已唱完的重叠行由退出缓冲保留到主行行末,双行段不在对唱中途塌掉;整块超出歌词区时按同一共享系数缩小(0.3 绝对下限,低于下限溢出裁切)。并发行在场时取代独立「下一行」行。任一曲面开启时投影即携带候选,各曲面按自己的开关渲染。SuperLyric(只推当前行的逐行源)不产出并发行。本次移植有意省去上游的槽位继承/双段独立过渡机制(v1 简化),选取语义与上游 99ba119d4 一致。
+- 生产者 ingest 在选行/渲染之前把行窗与词窗的时间基准统一，只治自相矛盾的两类形状、正常拖尾逐字节不动：(1) 词窗超出行窗（词比行还长）→ 行窗扩到词窗并集（`行首 = min(词窗起点, 原行首)`、`行尾 = max(词窗终点, 原行尾)`）；(2) 行窗远大于文本可唱时长（逐字合成把乐器间隙吞进行窗的产物，真机实测单行偏差可达十余秒）且词级跨距可信 → 行窗向词对齐（首词起点/末词终点）；词级跨距同样失真时行窗保持原样、丢弃可疑词级并回退行级填充，头部贴附的行窗从 `end-估时` 起算；(3) 其余形状（含行窗比词窗并集长但差距在正常范围的正常拖尾）原样返回。不带词窗的一笔没有数据可归一，保持行窗原样（渲染侧稳定化已覆盖）。正常行零变化。行首钳制仅在全曲出现至少两个损坏行时启用（真实损坏是整首系统性的，真实长音则是孤立的长窗行）；孤立长窗行保持原有行窗不变。估时忽略行首标记——标记不发声；纯标记行按 0 字计。
+- 插件链保持字段级优先——处理器结果声明的 `changedFields`/`changedLyricFields` 决定它覆盖宿主哪些字段，声明 `WORDS` 的结果其词表（文本 + 时间戳）整份生效——同时合并文档自身保持时间轴自洽：合并后若有被接受的结果声明过 `WORDS`，逐行走与生产者 ingest 同一套归一（词窗超出行窗 → 行窗扩到并集；行窗远超可唱估时且词级跨距可信 → 向词对齐；其余形状含正常拖尾逐字节原样；无词窗的行没有数据可归一）。未声明 `WORDS` 时合并文档原样交给下游——宿主词表已在 ingest 过同一道门，宿主也绝不做 DTO 对比推断。插件词表时间戳由此既保持优先、又不与所在行窗自相矛盾。
+- 任一生产者观测到 seek 时跨源转发给其他生产者（`onExternalSeek`），位置源冻结/漏发 seek 回调的生产者立即落到权威位置，不再滞后。
+- 歌词时间偏移是文档级全局滑杆（默认 0ms,范围 ±5 秒,按 50ms 档量化;语义参考 HyperLyric 的歌词时间偏移）:时间轴源生产者（Lyricon、LyricInfo、Spicy）的选行查询与发射坐标——`positionMs`、行窗、词级时间与 `nextLineStartMs`——统一落在「播放位置 − 偏移」的显示时间轴上,正数延后显示、负数提前显示。机制层（位置外推、残留拒绝、seek 判定与跨源 seek 转发、歌尾钳制）保持原始媒体坐标,仅发射的显示坐标平移,逐字扫光与所选行保持同轴。拖动滑杆立即生效（设置变更即刷新生产者缓存）。SuperLyric 为逐行推流源（行到达即上屏）,不受偏移影响。偏移同时作用于息屏与锁屏;插件链的整首快照保持原始时间轴。
+- 主歌词接受每个 surface 1、2、3、4、5 行或不设用户限制的换行上限。高达 200% 的文本大小必须使用所选上限，而不是旧的固定三行上限。安全区几何、可选行移除、有界最小尺寸与 fail-closed 位置策略保持权威。
+- 每个 surface profile 存储从 50% 到 200% 的元数据大小与 ruby 朗读可见性。Ruby 默认显示，禁用时不占用绘制或布局高度。
+- 歌曲信息内容为 per-surface 设置,锁屏与息屏各自独立(未显式设置的曲面继承文档级默认值,旧文档升级语义不变):显示哪些切片(歌名/歌手/专辑)、它们的渲染顺序,以及每一对相邻切片之间的分隔符。快照携带原始歌名/歌手/专辑,由各渲染面按本面配置重新组装——改一面的选择不联动另一面的歌曲信息组装与高度预算。选择顺序即显示顺序(保留所选顺序;未选与空白切片丢弃;切片内部的 `·` 仍视作切片边界)。选中两项及以上时,每对相邻切片各有一个分隔符槽位,逐槽从同一词表独立选择——`newline`(每切片一行,历史默认)或行内连接(` · `、` - `、` | `、`、`、` / `)。分隔符序列归一化为所选部分推出的槽位数:缺项/非法项回落 `newline`,多余项截断,仅选一项时无槽位。本次改动前保存的文档携带单一旧字段 `metadataSeparator`,首次读取时按槽位展开并清空,只播种一次。画布仅在换行符处把组装后的元数据拆成行——绝不在分隔符文本处拆分——且最多渲染三行元数据。未知部分/分隔符值归一为默认。此外,每个 surface profile 还携带「专辑与歌名一致时隐藏专辑」开关(未显式设置的曲面继承文档级默认值):开启且专辑文本与歌名在去两端空白后逐字相等时,组装歌曲信息时丢弃专辑切片,该槽位不再产出;专辑与歌名不同或为空时不受影响。
+- 歌曲图片为 per-surface 设置,锁屏与息屏各自独立(显示开关、方形/圆形形状、自适应/固定尺寸、仅圆形可选旋转);旧文档中存的文档级全局值在首次读取时一次性播种到两个曲面。开启时歌曲信息块左侧恰好一个图片槽:槽边长默认自适应(歌曲信息字号 × 1.6,随字号缩放),关闭该 surface 的自适应开关时改取固定自定义边长(12–96dp,默认 22dp,即 100% 歌曲信息字号下的自适应边长),不随字号变化;与文本间距 6dp,行级对齐把「图片+文本块」当整组落位,文本块内各行仍按各自对齐排布。图片带高取「歌曲信息文本块高」与「图片槽边长」的较大者:图片高于文本块时带高随图片增长、文本块在带内垂直居中,图片不被内容裁剪框/锁屏卡片裁切,带高计入卡片实测高与歌曲信息组件预算(静态预算按图片槽边长 + 8dp 上下余量入账,大尺寸自定义图片不被裁切);图片与文本块共用同一视觉中线(首末行基线中点 + (ascent + descent)/2,而非裸基线中点)。音乐暂停驻留期间圆形封面默认停转(暂停期无逐帧开销),仅「音乐暂停时继续旋转」打开的曲面继续旋转。取图 fail-closed:只显示经校对的「当前播放的音乐软件」当前曲目的专辑图(在播媒体会话且包名/曲目身份与当前歌曲一致)——系统播放窗口滞留的旧封面、其他包、或歧义命中一律不显示。封面帧有界(源图降采样至 ≤192px 后压成 ≤24KiB JPEG),按帧键解码一次。方形不旋转;圆形旋转为匀速 12 秒/圈,与逐字歌词共用有效节拍门(隐藏即停帧)。未知形状值归一为方形;旋转仅圆形生效。隐私:封面字节不出设备、不入诊断;功耗:静态封面不增加逐帧开销,旋转随既有节拍门停止(隐藏,或暂停且未开「音乐暂停时继续旋转」)。
+- 在绑定 generation 的歌曲 intro 期间，匹配的单行标题/艺术家文本会抑制重复的元数据行，并在三秒后形变为持久的元数据位置与大小。不兼容或换行的几何使用有界交叉淡化。两条路径都不改变整个 surface 的 alpha、keepalive 亮度策略或位置权威。
+- 导入的数据不能指定类、资源、方法、路径、URL、命令或外部位图来源。
+- 重置会恢复内置安全 profile。
+
+已启用的固定注册表：
+
+- lyrics；
+- metadata；
+- 仅锁屏的 media_progress。
+
+artwork 强调色、状态文本、占位符（spacer）与分隔线，在各自拥有真实的有限渲染器、放置契约、隐私/功耗分析与设备证据之前，仍然被拒绝。歌曲图片(上文元数据伴生图)是唯一被放行的图片形态:自带有限渲染器(24KiB JPEG 上限、歌曲信息左侧单槽)、放置契约与隐私/功耗分析。AOD 进度仍然被清除出去;歌曲图片以有界帧随 wire 传输,校对不过即不显示。
+
+无论用户/导入值如何，AOD 策略都可以进一步降低亮度、亮区面积、动画、作品图、组件数量或场景大小。
+
+## 迁移
+
+- 既有的 `aod_render` 值填充默认 AOD profile，不产生可见回归。
+- 初始锁屏 profile 派生自 AOD 样式，但保持禁用。
+- 链接 surface 样式在锁屏启用后默认开启。
+- 无缝过渡仅在两个 surface 都已启用且 linkage 能力通过时默认开启。
+- 迁移版本仅在成功校验/持久化之后写入。
+- 旧版 AOD 偏好在一个回滚周期内保持可用。
+
+## 能力 fallback
+
+应用显示来自最近接受的能力报告的显式支持状态：无报告、已验证、已验证但缺失符号、不支持、实验性符合条件或实验性活动。已配置的 surface 偏好在不受支持的 profile 上仍会存储，但应用必须将其描述为无法运行并禁用依赖运行时的控件。外观编辑器仍可用于预览和未来配置。用户可以创建包含包版本与有限原始符号证据的兼容性报告。
+
+能力报告协议 v2 包含报告时间戳、生效 profile 状态、实验状态、原始探测集与已解析能力集。协议 v1 仅因应用/SystemUI 升级过渡兼容而被继续接受。未知 profile 保持 fail-closed；仅原始探测成功不会安装或启用任何 hook。
+
+各能力相互独立：
+
+```text
+AOD_SURFACE
+AOD_POSITION_UPDATES
+AOD_LIFETIME_GUARD
+AOD_WAKE_BROKER
+LOCKSCREEN_HOST
+LOCKSCREEN_GEOMETRY
+LINKAGE_DIRECTION
+LINKAGE_GEOMETRY
+RAISE_TO_AOD
+FULL_AOD
+VIDEO_DEPTH
+```
+
+匹配包括 SystemUI/AOD 包版本与精确的必需符号签名。未知或缺失的符号仅禁用依赖行为。原生 UI 从不被隐藏、替换、重新父级化、重新测量或重新样式化。时钟平移控制仅允许由上文验证过的 AOD 场景策略执行，且必须能退回到 Xiaomi 的原始目标。

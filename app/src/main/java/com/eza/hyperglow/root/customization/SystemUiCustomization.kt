@@ -3,16 +3,27 @@ package com.eza.hyperglow.root.customization
 import android.os.Bundle
 import com.eza.hyperglow.customization.CompiledCustomization
 import com.eza.hyperglow.customization.CompiledSurfaceProfile
+import com.eza.hyperglow.customization.CustomFontContract
 import com.eza.hyperglow.customization.SceneCompiler
 import com.eza.hyperglow.customization.WidgetSpec
+import com.eza.hyperglow.customization.normalizeArtworkShape
+import com.eza.hyperglow.customization.normalizeArtworkSizeDp
 import com.eza.hyperglow.customization.normalizeCardAlpha
 import com.eza.hyperglow.customization.normalizeCardColor
+import com.eza.hyperglow.customization.normalizeLineTransition
+import com.eza.hyperglow.customization.normalizeLineTransitionSpeed
 import com.eza.hyperglow.customization.normalizeLyricLineLimit
+import com.eza.hyperglow.customization.normalizeMetadataParts
+import com.eza.hyperglow.customization.normalizeMetadataSeparators
 import com.eza.hyperglow.aod.normalizePauseLingerMs
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
 import com.eza.hyperglow.root.surface.SurfacePolicyResolver
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.encodeToJsonElement
 
 internal enum class WidgetRendererId {
     LYRICS,
@@ -50,9 +61,18 @@ internal object SystemUiCustomizationValidator {
                 collisionPolicy = rawLockscreen.collisionPolicy,
                 widgets = rawLockscreen.widgets,
                 metadataVisible = rawLockscreen.metadataVisible,
+                artworkVisible = rawLockscreen.artworkVisible,
+                artworkShape = rawLockscreen.artworkShape,
+                artworkSpin = rawLockscreen.artworkSpin,
+                artworkSpinWhenPaused = rawLockscreen.artworkSpinWhenPaused,
+                artworkAdaptiveScale = rawLockscreen.artworkAdaptiveScale,
+                artworkSizeDp = rawLockscreen.artworkSizeDp,
                 backgroundStyle = rawLockscreen.backgroundStyle,
                 cardAlpha = rawLockscreen.cardAlpha,
-                cardColor = rawLockscreen.cardColor
+                cardColor = rawLockscreen.cardColor,
+                metadataParts = rawAod.metadataParts,
+                metadataSeparators = rawAod.metadataSeparators,
+                duetMarkers = rawAod.duetMarkers
             )
         } else {
             rawLockscreen
@@ -71,6 +91,11 @@ internal object SystemUiCustomizationValidator {
                 hash = "",
                 sourceId = normalizeIdentifier(configuration.sourceId),
                 pauseLingerMs = normalizePauseLingerMs(configuration.pauseLingerMs),
+                metadataParts = normalizeMetadataParts(configuration.metadataParts),
+                metadataSeparators = normalizeMetadataSeparators(
+                    configuration.metadataSeparators,
+                    configuration.metadataParts
+                ),
                 profiles = profiles
             )
         )
@@ -122,23 +147,35 @@ internal object SystemUiCustomizationValidator {
             metadataVisible = profile.metadataVisible && widgets.any { it.type == "metadata" },
             metadataAnchor = if (profile.metadataAnchor == "bottom") "bottom" else "top",
             metadataSizePercent = profile.metadataSizePercent.coerceIn(50, 200),
+            metadataAlignment = profile.metadataAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
+            nextLineAlignment = profile.nextLineAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
+            artworkVisible = profile.artworkVisible,
+            artworkShape = normalizeArtworkShape(profile.artworkShape),
+            artworkSpin = profile.artworkSpin,
+            artworkAdaptiveScale = profile.artworkAdaptiveScale,
+            artworkSizeDp = normalizeArtworkSizeDp(profile.artworkSizeDp),
             weight = profile.weight.takeIf { it in WEIGHTS } ?: "Medium",
             textSize = profile.textSize.takeIf { it in TEXT_SIZES } ?: "normal",
             textSizeCustom = profile.textSizeCustom.coerceIn(50, 200),
-            fontFamily = profile.fontFamily.takeIf { it in FONT_FAMILIES } ?: "spotify",
+            fontFamily = profile.fontFamily.takeIf {
+                it in FONT_FAMILIES || CustomFontContract.isCustomFontFamily(it)
+            } ?: "spotify",
             animation = when {
-                aod && profile.animation != "Minimal" -> "Gradient"
+                // 与 SceneCompiler.compile 同表同兜底:息屏与锁屏共用同一画布词表
+                // (历史档曾把息屏非 Minimal 一律压回 Gradient;新档入词表后按成员放行)。
                 profile.animation in ANIMATIONS -> profile.animation
                 else -> "Gradient"
             },
             glow = if (profile.glow == "On") "On" else "Off",
             lineSyncFillMode = normalizeLineSyncFillMode(profile.lineSyncFillMode),
             overflow = if (profile.overflow == "Clip") "Clip" else "Wrap",
+            lineTransition = normalizeLineTransition(profile.lineTransition),
+            lineTransitionSpeed = normalizeLineTransitionSpeed(profile.lineTransitionSpeed),
             backgroundStyle = if (!aod && profile.backgroundStyle == "card") "card" else "none",
             cardAlpha = normalizeCardAlpha(profile.cardAlpha),
             cardColor = normalizeCardColor(profile.cardColor),
             palette = profile.palette.asSequence()
-                .filter { it.key in SEMANTIC_COLORS && it.value in PALETTE_VALUES }
+                .filter { it.key in SEMANTIC_COLORS && SceneCompiler.isAllowedPaletteValue(it.value) }
                 .take(SEMANTIC_COLORS.size)
                 .associate { it.key to it.value }
         )
@@ -151,16 +188,14 @@ internal object SystemUiCustomizationValidator {
         .ifBlank { "default" }
 
     private val SEMANTIC_COLORS = setOf(
-        "primaryText",
         "secondaryText",
         "metadataText",
+        "nextLineText",
         "sungText",
         "unsungText",
         "glow",
-        "accent",
-        "surfaceScrim"
+        "accent"
     )
-    private val PALETTE_VALUES = setOf("default", "clock", "wallpaper", "white", "dimmed")
     private val ANCHORS = setOf(
         "below_stock_clock",
         "screen_center",
@@ -180,8 +215,8 @@ internal object SystemUiCustomizationValidator {
     private val SECONDARY_MODES = setOf("Main only", "Transliteration", "Translation", "Both")
     private val WEIGHTS = setOf("Regular", "Medium", "Bold")
     private val TEXT_SIZES = setOf("small", "normal", "large", "xlarge", "custom")
-    private val FONT_FAMILIES = setOf("noto", "spotify", "apple")
-    private val ANIMATIONS = setOf("Minimal", "Gradient")
+    private val FONT_FAMILIES = setOf("noto", "spotify", "apple", "noto-sc", "custom")
+    private val ANIMATIONS = setOf("Minimal", "Gradient", "BetterLyrics")
     private fun normalizeLineSyncFillMode(value: String): String = when (value) {
         "None",
         "Top to bottom",
@@ -244,17 +279,90 @@ internal object CompiledCustomizationBundleCodec {
 
     fun fromWirePayload(
         payload: WirePayload,
-        expectedUserId: Int? = null
+        expectedUserId: Int? = null,
+        onReject: ((reason: String) -> Unit)? = null
     ): CompiledCustomization? {
-        if (!isValidWirePayload(payload)) return null
-        if (expectedUserId != null && payload.userId != expectedUserId) return null
+        if (!isValidWirePayload(payload)) {
+            onReject?.invoke(
+                "envelope_invalid(protocol=${payload.protocol},userId=${payload.userId}," +
+                    "revision=${payload.revision},hashLen=${payload.hash.length},jsonLen=${payload.json.length})"
+            )
+            return null
+        }
+        if (expectedUserId != null && payload.userId != expectedUserId) {
+            onReject?.invoke("user_mismatch(payload=${payload.userId},expected=$expectedUserId)")
+            return null
+        }
         val decoded = runCatching {
             SceneCompiler.json.decodeFromString<CompiledCustomization>(payload.json)
-        }.getOrNull() ?: return null
-        if (decoded.revision != payload.revision || decoded.hash != payload.hash) return null
-        val validated = SystemUiCustomizationValidator.validate(decoded) ?: return null
-        if (validated.revision != decoded.revision || validated.hash != decoded.hash) return null
+        }.getOrElse {
+            onReject?.invoke(
+                "json_decode_failed(${it.javaClass.simpleName}:${it.message?.take(120)})"
+            )
+            return null
+        }
+        if (decoded.revision != payload.revision || decoded.hash != payload.hash) {
+            onReject?.invoke(
+                "envelope_body_mismatch(revision:${payload.revision}->${decoded.revision}," +
+                    "hash:${payload.hash}->${decoded.hash})"
+            )
+            return null
+        }
+        val validated = SystemUiCustomizationValidator.validate(decoded) ?: run {
+            onReject?.invoke("validate_rejected(version=${decoded.version})")
+            return null
+        }
+        if (validated.revision != decoded.revision || validated.hash != decoded.hash) {
+            onReject?.invoke(
+                "validate_rewrote_fields(${summarizeValidationChanges(decoded, validated)})"
+            )
+            return null
+        }
         return validated
+    }
+
+    private fun summarizeValidationChanges(
+        before: CompiledCustomization,
+        after: CompiledCustomization
+    ): String = runCatching {
+        val changes = ArrayList<String>()
+        collectJsonChanges(
+            path = "",
+            before = SceneCompiler.json.encodeToJsonElement(before),
+            after = SceneCompiler.json.encodeToJsonElement(after),
+            out = changes
+        )
+        changes.take(MAX_VALIDATION_DIFF_ENTRIES).joinToString(",")
+    }.getOrElse { "diff_unavailable" }
+
+    private fun collectJsonChanges(
+        path: String,
+        before: JsonElement,
+        after: JsonElement,
+        out: MutableList<String>
+    ) {
+        if (before == after || out.size >= MAX_VALIDATION_DIFF_ENTRIES) return
+        if (before is JsonObject && after is JsonObject) {
+            (before.keys + after.keys).forEach { key ->
+                val beforeChild = before[key]
+                val afterChild = after[key]
+                when {
+                    beforeChild == null -> out += "$path$key=<absent>->$afterChild"
+                    afterChild == null -> out += "$path$key=$beforeChild-><absent>"
+                    else -> collectJsonChanges("$path$key.", beforeChild, afterChild, out)
+                }
+            }
+        } else if (before is JsonArray && after is JsonArray) {
+            if (before.size != after.size) {
+                out += "${path}size=${before.size}->${after.size}"
+            } else {
+                before.indices.forEach { index ->
+                    collectJsonChanges("$path$index.", before[index], after[index], out)
+                }
+            }
+        } else {
+            out += "${path.removeSuffix(".")}=$before->$after"
+        }
     }
 
     internal fun isValidWirePayload(payload: WirePayload): Boolean {
@@ -280,6 +388,7 @@ internal object CompiledCustomizationBundleCodec {
 
     private const val PROTOCOL_VERSION = 3
     private const val SHA_256_HEX_LENGTH = 64
+    private const val MAX_VALIDATION_DIFF_ENTRIES = 24
     private const val KEY_PROTOCOL = "protocol"
     private const val KEY_USER_ID = "userId"
     private const val KEY_REVISION = "revision"

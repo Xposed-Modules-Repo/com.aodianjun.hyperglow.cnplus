@@ -1,9 +1,13 @@
 package com.eza.hyperglow.root.lockscreen
 
 import com.eza.hyperglow.root.aod.AodWakeBroker
+import com.eza.hyperglow.root.HookInstallGuard
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.HookRegistry
 import com.eza.hyperglow.root.capability.XiaomiCapability
 import com.eza.hyperglow.root.capability.XiaomiCapabilityResolver
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
@@ -24,21 +28,20 @@ internal object RaiseToAodController {
 }
 
 internal object RaiseToAodHook {
-    private var installed = false
+    private const val FEATURE_ID = "raise-to-aod"
+    private val installGuard = HookInstallGuard()
 
-    @Synchronized
     fun install(module: XposedModule, classLoader: ClassLoader) {
-        if (installed) return
-        val powerManager = classLoader.loadClass(POWER_MANAGER)
-        val wakeUp = powerManager.getDeclaredMethod(
-            "wakeUp",
-            Long::class.javaPrimitiveType,
-            String::class.java
-        ).apply { isAccessible = true }
-        module.deoptimize(wakeUp)
-        module.hook(wakeUp).intercept(WakeUpHooker)
-        installed = true
-        HookLogger.i(TAG, "Pickup wake remap hook installed")
+        val completed = installGuard.runOnce {
+            val wakeUp = SymbolResolver.resolveMethod(
+                classLoader,
+                FEATURE_ID,
+                SymbolRequest.method(POWER_MANAGER, "wakeUp", "long", "java.lang.String")
+            ) ?: return@runOnce false
+            HookRegistry.hook(module, FEATURE_ID, wakeUp, WakeUpHooker)
+            true
+        }
+        if (completed) HookLogger.i(TAG, "Pickup wake remap hook installed")
     }
 
     private object WakeUpHooker : Hooker {

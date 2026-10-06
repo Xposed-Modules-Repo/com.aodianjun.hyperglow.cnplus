@@ -27,15 +27,17 @@ internal data class CapturedDiagnosticData(
 )
 
 internal class DiagnosticCaptureCollector(
+    private val appTraceReader: () -> String = { "" },
     private val runner: DiagnosticRootCommandRunner
 ) {
     fun collect(startedAtUtcMillis: Long): CapturedDiagnosticData {
         val rootAccessStatus = checkDiagnosticRootAccess(runner)
         if (rootAccessStatus != "granted") {
+            // 镜像不依赖 root:拒绝路径也带上 App 侧证据,报告不至于只剩元数据。
             return CapturedDiagnosticData(
                 outcome = "metadata_only_root_denied",
                 rootAccessStatus = rootAccessStatus,
-                logs = "",
+                logs = appTraceSection(),
                 crashExcerpt = "",
                 lsposedLines = "",
                 commandFailures = listOf("root_access"),
@@ -47,7 +49,7 @@ internal class DiagnosticCaptureCollector(
             Instant.ofEpochMilli(startedAtUtcMillis).atZone(ZoneId.systemDefault())
         )
         val commands = listOf(
-            "logs" to "logcat -d -b main -b system -v threadtime -t 4000 " +
+            "logs" to "logcat -d -b main -b system -v threadtime -T '$timestamp' " +
                 "-s HyperGlow:V '*:S'",
             "systemui_processes" to SYSTEM_UI_PROCESS_COMMAND,
             "framework" to FRAMEWORK_EVIDENCE_COMMAND,
@@ -78,6 +80,9 @@ internal class DiagnosticCaptureCollector(
                 append('\n')
             }
             append(sanitizeDiagnosticLines(results.getValue("logs").output))
+            // App 侧镜像放段尾:组合截断保 1/4 前缀 + 3/4 尾部,捕获失败瞬间的 App 侧
+            // 最新日志落在尾部优先保留。
+            append(appTraceSection())
         }
         val rawCrash = filterAllowedCrashBlocks(results.getValue("crash").output)
         val lsposedOutput = results.getValue("lsposed").output
@@ -108,6 +113,26 @@ internal class DiagnosticCaptureCollector(
             commandFailures = failures,
             truncationFlags = flags
         )
+    }
+
+    /**
+     * App 进程日志镜像段。HyperOS 丢弃 App 侧 logcat,这里是报告里唯一的 App 侧决策
+     * 证据;状态行自带 truncated 标记,不占用 TRUNCATION_KEYS 白名单。
+     */
+    private fun appTraceSection(): String {
+        val trace = appTraceReader()
+        if (trace.isBlank()) return "app_trace=empty\n"
+        val bounded = truncateDiagnosticLines(
+            sanitizeDiagnosticLines(trace),
+            DiagnosticLimits.APP_TRACE_BYTES
+        )
+        return buildString {
+            append("app_trace=present")
+            if (bounded.truncated) append(" truncated")
+            append("\nApp process trace:\n")
+            append(bounded.text)
+            append('\n')
+        }
     }
 
     companion object {
@@ -165,7 +190,7 @@ internal class DiagnosticCaptureCollector(
 }
 
 internal fun checkDiagnosticRootAccess(runner: DiagnosticRootCommandRunner): String {
-    val result = runner.run("id -u", DiagnosticLimits.COMMAND_TIMEOUT_MS)
+    val result = runner.run("id -u", DiagnosticLimits.ROOT_PROBE_TIMEOUT_MS)
     return when {
         result.timedOut -> "error"
         result.exitCode == 0 && result.output.trim() == "0" -> "granted"
@@ -247,6 +272,8 @@ private fun redactDiagnosticSecrets(line: String): String = line
     .replace(SPOTIFY_TRACK_URI_REGEX, "spotify:track:<redacted>")
     .replace(URL_REGEX, "<url redacted>")
     .replace(CREDENTIAL_REGEX, "$1=<redacted>")
+    .replace(DATA_PATH_REGEX, "/data/user/<redacted>")
+    .replace(STORAGE_PATH_REGEX, "$1<redacted>")
     .replace(EXCEPTION_MESSAGE_REGEX, "$1: <message redacted>")
 
 private fun isCrashBoundary(line: String): Boolean =
@@ -260,6 +287,13 @@ private val SPOTIFY_TRACK_URI_REGEX = Regex("spotify:track:[A-Za-z0-9]+")
 private val URL_REGEX = Regex("https?://\\S+", RegexOption.IGNORE_CASE)
 private val CREDENTIAL_REGEX = Regex(
     "(?i)\\b(token|authorization|cookie|set-cookie)\\s*[=:]\\s*\\S+"
+)
+// 私有存储路径(与 Bridge SensitiveFieldRedactor 同集合):/data/user/<uid>/<pkg>
+// 与外部存储绝对路径可能暴露用户目录结构与媒体文件名,报告统一脱敏。
+private val DATA_PATH_REGEX = Regex("/data/user/\\d+/[A-Za-z0-9_.]+")
+private val STORAGE_PATH_REGEX = Regex(
+    "(/storage/emulated/\\d+/|/sdcard/)[^\\s,]+",
+    RegexOption.IGNORE_CASE
 )
 private val EXCEPTION_MESSAGE_REGEX = Regex(
     "((?:java|kotlin|android|com\\.[A-Za-z0-9_$.]+)\\.[A-Za-z0-9_$.]*(?:Exception|Error))(?::[^\\n]*)?"

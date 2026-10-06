@@ -2,13 +2,18 @@ package com.eza.hyperglow.aod
 
 import android.content.Context
 import android.os.SystemClock
+import com.eza.hyperglow.AppLog
 import com.eza.hyperglow.RuntimeCustomization
 import com.eza.hyperglow.bridge.SpicyBridgeDocument
 import com.eza.hyperglow.bridge.SpicyBridgeState
 import com.eza.hyperglow.bridge.SpicyBridgeStore
+import com.eza.hyperglow.customization.CompiledCustomization
 import com.eza.hyperglow.customization.CustomizationRepository
+import com.eza.hyperglow.customization.SceneCompiler
+import com.eza.hyperglow.plugin.PluginPipeline
 import com.eza.hyperglow.producer.LyricProducerState
 import com.eza.hyperglow.producer.LyricProducers
+import com.eza.hyperglow.producer.SongArtworkRepository
 import com.eza.hyperglow.root.projection.currentProcessUserId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -117,6 +122,13 @@ object AodProjectionEngine {
     private var scheduler: Job? = null
     private var transitionKeepAlive: Job? = null
     private var fallbackSession: FallbackRefreshSession? = null
+
+    init {
+        // 歌曲图片异步补帧:出帧时把帧挂到同曲目已发布快照上重播(见 AodStateBridge.publishArtwork)。
+        SongArtworkRepository.onFrameReady = { trackGeneration, frame ->
+            AodStateBridge.publishArtwork(trackGeneration, frame.jpeg, frame.key)
+        }
+    }
     private var releaseJob: Job? = null
     private var pauseConfirmJob: Job? = null
     private var pendingPauseSession: ProjectionSessionIdentity? = null
@@ -268,6 +280,15 @@ object AodProjectionEngine {
      * lifetime and replays Xiaomi's hide in the middle of a song change. The edge is published as a
      * still-playing transport gap first; only a producer that is still non-playing on the same
      * session after the bounded window becomes real pause retention.
+     *
+     * The window must cover the whole track-change gap: NetEase observed 0.96 s of playing=false
+     * plus lyric-load time before the new track's playing=true (09:53 capture), and the player can
+     * re-emit a late onStop for the old track on top. A 1.5 s window let the OLD session's pause
+     * confirm commit visible=false while the new track was already loading — the systemui guard
+     * died, Xiaomi closed the AOD surface, and every snapshot the module published during the
+     * intro had no surface to draw on. 5 s covers the observed gap; the cost is that a genuine
+     * pause now enters retention (and hides for pauseShowContent=off users) 5 s in, during which
+     * the transport-gap freeze keeps presenting.
      */
     @Synchronized
     private fun schedulePauseConfirmation(session: ProjectionSessionIdentity) {
@@ -369,14 +390,35 @@ object AodProjectionEngine {
         publishCustomizationIfDue(now)
         val prefs = appContext?.let(AodRenderPreferences::read) ?: AodRenderConfig()
         val compiled = appContext?.let(CustomizationRepository::loadCompiled)
+        // 插件富化在投影前同步查表:无插件结果时原样返回同一实例(保持下方
+        // isCurrentActive 的引用相等校验),有结果时仅覆盖内容字段。
+        val effectiveState = PluginPipeline.enrich(state)
+        // 歌曲图片:任一曲面(锁屏/息屏)显示开关打开时按曲目拉取已校对封面帧
+        // (包名/曲目校对不过=无封面)。取图为异步,本次投影先带已有帧,出帧后经
+        // onFrameReady 补挂重播;各曲面是否展示由自己的 profile 决定。
+        val artwork = if (compiled?.profiles?.values?.any { it.artworkVisible } == true) {
+            appContext?.let { context ->
+                SongArtworkRepository.ensure(
+                    context,
+                    trackGeneration(effectiveState),
+                    effectiveState.title,
+                    effectiveState.artist
+                )
+            }
+            SongArtworkRepository.frameFor(effectiveState.title, effectiveState.artist)
+        } else {
+            null
+        }
         val projectedState = projectToDisplay(
-            state = state,
+            state = effectiveState,
             now = now,
             prefs = prefs,
             compiled = compiled,
             metadataIntroPolicy = metadataIntroPolicy,
             powerSessionPolicy = powerSessionPolicy,
-            userId = currentProcessUserId()
+            userId = currentProcessUserId(),
+            artworkJpeg = artwork?.jpeg ?: ByteArray(0),
+            artworkKey = artwork?.key ?: ""
         )
         if (!publicationGuard.canPublish(
                 token = publicationToken,
@@ -384,7 +426,24 @@ object AodProjectionEngine {
                 current = LyricProducers.arbiter.active.value
             ) || !isCurrentActive(state) || !state.playing
         ) return
+        logRenderModeProbe(compiled, projectedState)
         AodStateBridge.publish(projectedState)
+    }
+
+    private var lastRenderProbeKey = ""
+
+    /**
+     * 诊断探针(配置下发排查):发布快照的渲染模式取值来源(编译 profile 覆盖 vs
+     * renderModes 兜底)。只在值变化时留痕,与 SystemUI 侧 AodSurfaceController 的
+     * 「Render profile probe」配对,定位「配置已下发但画布仍渲染旧档」断在哪一跳。
+     */
+    private fun logRenderModeProbe(compiled: CompiledCustomization?, state: AodDisplayState) {
+        val profile = compiled?.profiles?.get(SceneCompiler.SURFACE_AOD)
+        val key = "profile=${profile != null} anim=${state.animationMode} glow=${state.glowMode} " +
+            "profileAnim=${profile?.animation} profileGlow=${profile?.glow}"
+        if (key == lastRenderProbeKey) return
+        lastRenderProbeKey = key
+        AppLog.w("AodProjectionEngine", "Render mode probe: $key")
     }
 
     private fun publishCustomizationIfDue(now: Long) {
@@ -418,6 +477,8 @@ object AodProjectionEngine {
 
     fun keepAliveDue(lastAt: Long, now: Long): Boolean =
         lastAt <= 0L || now - lastAt >= KEEP_ALIVE_INTERVAL_MS
+
+    internal fun keepAliveIntervalMs(): Long = KEEP_ALIVE_INTERVAL_MS
 
     internal fun fallbackRefreshSession(state: LyricProducerState) = FallbackRefreshSession(
         state.producerId,
@@ -465,7 +526,7 @@ object AodProjectionEngine {
         ProjectionSessionIdentity.from(current) == pendingSession
 
     fun staticPlaybackPlaceholder(status: String): String? =
-        "♪".takeIf { status == "no_lyrics" }
+        PLAYING_PLACEHOLDER.takeIf { status == "no_lyrics" }
 
     internal fun playbackFallback(status: String, line: String, metadata: String): String? =
         if (status == "loading") metadata.takeIf { it.isNotBlank() }
@@ -475,10 +536,15 @@ object AodProjectionEngine {
     // after the Phase 3 switch — producers now select the active row before emitting). ---
 
     fun isTimedDocumentType(type: String): Boolean =
-        type.equals("Line", ignoreCase = true) || type.equals("Syllable", ignoreCase = true)
+        type.equals("Line", ignoreCase = true) || type.equals("Word", ignoreCase = true) ||
+            type.equals("Syllable", ignoreCase = true)
 
     internal fun hasActualLyricTiming(document: SpicyBridgeDocument): Boolean =
-        isTimedDocumentType(document.type) && document.rows.any { it.endMs > it.startMs }
+        // 间奏行带时间窗但不是唱词:只有间奏的文档不计「有计时」,否则没有唱词源的歌会把
+        // AOD keepalive 钉在间奏场景(上游 99ba119)。
+        isTimedDocumentType(document.type) && document.rows.any {
+            it.role != "INTERLUDE" && it.endMs > it.startMs
+        }
 
     internal fun shouldKeepAodAlive(
         playing: Boolean,
@@ -494,7 +560,8 @@ object AodProjectionEngine {
 
     fun isEffectiveLineLevelSync(type: String, wordCount: Int): Boolean =
         isLineLevelDocumentType(type) ||
-            type.equals("Syllable", ignoreCase = true) && wordCount <= 0
+            (type.equals("Word", ignoreCase = true) ||
+                type.equals("Syllable", ignoreCase = true)) && wordCount <= 0
 
     /** Delegates to [AodStateProjector.sessionWakeSignal] (LyricProducerState overload). */
     internal fun sessionWakeSignal(state: LyricProducerState, hasTimedLyrics: Boolean): Long =
@@ -504,9 +571,15 @@ object AodProjectionEngine {
     internal fun trackGeneration(state: LyricProducerState): Long =
         com.eza.hyperglow.aod.trackGeneration(state)
 
-    private const val KEEP_ALIVE_INTERVAL_MS = 4_000L
+    /**
+     * 消费端(SystemUiLyricProjection)在 [com.eza.hyperglow.root.projection.LYRIC_SNAPSHOT_FRESH_MS]
+     * (5 秒)收不到任何消息就丢弃投影。4 秒一拍时单次心跳迟到(如 Binder 竞争超过 1 秒)就足以
+     * 丢掉投影,撤回 AOD lifetime guard,歌曲中途掉回 stock clock。1.5 秒一拍让一个 5 秒窗口
+     * 内容纳三拍,单拍迟到由余量吸收(上游 cc1f62f)。
+     */
+    private const val KEEP_ALIVE_INTERVAL_MS = 1_500L
     private const val FALLBACK_REFRESH_INTERVAL_MS = 1_000L
     private const val TRANSITION_GRACE_MS = 1_500L
-    internal const val PAUSE_CONFIRM_MS = 1_500L
+    internal const val PAUSE_CONFIRM_MS = 5_000L
     private const val CUSTOMIZATION_REFRESH_MS = 1_000L
 }

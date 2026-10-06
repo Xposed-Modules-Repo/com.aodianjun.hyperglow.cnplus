@@ -1,0 +1,707 @@
+package com.eza.hyperglow.ui
+
+import android.content.Context
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.eza.hyperglow.R
+import com.eza.hyperglow.aod.AodRenderPreferences
+import com.eza.hyperglow.bridge.SpicyBridgeDocumentStore
+import com.eza.hyperglow.plugin.PluginInstaller
+import com.eza.hyperglow.plugin.PluginPipeline
+import com.eza.hyperglow.plugin.PluginRuntime
+import com.eza.hyperglow.plugin.PluginSettingsStore
+import com.eza.hyperglow.plugin.PluginSettingData
+import com.eza.hyperglow.producer.LyricSource
+import com.lidesheng.hyperlyric.plugin.api.PluginSettingInputType
+import com.lidesheng.hyperlyric.plugin.api.PluginSettingType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.basic.TextField
+import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.preference.RadioButtonPreference
+import top.yukonga.miuix.kmp.preference.SliderPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.window.WindowDialog
+import java.util.Locale
+
+/**
+ * 插件管理页（HyperLyric 兼容插件的宿主 UI）。
+ *
+ * 职责：
+ * - 总开关（plugin_processing_enabled）+ ZIP 安装入口 + 已装插件列表；
+ * - 每个插件：激活开关（activationSettingKey）、manifest 声明式设置渲染、
+ *   缓存清理、卸载确认；
+ * - 配置写入后实时同步 onConfigChanged/onEnable（下一首歌生效）；
+ *   安装/卸载等代码变更即时 reloadAll（旧 ClassLoader 无法卸载，
+ *   彻底清理需重启 App——对应 HyperLyric 在 SystemUI 里需重启 SystemUI）。
+ *
+ * 对话框状态全部提升到本函数：对话框不能挂在 LazyColumn 的 item 里，
+ * 否则条目滚出可视区被回收时对话框会被意外关闭。
+ */
+@Composable
+internal fun PluginManagementScreen(
+    onBack: () -> Unit,
+    onOpenSettings: (String) -> Unit,
+    onOpenCache: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var plugins by remember { mutableStateOf(PluginRuntime.installed()) }
+    var processingEnabled by remember {
+        mutableStateOf(AodRenderPreferences.read(context).pluginProcessingEnabled)
+    }
+    var uninstallPluginId by remember { mutableStateOf<String?>(null) }
+    // 管线输入状态(与 PluginPipeline.maybeProcess 同源):Spicy 源按文档状态提示,
+    // 逐行源(Lyricon/SuperLyric/LyricInfo)已接入插件链,固定显示接入提示。
+    val activeProducerState by collectActiveState()
+    val spicyDocument by SpicyBridgeDocumentStore.state.collectAsState()
+    val activeSource by collectActiveSource()
+
+    fun refresh() {
+        plugins = PluginRuntime.installed()
+    }
+
+    val installLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val (manifest, error) = withContext(Dispatchers.IO) {
+                val bytes = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        input.readNBytes(PluginInstaller.MAX_ZIP_BYTES.toInt() + 1)
+                    } ?: error("plugin file unavailable")
+                }.getOrElse { return@withContext null to "read failed: ${it.message}" }
+                if (bytes.size > PluginInstaller.MAX_ZIP_BYTES) {
+                    return@withContext null to "archive too large"
+                }
+                PluginInstaller.install(context, bytes)
+            }
+            if (manifest != null) {
+                PluginRuntime.reloadAll()
+                refresh()
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.plugin_toast_installed, manifest.name),
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.plugin_toast_install_failed, error),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    fun pickPluginZip() {
+        installLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
+    }
+
+    Scaffold(
+        containerColor = appSurfaceColor(),
+        topBar = {
+            AppTopBar(
+                title = stringResource(R.string.plugin_management_title),
+                onBack = onBack
+            )
+        }
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                top = innerPadding.calculateTopPadding() + 12.dp,
+                bottom = innerPadding.calculateBottomPadding() + 20.dp
+            )
+        ) {
+            item { SmallTitle(text = stringResource(R.string.section_plugin_processing)) }
+            item {
+                SettingsCard {
+                    SwitchPreference(
+                        processingEnabled,
+                        { enabled ->
+                            val saved = context
+                                .getSharedPreferences(AodRenderPreferences.PREFS, 0)
+                                .edit()
+                                .putBoolean(
+                                    AodRenderPreferences.PLUGIN_PROCESSING_ENABLED,
+                                    enabled
+                                )
+                                .commit()
+                            if (saved) {
+                                processingEnabled = enabled
+                                if (enabled) {
+                                    PluginPipeline.requestProcess()
+                                } else {
+                                    PluginPipeline.invalidate()
+                                }
+                            }
+                        },
+                        stringResource(R.string.setting_plugin_processing_enabled),
+                        summary = stringResource(R.string.summary_plugin_processing_enabled)
+                    )
+                    ArrowPreference(
+                        title = stringResource(R.string.plugin_action_install),
+                        summary = stringResource(R.string.summary_plugin_action_install),
+                        onClick = { pickPluginZip() }
+                    )
+                    ArrowPreference(
+                        title = stringResource(R.string.plugin_action_download),
+                        summary = stringResource(R.string.summary_plugin_action_download),
+                        onClick = { openExternalUrl(context, PLUGINS_RELEASE_URL) }
+                    )
+                    val activeState = activeProducerState
+                    val statusText: String? = when {
+                        !processingEnabled || plugins.isEmpty() || activeState == null -> null
+                        // Spicy 源沿用文档状态;逐行源已接入插件链(v2),固定显示接入提示。
+                        activeSource == LyricSource.SPICY -> {
+                            val inputState = PluginPipeline.pipelineInputState(
+                                activeState, spicyDocument
+                            )
+                            when (inputState) {
+                                PluginPipeline.PipelineInputState.IDLE_NO_DOCUMENT ->
+                                    stringResource(
+                                        R.string.plugin_pipeline_status_no_document,
+                                        activeState.producerId
+                                    )
+                                PluginPipeline.PipelineInputState.SOURCE_MISMATCH ->
+                                    stringResource(R.string.plugin_pipeline_status_mismatch)
+                                PluginPipeline.PipelineInputState.READY ->
+                                    stringResource(
+                                        R.string.plugin_pipeline_status_ready,
+                                        spicyDocument?.rows?.size ?: 0
+                                    )
+                                PluginPipeline.PipelineInputState.IDLE_NO_SOURCE -> null
+                            }
+                        }
+                        else ->
+                            stringResource(R.string.plugin_pipeline_status_line_stream)
+                    }
+                    if (statusText != null) {
+                        Text(
+                            text = statusText,
+                            fontSize = 13.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
+                            modifier = Modifier
+                                .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+                        )
+                    }
+                }
+            }
+            if (plugins.isEmpty()) {
+                item {
+                    SettingsCard {
+                        Text(
+                            text = stringResource(R.string.plugin_empty_hint),
+                            fontSize = 14.sp,
+                            color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
+                        )
+                    }
+                }
+            } else {
+                item { SmallTitle(text = stringResource(R.string.section_installed_plugins)) }
+                items(plugins, key = { it.manifest.id }) { plugin ->
+                    PluginCard(
+                        plugin = plugin,
+                        onOpenSettings = { onOpenSettings(plugin.manifest.id) },
+                        onOpenCache = { onOpenCache(plugin.manifest.id) },
+                        onRequestUninstall = { uninstallPluginId = plugin.manifest.id }
+                    )
+                }
+            }
+        }
+    }
+
+    // 卸载确认对话框。
+    uninstallPluginId?.let { pluginId ->
+        val plugin = plugins.firstOrNull { it.manifest.id == pluginId }
+        if (plugin == null) {
+            uninstallPluginId = null
+        } else {
+            WindowDialog(
+                title = stringResource(R.string.plugin_uninstall_confirm_title),
+                summary = stringResource(
+                    R.string.plugin_uninstall_confirm_summary,
+                    plugin.manifest.localizedName(currentLanguageTag(context))
+                ),
+                show = true,
+                onDismissRequest = { uninstallPluginId = null }
+            ) {
+                Column {
+                    Row(Modifier.fillMaxWidth()) {
+                        TextButton(
+                            text = stringResource(R.string.action_cancel),
+                            modifier = Modifier.weight(1f),
+                            onClick = { uninstallPluginId = null }
+                        )
+                        Spacer(Modifier.width(20.dp))
+                        TextButton(
+                            text = stringResource(R.string.action_uninstall),
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.textButtonColorsPrimary(),
+                            onClick = {
+                                val removed = PluginInstaller.uninstall(context, pluginId)
+                                PluginRuntime.reloadAll()
+                                PluginSettingsStore.clear(context, pluginId)
+                                refresh()
+                                uninstallPluginId = null
+                                Toast.makeText(
+                                    context,
+                                    context.getString(
+                                        if (removed) R.string.plugin_toast_uninstalled
+                                        else R.string.plugin_toast_uninstall_failed
+                                    ),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 单个插件的卡片:名称/作者/版本、加载状态、激活开关、设置/缓存管理/卸载入口。 */
+@Composable
+private fun PluginCard(
+    plugin: PluginRuntime.LoadedPlugin,
+    onOpenSettings: () -> Unit,
+    onOpenCache: () -> Unit,
+    onRequestUninstall: () -> Unit
+) {
+    val context = LocalContext.current
+    val languageTag = currentLanguageTag(context)
+    val manifest = plugin.manifest
+
+    SettingsCard {
+        Column(Modifier.padding(top = 14.dp, start = 16.dp, end = 16.dp, bottom = 2.dp)) {
+            Text(
+                text = manifest.localizedName(languageTag),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Medium
+            )
+            val versionLine = buildString {
+                if (manifest.version.isNotEmpty()) append("v${manifest.version}")
+                if (manifest.author.isNotEmpty()) {
+                    if (isNotEmpty()) append(" · ")
+                    append(manifest.author)
+                }
+            }
+            if (versionLine.isNotEmpty()) {
+                Text(
+                    text = versionLine,
+                    fontSize = 13.sp,
+                    color = MiuixTheme.colorScheme.onSurfaceContainerVariant
+                )
+            }
+            Text(
+                text = when {
+                    plugin.plugin == null ->
+                        stringResource(R.string.plugin_load_failed, plugin.loadError ?: "")
+                    !plugin.isActivated(context) ->
+                        stringResource(R.string.plugin_status_inactive)
+                    plugin.processors.isEmpty() ->
+                        stringResource(R.string.plugin_status_no_processors)
+                    else -> stringResource(R.string.plugin_status_processors, plugin.processors.size)
+                },
+                fontSize = 13.sp,
+                color = if (plugin.plugin == null) {
+                    MiuixTheme.colorScheme.primary
+                } else {
+                    MiuixTheme.colorScheme.onSurfaceContainerVariant
+                },
+                modifier = Modifier.padding(top = 2.dp, bottom = 4.dp)
+            )
+        }
+        if (manifest.activationSettingKey != null && plugin.plugin != null) {
+            var activated by remember(manifest.id) {
+                mutableStateOf(PluginSettingsStore.isActivated(context, manifest))
+            }
+            SwitchPreference(
+                activated,
+                { enabled ->
+                    PluginSettingsStore.putBoolean(
+                        context,
+                        manifest.id,
+                        manifest.activationSettingKey,
+                        enabled
+                    )
+                    if (enabled) PluginRuntime.notifyEnabled(manifest.id, enabled)
+                    PluginRuntime.notifyConfigChanged(manifest.id)
+                    activated = enabled
+                },
+                stringResource(R.string.plugin_setting_enabled)
+            )
+        }
+        if (manifest.settings.isNotEmpty()) {
+            ArrowPreference(
+                title = stringResource(R.string.plugin_action_settings),
+                onClick = onOpenSettings,
+                enabled = plugin.plugin != null
+            )
+        }
+        if (manifest.cacheScopes.isNotEmpty()) {
+            val cacheBytes = remember(manifest.id) {
+                PluginRuntime.cacheSizeBytes(manifest.id)
+            }
+            ArrowPreference(
+                title = stringResource(R.string.plugin_action_manage_cache),
+                summary = formatBytes(cacheBytes),
+                onClick = onOpenCache,
+                enabled = plugin.plugin != null
+            )
+        }
+        ArrowPreference(
+            title = stringResource(R.string.plugin_action_uninstall),
+            onClick = onRequestUninstall
+        )
+    }
+}
+
+/** 单条设置的宿主渲染，按 [PluginSettingType] 分派到 miuix 偏好组件。 */
+@Composable
+internal fun PluginSettingRow(
+    pluginId: String,
+    setting: PluginSettingData,
+    languageTag: String,
+    onEdit: () -> Unit,
+    onWrite: (put: () -> Unit) -> Unit
+) {
+    val context = LocalContext.current
+    val title = setting.localizedTitle(languageTag)
+    val summary = setting.localizedSummary(languageTag)
+
+    when (setting.type) {
+        PluginSettingType.SWITCH -> {
+            val checked = PluginSettingsStore.getBoolean(context, pluginId, setting)
+            SwitchPreference(
+                checked,
+                { enabled ->
+                    onWrite {
+                        PluginSettingsStore.putBoolean(context, pluginId, setting.key, enabled)
+                    }
+                },
+                title,
+                summary = summary
+            )
+        }
+        PluginSettingType.SLIDER -> {
+            val min = (setting.min ?: 0.0).toFloat()
+            val max = (setting.max ?: 100.0).toFloat()
+            if (max > min) {
+                val value = PluginSettingsStore.getFloat(context, pluginId, setting)
+                    .coerceIn(min, max)
+                val step = setting.step?.toFloat()?.takeIf { it > 0f }
+                val steps = if (step != null) {
+                    (((max - min) / step).toInt() - 1).coerceAtLeast(0)
+                } else {
+                    0
+                }
+                SliderPreference(
+                    value = value,
+                    onValueChange = { next ->
+                        onWrite {
+                            PluginSettingsStore.putFloat(context, pluginId, setting.key, next)
+                        }
+                    },
+                    title = title,
+                    summary = summary,
+                    valueText = formatSettingNumber(value),
+                    valueRange = min..max,
+                    steps = steps
+                )
+            } else {
+                ArrowPreference(title = title, summary = summary, onClick = {})
+            }
+        }
+        PluginSettingType.SELECT -> {
+            val selected = PluginSettingsStore.getString(context, pluginId, setting)
+            val selectedLabel = setting.options
+                .firstOrNull { it.value == selected }
+                ?.localizedLabel(languageTag)
+                ?: selected.ifEmpty { null }
+                ?: setting.localizedEmptyValueSummary(languageTag)
+                ?: stringResource(R.string.plugin_setting_empty_value)
+            ArrowPreference(
+                title = title,
+                summary = listOfNotNull(summary, selectedLabel).joinToString("\n"),
+                onClick = onEdit
+            )
+        }
+        PluginSettingType.MULTI_SELECT -> {
+            val selected = PluginSettingsStore.getStringSet(context, pluginId, setting)
+            val selectedLabel = setting.options
+                .filter { it.value in selected }
+                .joinToString(", ") { it.localizedLabel(languageTag) }
+                .ifEmpty {
+                    setting.localizedEmptyValueSummary(languageTag)
+                        ?: stringResource(R.string.plugin_setting_empty_value)
+                }
+            ArrowPreference(
+                title = title,
+                summary = listOfNotNull(summary, selectedLabel).joinToString("\n"),
+                onClick = onEdit
+            )
+        }
+        PluginSettingType.TEXT, PluginSettingType.PASSWORD -> {
+            val value = PluginSettingsStore.getString(context, pluginId, setting)
+            val valueLabel = when {
+                setting.type == PluginSettingType.PASSWORD && value.isNotEmpty() -> "•••"
+                value.isNotEmpty() -> value
+                else -> setting.localizedEmptyValueSummary(languageTag)
+                    ?: stringResource(R.string.plugin_setting_empty_value)
+            }
+            ArrowPreference(
+                title = title,
+                summary = listOfNotNull(summary, valueLabel).joinToString("\n"),
+                onClick = onEdit
+            )
+        }
+        PluginSettingType.NUMBER -> {
+            val value = PluginSettingsStore.getFloat(context, pluginId, setting)
+            ArrowPreference(
+                title = title,
+                summary = listOfNotNull(summary, formatSettingNumber(value))
+                    .joinToString("\n"),
+                onClick = onEdit
+            )
+        }
+        // ACTION 型设置在 HyperLyric 上游依赖其自有 UI 框架的点击回调，本 API 副本
+        // 未暴露回调接口；宿主以只读行展示，保持 manifest 语义可见。
+        PluginSettingType.ACTION -> {
+            ArrowPreference(
+                title = title,
+                summary = summary ?: stringResource(R.string.plugin_setting_action_unsupported),
+                onClick = {},
+                enabled = false
+            )
+        }
+        null -> Unit
+    }
+}
+
+/** 标量/单选/多选设置的编辑子对话框。 */
+@Composable
+internal fun PluginSettingEditDialog(
+    pluginId: String,
+    setting: PluginSettingData,
+    languageTag: String,
+    onDismiss: () -> Unit,
+    onWrite: (put: () -> Unit) -> Unit
+) {
+    val context = LocalContext.current
+    val title = setting.localizedTitle(languageTag)
+
+    when (setting.type) {
+        PluginSettingType.SELECT -> {
+            val selected = PluginSettingsStore.getString(context, pluginId, setting)
+            WindowDialog(
+                title = title,
+                summary = setting.localizedDialogSummary(languageTag),
+                show = true,
+                onDismissRequest = onDismiss
+            ) {
+                Column(
+                    Modifier
+                        .heightIn(max = 440.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    setting.options.forEach { option ->
+                        RadioButtonPreference(
+                            option.localizedLabel(languageTag),
+                            option.value == selected,
+                            {
+                                onWrite {
+                                    PluginSettingsStore.putString(
+                                        context, pluginId, setting.key, option.value
+                                    )
+                                }
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        PluginSettingType.MULTI_SELECT -> {
+            // 本地可变快照：多选不关对话框，切换即时反馈；写入仍走 onWrite 落盘。
+            var selected by remember(setting.key) {
+                mutableStateOf(PluginSettingsStore.getStringSet(context, pluginId, setting))
+            }
+            WindowDialog(
+                title = title,
+                summary = setting.localizedDialogSummary(languageTag),
+                show = true,
+                onDismissRequest = onDismiss
+            ) {
+                Column(
+                    Modifier
+                        .heightIn(max = 440.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    setting.options.forEach { option ->
+                        SwitchPreference(
+                            option.value in selected,
+                            { enabled ->
+                                val next = if (enabled) {
+                                    selected + option.value
+                                } else {
+                                    selected - option.value
+                                }
+                                selected = next
+                                onWrite {
+                                    PluginSettingsStore.putStringSet(
+                                        context, pluginId, setting.key, next
+                                    )
+                                }
+                            },
+                            option.localizedLabel(languageTag)
+                        )
+                    }
+                }
+            }
+        }
+        PluginSettingType.TEXT, PluginSettingType.PASSWORD, PluginSettingType.NUMBER -> {
+            val isNumber = setting.type == PluginSettingType.NUMBER
+            val storedText = if (isNumber) {
+                formatSettingNumber(PluginSettingsStore.getFloat(context, pluginId, setting))
+            } else {
+                PluginSettingsStore.getString(context, pluginId, setting)
+            }
+            var text by remember(setting.key) { mutableStateOf(storedText) }
+            val numericInput = isNumber ||
+                setting.inputType == PluginSettingInputType.NUMBER
+            WindowDialog(
+                title = title,
+                summary = setting.localizedDialogSummary(languageTag),
+                show = true,
+                onDismissRequest = onDismiss
+            ) {
+                Column {
+                    TextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        singleLine = true,
+                        label = setting.localizedEmptyValueSummary(languageTag)
+                            ?: stringResource(R.string.plugin_setting_empty_value),
+                        useLabelAsPlaceholder = true,
+                        textStyle = TextStyle(
+                            color = MiuixTheme.colorScheme.onSurfaceContainerHighest,
+                            fontSize = 16.sp
+                        ),
+                        cursorBrush = SolidColor(MiuixTheme.colorScheme.primary),
+                        keyboardOptions = if (numericInput) {
+                            KeyboardOptions(keyboardType = KeyboardType.Number)
+                        } else {
+                            KeyboardOptions.Default
+                        }
+                    )
+                    Row(Modifier.fillMaxWidth()) {
+                        TextButton(
+                            text = stringResource(R.string.action_cancel),
+                            modifier = Modifier.weight(1f),
+                            onClick = onDismiss
+                        )
+                        Spacer(Modifier.width(20.dp))
+                        TextButton(
+                            text = stringResource(R.string.action_save),
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.textButtonColorsPrimary(),
+                            onClick = {
+                                if (isNumber) {
+                                    val parsed = text.trim().toFloatOrNull()
+                                    if (parsed == null) {
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(
+                                                R.string.plugin_toast_invalid_number
+                                            ),
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                        return@TextButton
+                                    }
+                                    onWrite {
+                                        PluginSettingsStore.putFloat(
+                                            context, pluginId, setting.key, parsed
+                                        )
+                                    }
+                                } else {
+                                    onWrite {
+                                        PluginSettingsStore.putString(
+                                            context, pluginId, setting.key, text
+                                        )
+                                    }
+                                }
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        else -> onDismiss()
+    }
+}
+
+/** App 当前语言标签（per-app locale 优先），匹配 manifest 的 *Locales 键。 */
+internal fun currentLanguageTag(context: Context): String =
+    context.resources.configuration.locales[0].toLanguageTag()
+
+internal fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024L * 1024L ->
+        String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+    bytes >= 1024L ->
+        String.format(Locale.US, "%.1f KB", bytes / 1024f)
+    else -> "$bytes B"
+}
+
+private fun formatSettingNumber(value: Float): String =
+    if (value == value.toLong().toFloat()) {
+        value.toLong().toString()
+    } else {
+        String.format(Locale.US, "%.2f", value)
+    }

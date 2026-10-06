@@ -1,9 +1,18 @@
 package com.eza.hyperglow.root.projection
 
+import com.eza.hyperglow.aod.AOD_ROTATION_MODE_PORTRAIT
 import com.eza.hyperglow.aod.AodStateWireLimits
 import com.eza.hyperglow.aod.AodStateWireMessage
+import com.eza.hyperglow.aod.DEFAULT_CANVAS_PADDING_PERCENT
+import com.eza.hyperglow.aod.DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT
 import com.eza.hyperglow.aod.normalizeAodBurnInInterval
 import com.eza.hyperglow.aod.normalizeAodBurnInPattern
+import com.eza.hyperglow.aod.normalizeAodCanvasAnchor
+import com.eza.hyperglow.aod.normalizeAodCanvasPaddingPercent
+import com.eza.hyperglow.aod.normalizeAodFullscreenSafeMarginPercent
+import com.eza.hyperglow.aod.normalizeAodLandscapeTextScale
+import com.eza.hyperglow.aod.normalizeAodRotationMode
+import com.eza.hyperglow.aod.normalizeAodRotationSettleMs
 import com.eza.hyperglow.aod.normalizePauseLingerMs
 
 internal data class LyricWord(
@@ -26,28 +35,73 @@ internal data class LyricLayoutGroup(
     val confidence: Double
 )
 
+/**
+ * 对唱并发行(仅息屏消费):与主行播放窗口重叠的另一唱词行,画布在主行下方同时渲染。
+ * v1 不携带 ruby/layoutGroups(三个接入源中只有 Spicy 可产,normalize 侧还要为文本 trim
+ * 重算区间;并入 v2 再评估)。
+ */
+internal data class LyricDuetLine(
+    val text: String = "",
+    val romanized: String = "",
+    val translated: String = "",
+    /** 分侧(元数据身份版);渲染面按本面「识别对唱标记」开关在两版之间选用。 */
+    val alignedRight: Boolean = false,
+    /** 分侧(标记识别版)。 */
+    val alignedRightMarkers: Boolean = false,
+    val lineStartMs: Long = 0L,
+    val lineEndMs: Long = 0L,
+    val words: List<LyricWord> = emptyList()
+)
+
 internal data class LyricSnapshot(
     val revision: Long = 0L,
     val userId: Int = 0,
     val trackGeneration: Long = 0L,
     val updatedAtElapsedMs: Long = 0L,
+    /** 隐藏但仍在播放的传输间隙首边(投影侧盖章,见 [stampTransportGapEdge]);0 表示非间隙态。 */
+    val transportGapStartedAtElapsedMs: Long = 0L,
     val visible: Boolean = false,
     val playbackActive: Boolean = false,
     val pauseRetentionEligible: Boolean = false,
     val aodEnabled: Boolean = true,
     val lockscreenEnabled: Boolean = false,
-    val seamlessTransitionEnabled: Boolean = true,
     val keepAlive: Boolean = false,
     val positionFollowingEnabled: Boolean = false,
     val burnInPattern: String = "static_bottom",
     val burnInIntervalMs: Long = 60_000L,
+    val suppressStockAodContent: Boolean = false,
+    val aodRotateWithDevice: Boolean = false,
+    val aodRotationMode: String = AOD_ROTATION_MODE_PORTRAIT,
+    val aodRotationSettleMs: Long = 1_000L,
+    val aodCanvasAnchorLandscape: Float = 0.5f,
+    val aodLandscapeTextScale: Float = 1f,
+    val aodLandscapeHideStock: Boolean = false,
+    val aodLandscapeFullscreen: Boolean = false,
+    val aodLandscapeFullscreenSafeMarginPercent: Float = DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT,
+    val aodDebugShowCanvasFrame: Boolean = false,
+    val aodCanvasPaddingPortraitXPercent: Float = DEFAULT_CANVAS_PADDING_PERCENT,
+    val aodCanvasPaddingPortraitYPercent: Float = DEFAULT_CANVAS_PADDING_PERCENT,
+    val aodCanvasPaddingLandscapeXPercent: Float = DEFAULT_CANVAS_PADDING_PERCENT,
+    val aodCanvasPaddingLandscapeYPercent: Float = DEFAULT_CANVAS_PADDING_PERCENT,
     val wakeSignal: Long = 0L,
     val original: String = "",
     val romanized: String = "",
     val translated: String = "",
     val nextLine: String = "",
+    /** 下一行歌词的辅助文字(音标/翻译);「显示第二行辅助文字」消费。 */
+    val nextLineRomanized: String = "",
+    val nextLineTranslated: String = "",
     val metadata: String = "",
+    /** 原始歌名/歌手/专辑:渲染面按本面「歌曲信息内容」重新组装(per-surface)。 */
+    val title: String = "",
+    val artist: String = "",
+    val album: String = "",
+    /** 大元数据引导态:渲染面用本面组装后的歌曲信息替换 original 占位符。 */
+    val largeMetadata: Boolean = false,
+    /** 分侧(元数据身份版);标记识别版见 [alignedRightMarkers]。 */
     val alignedRight: Boolean = false,
+    /** 分侧(标记识别版);「识别对唱标记」开启的面取本值,否则取 [alignedRight]。 */
+    val alignedRightMarkers: Boolean = false,
     val lineLevelSync: Boolean = false,
     val lineStartMs: Long = 0L,
     val lineEndMs: Long = 0L,
@@ -72,7 +126,13 @@ internal data class LyricSnapshot(
     val alignmentMode: String = "auto",
     val metadataVisible: Boolean = true,
     val metadataAnchor: String = "top",
-    val adaptiveSectioning: Boolean = true
+    val adaptiveSectioning: Boolean = true,
+    /** 歌曲图片帧(有界 JPEG,空数组=无封面):经包名/曲目校对的当前播放音乐软件封面。 */
+    val artworkJpeg: ByteArray = ByteArray(0),
+    /** 封面稳定键(包名+曲目身份);空串=无封面,渲染侧按帧缓存解码位图。 */
+    val artworkKey: String = "",
+    /** 对唱并发行(仅息屏消费);null = 无并发行或「显示并发歌词(对唱)」已关。 */
+    val duetLine: LyricDuetLine? = null
 ) {
     fun renderContent(): LyricRenderContent = LyricRenderContent(
         trackGeneration,
@@ -80,8 +140,15 @@ internal data class LyricSnapshot(
         romanized,
         translated,
         nextLine,
+        nextLineRomanized,
+        nextLineTranslated,
         metadata,
+        title,
+        artist,
+        album,
+        largeMetadata,
         alignedRight,
+        alignedRightMarkers,
         lineLevelSync,
         lineStartMs,
         lineEndMs,
@@ -106,7 +173,9 @@ internal data class LyricSnapshot(
         alignmentMode,
         metadataVisible,
         metadataAnchor,
-        adaptiveSectioning
+        adaptiveSectioning,
+        artworkKey,
+        duetLine
     )
 }
 
@@ -116,8 +185,18 @@ internal data class LyricRenderContent(
     val romanized: String,
     val translated: String,
     val nextLine: String,
+    val nextLineRomanized: String = "",
+    val nextLineTranslated: String = "",
     val metadata: String,
+    /** 原始歌名/歌手/专辑:渲染面按本面「歌曲信息内容」重新组装(per-surface)。 */
+    val title: String = "",
+    val artist: String = "",
+    val album: String = "",
+    /** 大元数据引导态:渲染面用本面组装后的歌曲信息替换 original 占位符。 */
+    val largeMetadata: Boolean = false,
     val alignedRight: Boolean,
+    /** 分侧(标记识别版);「识别对唱标记」开启的面取本值,否则取 [alignedRight]。 */
+    val alignedRightMarkers: Boolean = false,
     val lineLevelSync: Boolean,
     val lineStartMs: Long,
     val lineEndMs: Long,
@@ -142,7 +221,17 @@ internal data class LyricRenderContent(
     val alignmentMode: String,
     val metadataVisible: Boolean,
     val metadataAnchor: String,
-    val adaptiveSectioning: Boolean
+    val adaptiveSectioning: Boolean,
+    /**
+     * 变更指纹只带封面键不带 JPEG 字节:每次 wire 解码都会产出新 ByteArray,
+     * 按内容比对会让逐帧重渲染判定失效,按键比对则同帧重播仍是「无变化」。
+     */
+    val artworkKey: String = "",
+    /**
+     * 对唱并发行(锁屏/息屏各自按自己的开关门控后)。纳入变更指纹:主行不变而并发行
+     * 单独加入/离开时,控制器也要重投内容(与 artworkKey 同为内容级指纹)。
+     */
+    val duetLine: LyricDuetLine? = null
 )
 
 internal data class LyricKeepAliveSignal(
@@ -186,6 +275,78 @@ internal fun pauseLingerRemainingMs(
     val elapsedMs = (nowElapsedMs - pausedAtElapsedMs).coerceAtLeast(0L)
     return (durationMs - elapsedMs).takeIf { it > 0L }
 }
+
+/**
+ * 驻留回合的隐藏首边,以及它开启的是哪一种驻留(暂停驻留还是传输间隙)。
+ *
+ * 上报的 `updatedAtElapsedMs` 是 producer 发消息的时刻,不是播放停止的时刻,而且 producer
+ * 会在 Spotify 每次修订同一暂停态时重发——一次进度更新、另一个应用接管媒体会话都会触发。
+ * 把冻结快照锚定到每条到达的消息上,会让有限时长的驻留计时被无限重置:一首早已暂停的
+ * 歌词在会话被任何东西"碰一下"时就再驻留一整轮,于是过期歌词盖在了显示另一个播放器的
+ * AOD 上。驻留回合只认第一条隐藏边,直到可见快照或终止隐藏态结束它。
+ */
+internal data class LyricRetentionAnchor(
+    val pauseRetentionEligible: Boolean,
+    val atElapsedMs: Long
+)
+
+internal fun nextLyricRetentionAnchor(
+    incoming: LyricSnapshot,
+    anchor: LyricRetentionAnchor?,
+    nowElapsedMs: Long
+): LyricRetentionAnchor? {
+    if (incoming.visible) return null
+    val eligible = when {
+        incoming.pauseRetentionEligible -> true
+        incoming.playbackActive -> false
+        else -> return null
+    }
+    return anchor?.takeIf { it.pauseRetentionEligible == eligible }
+        ?: LyricRetentionAnchor(
+            eligible,
+            if (eligible) {
+                incoming.updatedAtElapsedMs.coerceIn(0L, nowElapsedMs)
+            } else {
+                incoming.transportGapStartedAtElapsedMs
+                    .takeIf { it > 0L }
+                    ?.coerceAtMost(nowElapsedMs)
+                    ?: incoming.updatedAtElapsedMs.coerceIn(0L, nowElapsedMs)
+            }
+        )
+}
+
+/**
+ * 在投影侧为传输间隙盖章:隐藏+仍在播放且非暂停驻留的快照,其首边继承自同曲目同间隙态的
+ * 上一条快照,否则取本条消息的上报时刻。可见/暂停态一律清零。
+ */
+internal fun stampTransportGapEdge(
+    current: LyricSnapshot?,
+    incoming: LyricSnapshot
+): LyricSnapshot {
+    if (incoming.visible || !incoming.playbackActive || incoming.pauseRetentionEligible) {
+        return incoming.copy(transportGapStartedAtElapsedMs = 0L)
+    }
+    val sameGap = current?.takeIf {
+        !it.visible && it.playbackActive && !it.pauseRetentionEligible &&
+            it.trackGeneration == incoming.trackGeneration
+    }
+    val edge = sameGap?.transportGapStartedAtElapsedMs?.takeIf { it > 0L }
+        ?: incoming.updatedAtElapsedMs
+    return incoming.copy(transportGapStartedAtElapsedMs = edge)
+}
+
+internal fun LyricRetentionAnchor?.edgeFor(
+    pauseRetentionEligible: Boolean,
+    fallbackElapsedMs: Long
+): Long = this?.takeIf { it.pauseRetentionEligible == pauseRetentionEligible }?.atElapsedMs
+    ?: fallbackElapsedMs
+
+/**
+ * 既无播放也无暂停驻留的隐藏态。共享快照契约称之为终止态:任何内容都不得由它呈现,
+ * 它原本可以重建出的缓存可见快照也随它一并丢弃。
+ */
+internal fun LyricSnapshot.isTerminalHidden(): Boolean =
+    !visible && !playbackActive && !pauseRetentionEligible
 
 internal fun LyricSnapshot.isAuthorizedForPresentation(): Boolean =
     playbackActive || pauseRetentionEligible && speed == 0f
@@ -249,6 +410,41 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
     }.toList()
     val position = snapshot.positionMs.coerceAtLeast(0L)
     val duration = snapshot.durationMs.coerceAtLeast(0L)
+    // 歌曲图片:超限/半截帧整帧丢弃(与投影侧 normalizeAodDisplayState 同 fail-closed 口径)。
+    val artworkJpeg = snapshot.artworkJpeg.takeIf {
+        it.isNotEmpty() && it.size <= AodStateWireLimits.MAX_ARTWORK_BYTES
+    } ?: ByteArray(0)
+    val artworkKey = if (artworkJpeg.isEmpty()) {
+        ""
+    } else {
+        snapshot.artworkKey.trim().take(AodStateWireLimits.MAX_ARTWORK_KEY_CHARS)
+    }
+    // 对唱并发行:文本 trim/钳制(空文本整条丢弃),时间窗钳到非负,词级条数/时间轻量钳制
+    // (wire 侧 isValidSnapshot 已做过整包校验,这里只兜投影侧直接构造的快照)。
+    val duetLine = snapshot.duetLine?.let { line ->
+        val duetText = line.text.trim().take(MAX_LYRIC_LENGTH)
+        if (duetText.isEmpty()) {
+            null
+        } else {
+            line.copy(
+                text = duetText,
+                romanized = line.romanized.trim().take(MAX_LYRIC_LENGTH),
+                translated = line.translated.trim().take(MAX_LYRIC_LENGTH),
+                alignedRight = line.alignedRight,
+                alignedRightMarkers = line.alignedRightMarkers,
+                lineStartMs = line.lineStartMs.coerceAtLeast(0L),
+                lineEndMs = line.lineEndMs.coerceAtLeast(line.lineStartMs.coerceAtLeast(0L)),
+                words = line.words.asSequence().take(MAX_WORDS).map { word ->
+                    word.copy(
+                        text = word.text.take(MAX_LYRIC_LENGTH),
+                        romanized = word.romanized.take(MAX_LYRIC_LENGTH),
+                        startMs = word.startMs.coerceAtLeast(0L),
+                        endMs = word.endMs.coerceAtLeast(word.startMs.coerceAtLeast(0L))
+                    )
+                }.toList()
+            )
+        }
+    }
     return snapshot.copy(
         revision = snapshot.revision.coerceAtLeast(0L),
         trackGeneration = snapshot.trackGeneration.coerceAtLeast(0L),
@@ -258,7 +454,12 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
         romanized = snapshot.romanized.trim().take(MAX_LYRIC_LENGTH),
         translated = snapshot.translated.trim().take(MAX_LYRIC_LENGTH),
         nextLine = snapshot.nextLine.trim().take(MAX_LYRIC_LENGTH),
+        nextLineRomanized = snapshot.nextLineRomanized.trim().take(MAX_LYRIC_LENGTH),
+        nextLineTranslated = snapshot.nextLineTranslated.trim().take(MAX_LYRIC_LENGTH),
         metadata = snapshot.metadata.trim().take(MAX_METADATA_LENGTH),
+        title = snapshot.title.trim().take(MAX_METADATA_LENGTH),
+        artist = snapshot.artist.trim().take(MAX_METADATA_LENGTH),
+        album = snapshot.album.trim().take(MAX_METADATA_LENGTH),
         lineStartMs = snapshot.lineStartMs.coerceAtLeast(0L),
         lineEndMs = snapshot.lineEndMs.coerceAtLeast(snapshot.lineStartMs.coerceAtLeast(0L)),
         durationMs = duration,
@@ -267,10 +468,32 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
         speed = snapshot.speed.takeIf { it.isFinite() && it >= 0f } ?: 1f,
         burnInPattern = normalizeAodBurnInPattern(snapshot.burnInPattern),
         burnInIntervalMs = normalizeAodBurnInInterval(snapshot.burnInIntervalMs),
+        aodRotationMode = normalizeAodRotationMode(snapshot.aodRotationMode),
+        aodRotationSettleMs = normalizeAodRotationSettleMs(snapshot.aodRotationSettleMs),
+        aodCanvasAnchorLandscape = normalizeAodCanvasAnchor(snapshot.aodCanvasAnchorLandscape),
+        aodLandscapeTextScale = normalizeAodLandscapeTextScale(snapshot.aodLandscapeTextScale),
+        aodLandscapeFullscreenSafeMarginPercent = normalizeAodFullscreenSafeMarginPercent(
+            snapshot.aodLandscapeFullscreenSafeMarginPercent
+        ),
+        aodCanvasPaddingPortraitXPercent = normalizeAodCanvasPaddingPercent(
+            snapshot.aodCanvasPaddingPortraitXPercent
+        ),
+        aodCanvasPaddingPortraitYPercent = normalizeAodCanvasPaddingPercent(
+            snapshot.aodCanvasPaddingPortraitYPercent
+        ),
+        aodCanvasPaddingLandscapeXPercent = normalizeAodCanvasPaddingPercent(
+            snapshot.aodCanvasPaddingLandscapeXPercent
+        ),
+        aodCanvasPaddingLandscapeYPercent = normalizeAodCanvasPaddingPercent(
+            snapshot.aodCanvasPaddingLandscapeYPercent
+        ),
         words = words,
         ruby = ruby,
         layoutGroups = layoutGroups,
-        textSizeCustom = snapshot.textSizeCustom.coerceIn(0, 500)
+        textSizeCustom = snapshot.textSizeCustom.coerceIn(0, 500),
+        artworkJpeg = artworkJpeg,
+        artworkKey = artworkKey,
+        duetLine = duetLine
     )
 }
 
@@ -286,18 +509,39 @@ internal fun AodStateWireMessage.toLyricProjectionMessage(): LyricProjectionMess
             pauseRetentionEligible = false,
             aodEnabled = value.aodEnabled,
             lockscreenEnabled = value.lockscreenEnabled,
-            seamlessTransitionEnabled = value.seamlessTransitionEnabled,
             keepAlive = keepAlive,
             positionFollowingEnabled = value.positionFollowingEnabled,
             burnInPattern = value.burnInPattern,
             burnInIntervalMs = value.burnInIntervalMs,
+            suppressStockAodContent = value.suppressStockAodContent,
+            aodRotateWithDevice = value.aodRotateWithDevice,
+            aodRotationMode = value.aodRotationMode,
+            aodRotationSettleMs = value.aodRotationSettleMs,
+            aodCanvasAnchorLandscape = value.aodCanvasAnchorLandscape,
+            aodLandscapeTextScale = value.aodLandscapeTextScale,
+            aodLandscapeHideStock = value.aodLandscapeHideStock,
+            aodLandscapeFullscreen = value.aodLandscapeFullscreen,
+            aodLandscapeFullscreenSafeMarginPercent =
+                value.aodLandscapeFullscreenSafeMarginPercent,
+            aodDebugShowCanvasFrame = value.aodDebugShowCanvasFrame,
+            aodCanvasPaddingPortraitXPercent = value.aodCanvasPaddingPortraitXPercent,
+            aodCanvasPaddingPortraitYPercent = value.aodCanvasPaddingPortraitYPercent,
+            aodCanvasPaddingLandscapeXPercent = value.aodCanvasPaddingLandscapeXPercent,
+            aodCanvasPaddingLandscapeYPercent = value.aodCanvasPaddingLandscapeYPercent,
             wakeSignal = wakeSignal,
             original = value.original,
             romanized = value.romanized,
             translated = value.translated,
             nextLine = value.nextLine,
+            nextLineRomanized = value.nextLineRomanized,
+            nextLineTranslated = value.nextLineTranslated,
             metadata = value.metadata,
+            title = value.title,
+            artist = value.artist,
+            album = value.album,
+            largeMetadata = value.largeMetadata,
             alignedRight = value.alignedRight,
+            alignedRightMarkers = value.alignedRightMarkers,
             lineLevelSync = value.lineLevelSync,
             lineStartMs = value.lineStartMs,
             lineEndMs = value.lineEndMs,
@@ -342,7 +586,31 @@ internal fun AodStateWireMessage.toLyricProjectionMessage(): LyricProjectionMess
             alignmentMode = value.alignmentMode,
             metadataVisible = value.metadataVisible,
             metadataAnchor = value.metadataAnchor,
-            adaptiveSectioning = value.adaptiveSectioning
+            adaptiveSectioning = value.adaptiveSectioning,
+            artworkJpeg = value.artworkJpeg.bytes,
+            artworkKey = value.artworkKey,
+            duetLine = value.duetLine?.let { line ->
+                LyricDuetLine(
+                    text = line.text,
+                    romanized = line.romanized,
+                    translated = line.translated,
+                    alignedRight = line.alignedRight,
+                    alignedRightMarkers = line.alignedRightMarkers,
+                    lineStartMs = line.lineStartMs,
+                    lineEndMs = line.lineEndMs,
+                    words = line.words.map { word ->
+                        LyricWord(
+                            text = word.text,
+                            romanized = word.romanized,
+                            startMs = word.startMs,
+                            endMs = word.endMs,
+                            boundaryAfter = word.boundaryAfter,
+                            sourceStart = word.sourceStart,
+                            sourceEnd = word.sourceEnd
+                        )
+                    }
+                )
+            }
         )
     )
     is AodStateWireMessage.Hidden -> LyricProjectionMessage.Snapshot(

@@ -20,6 +20,56 @@ class LockscreenSurfaceControllerTest {
     }
 
     @Test
+    fun adaptiveSceneHeightFollowsMeasuredContentAndKeepsEstimateFallback() {
+        // 实测内容驱动:内容多高卡片就多高(含进度条间距+卡片上下留白);估算只兜底无实测;
+        // 「高度」设置仍是上限;lyricLineLimit=0 的无穷估算不影响实测路径。
+        assertEquals(
+            200f,
+            adaptiveLockscreenSceneHeight(
+                measuredContentStackPx = 150f,
+                estimatedSceneHeightPx = 500f,
+                progressHeightWithGapPx = 30f,
+                cardVerticalPaddingPx = 20f,
+                maximumPx = 800f
+            ),
+            0.0001f
+        )
+        assertEquals(
+            500f,
+            adaptiveLockscreenSceneHeight(
+                measuredContentStackPx = 0f,
+                estimatedSceneHeightPx = 500f,
+                progressHeightWithGapPx = 30f,
+                cardVerticalPaddingPx = 20f,
+                maximumPx = 800f
+            ),
+            0.0001f
+        )
+        assertEquals(
+            800f,
+            adaptiveLockscreenSceneHeight(
+                measuredContentStackPx = 900f,
+                estimatedSceneHeightPx = 500f,
+                progressHeightWithGapPx = 30f,
+                cardVerticalPaddingPx = 20f,
+                maximumPx = 800f
+            ),
+            0.0001f
+        )
+        assertEquals(
+            200f,
+            adaptiveLockscreenSceneHeight(
+                measuredContentStackPx = 150f,
+                estimatedSceneHeightPx = Float.POSITIVE_INFINITY,
+                progressHeightWithGapPx = 30f,
+                cardVerticalPaddingPx = 20f,
+                maximumPx = 800f
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
     fun lockscreenKeepAwakeRequiresActiveVisiblePlayback() {
         assertTrue(shouldKeepLockscreenAwake(true, true, false, true, 1f))
         assertFalse(shouldKeepLockscreenAwake(false, true, false, true, 1f))
@@ -516,15 +566,64 @@ class LockscreenSurfaceControllerTest {
             pauseRetentionEligible = true,
             updatedAtElapsedMs = 3_000L
         )
-        val first = retainedLockscreenSnapshotAfterUpdate(hidden, live, null, 3_000L, 10_000L)!!
-        val replayed = retainedLockscreenSnapshotAfterUpdate(hidden, live, first, 8_000L, 10_000L)
+        val first = retainedLockscreenSnapshotAfterUpdate(hidden, live, null, null, 3_000L, 10_000L)!!
+        val replayed = retainedLockscreenSnapshotAfterUpdate(hidden, live, first, null, 8_000L, 10_000L)
 
         assertEquals(first, replayed)
         assertEquals(6_000L, replayed!!.positionMs)
         assertEquals(0f, replayed.speed)
         assertEquals(
             null,
-            retainedLockscreenSnapshotAfterUpdate(hidden, live, null, 13_000L, 10_000L)
+            retainedLockscreenSnapshotAfterUpdate(hidden, live, null, null, 13_000L, 10_000L)
+        )
+    }
+
+    @Test
+    fun disabledPauseShowContentClearsPausedLyricsImmediately() {
+        // 「暂停时显示歌曲信息、歌词」关闭时,锁屏暂停边按终止态处理:
+        // 不冻结歌曲信息与歌词,与 AOD 侧同一开关语义。
+        val live = com.eza.hyperglow.root.projection.LyricSnapshot(
+            visible = true,
+            playbackActive = true,
+            keepAlive = true,
+            durationMs = 20_000L,
+            positionMs = 4_000L,
+            sampledAtElapsedMs = 1_000L,
+            speed = 1f,
+            original = "line"
+        )
+        val paused = live.copy(
+            visible = false,
+            playbackActive = false,
+            pauseRetentionEligible = true,
+            updatedAtElapsedMs = 3_000L
+        )
+
+        assertEquals(
+            null,
+            retainedLockscreenSnapshotAfterUpdate(
+                paused, live, null, null, 3_000L, 30_000L,
+                pauseRetentionEnabled = false
+            )
+        )
+        // 已经驻留中的快照在开关关闭后同样不再保留。
+        val retained = retainedLockscreenSnapshotAfterUpdate(
+            paused, live, null, null, 3_000L, 30_000L
+        )!!
+        assertEquals(
+            null,
+            retainedLockscreenSnapshotAfterUpdate(
+                paused, live, retained, null, 3_500L, 30_000L,
+                pauseRetentionEnabled = false
+            )
+        )
+        // 传输间隙驻留(仍在播放)不受该开关影响。
+        val gap = live.copy(visible = false, updatedAtElapsedMs = 3_000L)
+        assertTrue(
+            retainedLockscreenSnapshotAfterUpdate(
+                gap, live, null, null, 3_000L, 5_000L,
+                pauseRetentionEnabled = false
+            ) != null
         )
     }
 
@@ -549,6 +648,7 @@ class LockscreenSurfaceControllerTest {
             retainedLockscreenSnapshotAfterUpdate(
                 paused.copy(visible = false),
                 live.copy(playbackActive = true),
+                null,
                 null,
                 3_000L,
                 0L

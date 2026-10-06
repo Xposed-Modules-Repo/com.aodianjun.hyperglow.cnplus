@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -214,6 +215,25 @@ class AodStateWireCodecTest {
     }
 
     @Test
+    fun transitionVocabularyIsWhitelistedWithLegacyLowerCaseAliases() {
+        for (mode in listOf("Fade up", "Crossfade", "Slide up", "Slide left", "Zoom", "None")) {
+            assertEquals(mode, normalizeAodTransition(mode))
+            // 词表内的值必须能通过 fail-closed 校验编码进 wire,并按原值回环
+            val message = snapshotMessage(value = snapshotValue().copy(transitionMode = mode))
+            assertNotNull(AodStateWireCodec.encode(message))
+            assertEquals(message, AodStateWireCodec.encode(message)?.let(AodStateWireCodec::decode))
+        }
+        // 历史小写别名:Lyricon 曾以联动 preset id(continuity/crossfade/none)填 transition。
+        // "none" 必须归一到真正关闭换行的 "None",不能再落到 "Fade up"(静默开启换行动画)。
+        assertEquals("Fade up", normalizeAodTransition("continuity"))
+        assertEquals("Crossfade", normalizeAodTransition("crossfade"))
+        assertEquals("None", normalizeAodTransition("none"))
+        // 未知值 fail-safe 兜底 "Fade up";与原值不等,编码侧仍 fail-closed 拒绝裸 "Slide"
+        assertEquals("Fade up", normalizeAodTransition("Slide"))
+        assertEquals("Fade up", normalizeAodTransition(""))
+    }
+
+    @Test
     fun malformedUtf16FailsClosedInsteadOfReplacingCharacters() {
         assertNull(
             AodStateWireCodec.encode(
@@ -231,7 +251,102 @@ class AodStateWireCodecTest {
         assertEquals(exact, AodStateWireCodec.decode(envelope))
         assertTrue(requireNotNull(envelope.body).size <= AodStateWireLimits.MAX_ENCODED_BODY_BYTES)
         assertEquals(48 * 1024, AodStateWireLimits.MAX_AGGREGATE_TEXT_UTF8_BYTES)
-        assertEquals(64 * 1024, AodStateWireLimits.MAX_ENCODED_BODY_BYTES)
+        // 编码体上限 = 文本聚合预算 + 歌曲图片 JPEG 预算 + 结构开销(两账分计)。
+        assertEquals(96 * 1024, AodStateWireLimits.MAX_ENCODED_BODY_BYTES)
+        assertEquals(24 * 1024, AodStateWireLimits.MAX_ARTWORK_BYTES)
+        assertEquals(
+            com.eza.hyperglow.producer.MAX_ARTWORK_JPEG_BYTES,
+            AodStateWireLimits.MAX_ARTWORK_BYTES
+        )
+    }
+
+    @Test
+    fun nextLineAuxTextRoundTripsAndUntrimmedFailsClosed() {
+        // 下一行辅助文字(「显示第二行辅助文字」)随行文本过桥:内容相等是回环/去重判定的基石。
+        val message = snapshotMessage(
+            value = snapshotValue(
+                nextLine = "nextline",
+                nextLineRomanized = "next roma",
+                nextLineTranslated = "next trans"
+            )
+        )
+        assertEquals(message, AodStateWireCodec.encode(message)?.let(AodStateWireCodec::decode))
+        // 首尾空白 fail-closed(与 nextLine 同口径,归一到投影侧)。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(value = snapshotValue(nextLineTranslated = " padded "))
+            )
+        )
+    }
+
+    @Test
+    fun artworkFrameRoundTripsWithContentEquality() {
+        val jpegBytes = ByteArray(64) { it.toByte() }
+        val message = snapshotMessage(
+            value = snapshotValue(
+                artworkJpeg = ArtworkJpeg(jpegBytes.copyOf()),
+                artworkKey = "com.music.player|song|artist"
+            )
+        )
+        val envelope = requireNotNull(AodStateWireCodec.encode(message))
+        val decoded = AodStateWireCodec.decode(envelope)
+
+        assertEquals(message, decoded)
+        // 同帧不同实例必须相等(按内容比较):wire 快照整对象相等是回环/去重判定的基石。
+        assertEquals(ArtworkJpeg(jpegBytes.copyOf()), ArtworkJpeg(jpegBytes.copyOf()))
+        assertEquals(
+            ArtworkJpeg(jpegBytes.copyOf()).hashCode(),
+            ArtworkJpeg(jpegBytes.copyOf()).hashCode()
+        )
+        assertFalse(ArtworkJpeg(byteArrayOf(1, 2, 3)) == ArtworkJpeg(byteArrayOf(1, 2, 4)))
+    }
+
+    @Test
+    fun oversizeHalfOrUntrimmedArtworkFailsClosed() {
+        // 超限 JPEG:直接拒绝出包(有界渲染器契约)。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(
+                    value = snapshotValue(
+                        artworkJpeg = ArtworkJpeg(ByteArray(AodStateWireLimits.MAX_ARTWORK_BYTES + 1)),
+                        artworkKey = "key"
+                    )
+                )
+            )
+        )
+        // 半截帧:有图无键 / 有键无图,一律拒收。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(value = snapshotValue(artworkJpeg = ArtworkJpeg(byteArrayOf(1))))
+            )
+        )
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(value = snapshotValue(artworkKey = "key"))
+            )
+        )
+        // 规范键必须 trim 后原样:带首尾空白拒收。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(
+                    value = snapshotValue(
+                        artworkJpeg = ArtworkJpeg(byteArrayOf(1)),
+                        artworkKey = " key "
+                    )
+                )
+            )
+        )
+        // 键超长拒收。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(
+                    value = snapshotValue(
+                        artworkJpeg = ArtworkJpeg(byteArrayOf(1)),
+                        artworkKey = "k".repeat(AodStateWireLimits.MAX_ARTWORK_KEY_CHARS + 1)
+                    )
+                )
+            )
+        )
     }
 
     @Test
@@ -260,24 +375,42 @@ class AodStateWireCodecTest {
         original: String = "line",
         romanized: String = "",
         translated: String = "",
+        nextLine: String = "nextline",
+        nextLineRomanized: String = "",
+        nextLineTranslated: String = "",
         metadata: String = "track",
         speed: Float = 1f,
         words: List<AodStateWireWord> = emptyList(),
         ruby: List<AodStateWireRuby> = emptyList(),
         layoutGroups: List<AodStateWireLayoutGroup> = emptyList(),
-        weight: String = "Medium"
+        weight: String = "Medium",
+        artworkJpeg: ArtworkJpeg = ArtworkJpeg.EMPTY,
+        artworkKey: String = ""
     ) = AodStateWireSnapshot(
         trackGeneration = 12L,
         aodEnabled = true,
         lockscreenEnabled = true,
-        seamlessTransitionEnabled = true,
         positionFollowingEnabled = true,
         burnInPattern = "static_bottom",
         burnInIntervalMs = 60_000L,
+        suppressStockAodContent = true,
+        aodRotateWithDevice = true,
+        aodRotationMode = "landscape",
+        aodRotationSettleMs = 2_000L,
+        aodCanvasAnchorLandscape = 0.6f,
+        aodLandscapeTextScale = 0.85f,
+        aodLandscapeHideStock = false,
+        aodLandscapeFullscreen = false,
+        aodCanvasPaddingPortraitXPercent = 10f,
+        aodCanvasPaddingPortraitYPercent = 12f,
+        aodCanvasPaddingLandscapeXPercent = 14f,
+        aodCanvasPaddingLandscapeYPercent = 16f,
         original = original,
         romanized = romanized,
         translated = translated,
-        nextLine = "nextline",
+        nextLine = nextLine,
+        nextLineRomanized = nextLineRomanized,
+        nextLineTranslated = nextLineTranslated,
         metadata = metadata,
         alignedRight = true,
         lineLevelSync = true,
@@ -304,6 +437,115 @@ class AodStateWireCodecTest {
         alignmentMode = "auto",
         metadataVisible = true,
         metadataAnchor = "top",
-        adaptiveSectioning = true
+        adaptiveSectioning = true,
+        artworkJpeg = artworkJpeg,
+        artworkKey = artworkKey
     )
+
+    @Test
+    fun duetLineRoundTripsThroughWireBody() {
+        val message = snapshotMessage(
+            value = snapshotValue().copy(
+                duetLine = AodStateWireDuetLine(
+                    text = "second line",
+                    romanized = "roma",
+                    translated = "trans",
+                    alignedRight = true,
+                    lineStartMs = 40L,
+                    lineEndMs = 900L,
+                    words = listOf(AodStateWireWord("sec", "", 40L, 900L, true, -1, -1))
+                )
+            )
+        )
+        assertEquals(message, AodStateWireCodec.encode(message)?.let(AodStateWireCodec::decode))
+    }
+
+    @Test
+    fun duetLineFailsClosedOnBlankTextOrWindowBeyondDuration() {
+        // 空白文本:isValidSnapshot 拒收 → 编码直接出包失败(fail-closed)。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(
+                    value = snapshotValue().copy(
+                        duetLine = AodStateWireDuetLine(
+                            text = "   ",
+                            lineStartMs = 0L,
+                            lineEndMs = 10L,
+                            words = emptyList()
+                        )
+                    )
+                )
+            )
+        )
+        // 行窗越过歌长(快照 duration=1000):拒收。
+        assertNull(
+            AodStateWireCodec.encode(
+                snapshotMessage(
+                    value = snapshotValue().copy(
+                        duetLine = AodStateWireDuetLine(
+                            text = "second",
+                            lineStartMs = 0L,
+                            lineEndMs = 2_000L,
+                            words = emptyList()
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    @Test
+    fun everyRejectionGateNamesItselfAndAValidEnvelopeNamesNone() {
+        // 报告 R1-… 曾连打六条一模一样的 "Rejected invalid state payload":真实原因是应用
+        // 升级后 hook 进程尚未重启(会自愈),日志却分不出它与载荷损坏。
+        val envelope = requireNotNull(AodStateWireCodec.encode(snapshotMessage()))
+        val body = requireNotNull(envelope.body)
+        val unknownBodyVersion = body.copyOf()
+        ByteBuffer.wrap(unknownBodyVersion).putInt(4, 99)
+
+        assertNull(AodStateWireCodec.decodeRejectReason(envelope))
+        assertEquals(
+            "protocol_mismatch",
+            AodStateWireCodec.decodeRejectReason(
+                envelope.copy(protocol = AodStateWireContract.PROTOCOL_VERSION + 1)
+            )
+        )
+        assertEquals(
+            "invalid_scalars",
+            AodStateWireCodec.decodeRejectReason(envelope.copy(revision = -1L))
+        )
+        assertEquals(
+            "unknown_kind",
+            AodStateWireCodec.decodeRejectReason(envelope.copy(kind = 99))
+        )
+        assertEquals(
+            "missing_body",
+            AodStateWireCodec.decodeRejectReason(envelope.copy(body = null))
+        )
+        assertEquals(
+            "undecodable_body",
+            AodStateWireCodec.decodeRejectReason(envelope.copy(body = unknownBodyVersion))
+        )
+        assertEquals(
+            "undecodable_body",
+            AodStateWireCodec.decodeRejectReason(envelope.copy(body = body.copyOf(body.size - 1)))
+        )
+    }
+
+    @Test
+    fun aNonSnapshotKindRejectsOnlyOnItsOwnGate() {
+        // 闸门有序:无 body 的 KeepAlive 不得被报成 missing_body。
+        val envelope = requireNotNull(
+            AodStateWireCodec.encode(
+                AodStateWireMessage.KeepAlive(
+                    revision = 1L,
+                    userId = 0,
+                    updatedAtElapsedMs = 1L,
+                    keepAlive = true,
+                    wakeSignal = 0L
+                )
+            )
+        )
+        assertNull(AodStateWireCodec.decodeRejectReason(envelope))
+    }
 }

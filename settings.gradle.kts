@@ -21,3 +21,16 @@ dependencyResolutionManagement {
 
 rootProject.name = "hyperglow"
 include(":app")
+// HyperLyric 兼容插件体系:api 为 FQCN 兼容的插件 API 契约(宿主经 parent
+// ClassLoader 提供,绝不打进插件 ZIP);demo 为参考实现插件模块。
+include(":plugins:api")
+include(":plugins:demo")
+// 补充插件(可安装,不参与宿主 APK 构建):
+// - lyricfetch: 在线取词 + 多格式解析(accompanist-lyrics-core 随插件打进 dex)
+// - scriptconvert: 歌词简繁字形转换(OpenCC 词典内嵌)
+// - amll-ttml: AMLL TTML 逐字歌词(api.amll.dev 取词;TTML 解析同用 accompanist-lyrics-core)
+// - ai-translation: OpenAI 兼容接口的 AI 歌词翻译(用户自带地址/模型/Key;无第三方运行时库)
+include(":plugins:lyricfetch")
+include(":plugins:scriptconvert")
+include(":plugins:amll-ttml")
+include(":plugins:ai-translation")

@@ -22,9 +22,19 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
     private var graceEligible = false
     private var graceActive = false
     private var lastWakeSignal = Long.MIN_VALUE
+    private var lastRetriedSignal = Long.MIN_VALUE
+    private var projectionVisible = false
     private var lifetimeActive = false
     private var lifetimeActiveSinceElapsedMs = Long.MIN_VALUE
     private var hideRaceRecoveryPending = false
+    private var offAnchorResetPending = false
+    private var lastOffEdgeElapsedMs = Long.MIN_VALUE
+    private val offAnchorReset = Runnable {
+        offAnchorResetPending = false
+        val heldMs = SystemClock.elapsedRealtime() - lastOffEdgeElapsedMs
+        if (!isAodOffSessionEnd(heldMs, AOD_OFF_ANCHOR_RESET_SETTLE_MS)) return@Runnable
+        AodPositionHook.resetStockAnchor("display off settled")
+    }
     /** What last moved the guard. Reported with the transition so a release names its own cause. */
     private var guardCause = "init"
     private val graceExpiry = Runnable {
@@ -67,6 +77,30 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
         val off = isAodDisplayOffState(state)
         if (off == aodDisplayOff) return
         aodDisplayOff = off
+        if (off) {
+            // 真正的 AOD 会话结束(显示完全关闭)才清空跨 controller 继承的时钟锚定,
+            // 下次进入 AOD 重新锚定到当前系统位置。但 AOD 防烧屏脉冲会让 OFF↔DOZE
+            // 每 1~2s 交替(issue #62),OFF 边本身不足以判定会话结束:立即清锚会让
+            // 锚点反复落到已漂移的请求值,防下移退化为「钉住当前漂移位」。改为延迟
+            // AOD_OFF_ANCHOR_RESET_SETTLE_MS 清锚 —— 脉冲期间回到非 OFF 即取消,
+            // 只有 OFF 持续到底(真会话结束)才生效。必须绑在 OFF 边而非每次 surface
+            // detach —— 旋转/LinkageTransition 会高频重建 surface,但 AOD 仍在呈现,
+            // 此时清锚会让锚点落到已漂移的请求值,防下移失效、旋转回竖屏回不到原位
+            // (issue #36)。
+            lastOffEdgeElapsedMs = SystemClock.elapsedRealtime()
+            offAnchorResetPending = true
+            mainHandler.removeCallbacks(offAnchorReset)
+            mainHandler.postDelayed(offAnchorReset, AOD_OFF_ANCHOR_RESET_SETTLE_MS)
+        } else if (offAnchorResetPending) {
+            offAnchorResetPending = false
+            mainHandler.removeCallbacks(offAnchorReset)
+            val heldMs = SystemClock.elapsedRealtime() - lastOffEdgeElapsedMs
+            HookLogger.i(
+                TAG,
+                "AOD off pulse ignored for anchor reset " +
+                    "(held ${heldMs}ms < ${AOD_OFF_ANCHOR_RESET_SETTLE_MS}ms)"
+            )
+        }
         if (!off || lastWakeSignal == Long.MIN_VALUE) return
         if (!shouldRecoverRacedAodHide(
                 surfaceAttached = surfaceAttached,
@@ -82,6 +116,7 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
     }
 
     override fun onLyricSnapshot(snapshot: LyricSnapshot) {
+        projectionVisible = snapshot.visible
         guardCause = "snapshot visible=${snapshot.visible} playing=${snapshot.playbackActive} " +
             "keepAlive=${snapshot.keepAlive} grace=$graceActive"
         if (snapshot.visible) {
@@ -97,6 +132,17 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
             )
         ) {
             startGrace()
+        } else if (shouldHoldGraceAcrossPauseRetention(
+                graceActive = graceActive,
+                playbackActive = snapshot.playbackActive,
+                pauseRetentionEligible = snapshot.pauseRetentionEligible
+            )
+        ) {
+            // 切歌间隙:app 侧 pause confirm 窗口比播放器的 false→true 间隙短,提交的
+            // 暂停驻留边(playbackActive=false)会落在本窗口内。grace 的存在意义正是跨过
+            // 歌曲边界的瞬态(新歌的可见快照到达后恢复 keepalive);真暂停则由 grace 的
+            // 有界定时器(PAUSED_AOD_KEEP_ALIVE_MS)到期释放。间隙中途不得判死刑。
+            guardCause = "song-gap retention grace=$graceActive"
         } else {
             cancelGrace()
             keepAliveRequested = false
@@ -112,11 +158,23 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
     override fun onLyricKeepAlive(signal: LyricKeepAliveSignal) {
         guardCause = "keepalive playing=${signal.playbackActive} keepAlive=${signal.keepAlive} " +
             "grace=$graceActive"
-        if (!signal.playbackActive) {
+        if (!signal.playbackActive &&
+            !shouldHoldGraceAcrossPauseRetention(
+                graceActive = graceActive,
+                playbackActive = signal.playbackActive,
+                pauseRetentionEligible = signal.pauseRetentionEligible
+            )
+        ) {
             cancelGrace()
             keepAliveRequested = false
             graceEligible = false
-        } else if (signal.keepAlive) {
+        } else if (
+            signal.keepAlive &&
+            shouldAcceptKeepAliveHeartbeat(
+                projectionVisible = projectionVisible,
+                graceActive = graceActive
+            )
+        ) {
             keepAliveRequested = aodEnabled
             cancelGrace()
         } else if (!graceActive) {
@@ -127,22 +185,46 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
         dispatchWake(
             signal = signal.wakeSignal,
             allowed = aodEnabled,
-            forceRetry = shouldRetryDetachedAodWake(surfaceAttached, keepAliveRequested)
+            forceRetry = shouldRetryDetachedAodWake(
+                surfaceAttached = surfaceAttached,
+                keepAliveRequested = keepAliveRequested,
+                signal = signal.wakeSignal,
+                lastRetriedSignal = lastRetriedSignal
+            )
         )
     }
 
-    override fun onLyricProjectionDisconnected() = clear()
+    override fun onLyricProjectionDisconnected() = clear("projection-disconnected")
 
-    override fun onLyricProjectionStale() = clear()
+    /**
+     * 投影内容 stale:app 侧在播放中但有一段时间没推新快照/心跳。这里不能直接当会话结束
+     * 把 guard 关掉——否则前奏/间奏无歌词、或 Lyricon 息屏后位置源停更时,AOD 会被直接
+     * 关闭且后续 keepalive 无法恢复(因为 keepAliveRequested/aodEnabled 已被清零)。
+     *
+     * 正确行为:当已有 keepAlive 请求时保留 keepAliveRequested/aodEnabled 状态,只更新 cause
+     * 让日志可见;否则按正常会话结束清理。播放确实已结束时 app 侧会通过新的隐藏快照
+     * (playbackActive=false)或 disconnected 事件来关闭 guard;真暂停也有 grace 的有界定时器兜底。
+     */
+    override fun onLyricProjectionStale() {
+        if (shouldRetainAodPowerOnProjectionStale(keepAliveRequested)) {
+            guardCause = "projection-stale-retained"
+            updateLifetimeGuard()
+        } else {
+            clear("projection-stale")
+        }
+    }
 
-    private fun clear() {
+    private fun clear(cause: String) {
         cancelGrace()
         keepAliveRequested = false
         graceEligible = false
         aodEnabled = false
         aodDisplayOff = false
         hideRaceRecoveryPending = false
+        projectionVisible = false
         lastWakeSignal = Long.MIN_VALUE
+        lastRetriedSignal = Long.MIN_VALUE
+        guardCause = cause
         updateLifetimeGuard()
     }
 
@@ -166,8 +248,17 @@ internal object AodPowerCoordinator : SystemUiLyricSubscriber {
     private fun dispatchWake(signal: Long, allowed: Boolean, forceRetry: Boolean = false) {
         val newSignal = isNewAodWakeSignal(lastWakeSignal, signal)
         if (!allowed || (!newSignal && !forceRetry)) return
-        val accepted = AodWakeBroker.requestWake(signal)
-        if (newSignal && accepted) lastWakeSignal = signal
+        // Consume a content wake identity before calling the broker. A rejected request usually
+        // means Xiaomi has torn down the AOD host; leaving the identity unrecorded turns every
+        // heartbeat into another normal request and creates an attach/wake loop. The bounded
+        // detached retry below remains available once for that same identity.
+        if (newSignal) lastWakeSignal = signal
+        if (forceRetry) lastRetriedSignal = signal
+        val accepted = if (forceRetry) {
+            AodWakeBroker.requestEmergencyWake(signal)
+        } else {
+            AodWakeBroker.requestWake(signal)
+        }
         HookLogger.i(
             TAG,
             "AOD wake requested signal=$signal attached=$surfaceAttached " +
@@ -206,10 +297,49 @@ internal fun shouldStartAodPowerGrace(
     graceEligible: Boolean
 ): Boolean = aodEnabled && playbackActive && keepAliveRequested && graceEligible
 
+/**
+ * Song-boundary gap: the app-side pause confirmation window (1.5 s) can be shorter than the
+ * player's false→true gap at a track change (observed 0.96 s of false plus lyric load time), so
+ * the committed pause-retention edge (`playbackActive=false`, `pauseRetentionEligible=true`)
+ * lands while grace is still protecting the boundary. Grace must survive that edge: the new
+ * track's visible snapshot re-arms keepalive, and a genuine pause is bounded by the grace timer.
+ * Without this, a sub-second track change kills the guard and the AOD closes mid-playback.
+ */
+internal fun shouldHoldGraceAcrossPauseRetention(
+    graceActive: Boolean,
+    playbackActive: Boolean,
+    pauseRetentionEligible: Boolean
+): Boolean = graceActive && !playbackActive && pauseRetentionEligible
+
+/**
+ * Projection stale while we already have a live keepalive request should NOT be treated as a
+ * session end. Clearing `keepAliveRequested`/`aodEnabled` on stale would close the AOD during
+ * lyric-less intros/interludes or when the Lyricon position source stops updating after screen-off
+ * (issue #5), and subsequent keepalives could no longer resurrect the guard because aodEnabled had
+ * been zeroed.
+ *
+ * If there was no keepalive request in the first place, stale is an honest end-of-session and we
+ * fall back to [clear].
+ */
+internal fun shouldRetainAodPowerOnProjectionStale(keepAliveRequested: Boolean): Boolean =
+    keepAliveRequested
+
+/**
+ * A heartbeat cannot turn a hidden transport grace back into an unbounded active session.
+ * 心跳只能维持正在呈现的 AOD:靠心跳续期隐藏歌词的宽限窗口会把恢复余量拉成无限会话。
+ */
+internal fun shouldAcceptKeepAliveHeartbeat(
+    projectionVisible: Boolean,
+    graceActive: Boolean
+): Boolean = projectionVisible
+
 internal fun shouldRetryDetachedAodWake(
     surfaceAttached: Boolean,
-    keepAliveRequested: Boolean
-): Boolean = !surfaceAttached && keepAliveRequested
+    keepAliveRequested: Boolean,
+    signal: Long,
+    lastRetriedSignal: Long
+): Boolean = !surfaceAttached && keepAliveRequested &&
+    isNewAodWakeSignal(lastRetriedSignal, signal)
 
 /**
  * Bounded to the one unwinnable race: keepalive intent landing after Xiaomi's policy hide has
@@ -232,6 +362,22 @@ internal fun isAodDisplayOffState(state: Int): Boolean = state == 1
 
 /** Bounds recovery to Xiaomi's hide animation; the captured race lost the panel 1.79 s in. */
 internal const val HIDE_RACE_RECOVERY_WINDOW_MS = 2_500L
+
+/**
+ * 清锚的 OFF 稳定窗口(issue #62):实测 AOD 防烧屏脉冲的 OFF 段每 1~2s 出现一次、
+ * 单段最长约 1.8s;真会话结束(关屏/传感器暂停/休眠)的 OFF 会持续远超该窗口。
+ * 取 5s,对脉冲留有近 3 倍余量。
+ */
+internal const val AOD_OFF_ANCHOR_RESET_SETTLE_MS = 5_000L
+
+/**
+ * OFF 脉冲 vs 会话结束的判定(纯函数,issue #62):仅当 OFF 已连续持续 [settleMs]
+ * (中途没有任何非 OFF 边取消)才视为会话结束、允许清锚;更短的 OFF↔DOZE 交替是
+ * 防烧屏脉冲,必须忽略 —— 否则锚点被反复清空,下一次位置到达时以漂移后的请求值
+ * 重新播种,「防下移」退化为「钉住当前漂移位」。
+ */
+internal fun isAodOffSessionEnd(offHeldMs: Long, settleMs: Long): Boolean =
+    offHeldMs >= settleMs
 
 internal fun shouldActivateAodPowerLifetime(
     surfaceAttached: Boolean,

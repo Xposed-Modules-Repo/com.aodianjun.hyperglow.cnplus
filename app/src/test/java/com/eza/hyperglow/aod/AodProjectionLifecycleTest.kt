@@ -12,6 +12,11 @@ import org.junit.Test
 
 class AodProjectionLifecycleTest {
     @Test
+    fun pauseConfirmationCoversTrackChangeGap() {
+        assertEquals(5_000L, AodProjectionEngine.pauseConfirmWindowMs())
+    }
+
+    @Test
     fun terminalInvalidationRejectsInFlightVisiblePublication() {
         val guard = ProjectionPublicationGuard()
         val state = state()
@@ -77,10 +82,23 @@ class AodProjectionLifecycleTest {
     @Test
     fun keepAliveTimingRequiresTimedTypeAndPositiveRowDuration() {
         assertTrue(AodProjectionEngine.hasActualLyricTiming(document("Line", 100L, 200L)))
+        assertTrue(AodProjectionEngine.hasActualLyricTiming(document("Word", 100L, 200L)))
         assertTrue(AodProjectionEngine.hasActualLyricTiming(document("Syllable", 100L, 200L)))
         assertFalse(AodProjectionEngine.hasActualLyricTiming(document("Static", 100L, 200L)))
         assertFalse(AodProjectionEngine.hasActualLyricTiming(document("Line", 100L, 100L)))
         assertFalse(AodProjectionEngine.hasActualLyricTiming(document("Syllable", 0L, 0L)))
+        // 间奏行(INTERLUDE)带时间窗但不是唱词:只有间奏的文档不计「有计时」,
+        // 否则没有唱词源的歌会把 AOD keepalive 钉在间奏场景(上游 99ba119)。
+        assertFalse(
+            AodProjectionEngine.hasActualLyricTiming(
+                document("Line", 100L, 200L, role = "INTERLUDE")
+            )
+        )
+        assertTrue(
+            AodProjectionEngine.hasActualLyricTiming(
+                document("Line", 100L, 200L, role = "BACKGROUND")
+            )
+        )
     }
 
     @Test
@@ -120,7 +138,12 @@ class AodProjectionLifecycleTest {
         )
     }
 
-    private fun document(type: String, startMs: Long, endMs: Long) = SpicyBridgeDocument(
+    private fun document(
+        type: String,
+        startMs: Long,
+        endMs: Long,
+        role: String = "LEAD"
+    ) = SpicyBridgeDocument(
         producerId = "producer",
         generation = 7,
         trackUri = "spotify:track:test",
@@ -131,7 +154,7 @@ class AodProjectionLifecycleTest {
         processingVersion = 1,
         rows = listOf(
             SpicyBridgeRow(
-                role = "LEAD",
+                role = role,
                 startMs = startMs,
                 endMs = endMs,
                 fillEndMs = endMs,

@@ -16,9 +16,15 @@ internal object AodStateWireLimits {
     const val MAX_RUBY = 128
     const val MAX_LAYOUT_GROUPS = 256
     const val MAX_AGGREGATE_TEXT_UTF8_BYTES = 48 * 1024
-    const val MAX_ENCODED_BODY_BYTES = 64 * 1024
+    // 编码体上限 = 文本聚合预算 48KB + 歌曲图片 JPEG 预算 24KB + 结构开销余量。
+    // 不含封面时文本上限行为不变;含封面时两账分计,任一超限都拒收整包。
+    const val MAX_ENCODED_BODY_BYTES = 96 * 1024
     const val MAX_MEDIA_DURATION_MS = 24L * 60L * 60L * 1000L
     const val MAX_PLAYBACK_SPEED = 4f
+    const val MAX_ARTWORK_KEY_CHARS = 64
+
+    /** 歌曲图片 JPEG 上限:与 producer.MAX_ARTWORK_JPEG_BYTES 同源(取图侧编码上限)。 */
+    const val MAX_ARTWORK_BYTES = com.eza.hyperglow.producer.MAX_ARTWORK_JPEG_BYTES
 }
 
 internal object AodStateWireContract {
@@ -52,20 +58,83 @@ internal data class AodStateWireLayoutGroup(
     val confidence: Double
 )
 
+/**
+ * 歌曲图片 JPEG 帧字节的按内容比较包装:wire 快照依赖 data class 整对象相等做回环/
+ * 去重判定,裸 ByteArray 的 equals 只按引用比较会让「同帧不同实例」误判为不同;
+ * 包装后相等性与帧内容一致,与实例无关。
+ */
+internal class ArtworkJpeg(val bytes: ByteArray) {
+    val size: Int
+        get() = bytes.size
+
+    fun isEmpty(): Boolean = bytes.isEmpty()
+
+    override fun equals(other: Any?): Boolean =
+        other is ArtworkJpeg && other.bytes.contentEquals(bytes)
+
+    override fun hashCode(): Int = bytes.contentHashCode()
+
+    override fun toString(): String = "ArtworkJpeg(${bytes.size} bytes)"
+
+    companion object {
+        val EMPTY = ArtworkJpeg(ByteArray(0))
+    }
+}
+
+/**
+ * 对唱并发行(仅息屏消费);快照携带时其词级条数与主行共享 MAX_WORDS 上限
+ * (isValidSnapshot 求和校验),文本走同一聚合 UTF-8 预算。
+ */
+internal data class AodStateWireDuetLine(
+    val text: String,
+    val romanized: String = "",
+    val translated: String = "",
+    val alignedRight: Boolean = false,
+    /** 标记识别版分侧(v6 起);渲染面按本面「识别对唱标记」开关选用。 */
+    val alignedRightMarkers: Boolean = false,
+    val lineStartMs: Long,
+    val lineEndMs: Long,
+    val words: List<AodStateWireWord> = emptyList()
+)
+
 internal data class AodStateWireSnapshot(
     val trackGeneration: Long,
     val aodEnabled: Boolean,
     val lockscreenEnabled: Boolean,
-    val seamlessTransitionEnabled: Boolean,
     val positionFollowingEnabled: Boolean,
     val burnInPattern: String,
     val burnInIntervalMs: Long,
+    val suppressStockAodContent: Boolean,
+    val aodRotateWithDevice: Boolean,
+    val aodRotationMode: String,
+    val aodRotationSettleMs: Long,
+    val aodCanvasAnchorLandscape: Float,
+    val aodLandscapeTextScale: Float,
+    val aodLandscapeHideStock: Boolean,
+    val aodLandscapeFullscreen: Boolean,
+    val aodLandscapeFullscreenSafeMarginPercent: Float = DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT,
+    val aodDebugShowCanvasFrame: Boolean = false,
+    val aodCanvasPaddingPortraitXPercent: Float,
+    val aodCanvasPaddingPortraitYPercent: Float,
+    val aodCanvasPaddingLandscapeXPercent: Float,
+    val aodCanvasPaddingLandscapeYPercent: Float,
     val original: String,
     val romanized: String,
     val translated: String,
     val nextLine: String,
+    /** 下一行歌词的辅助文字(音标/翻译);「显示第二行辅助文字」消费。 */
+    val nextLineRomanized: String = "",
+    val nextLineTranslated: String = "",
     val metadata: String,
+    /** 原始歌名/歌手/专辑(v6 起):渲染面按本面「歌曲信息内容」重新组装,实现 per-surface 独立。 */
+    val title: String = "",
+    val artist: String = "",
+    val album: String = "",
+    /** 大元数据引导态(v6 起):渲染面用本面组装后的歌曲信息替换 [original] 的占位符。 */
+    val largeMetadata: Boolean = false,
     val alignedRight: Boolean,
+    /** 标记识别版分侧(v6 起);「识别对唱标记」开启的面取本值,否则取 [alignedRight]。 */
+    val alignedRightMarkers: Boolean = false,
     val lineLevelSync: Boolean,
     val lineStartMs: Long,
     val lineEndMs: Long,
@@ -90,7 +159,16 @@ internal data class AodStateWireSnapshot(
     val alignmentMode: String,
     val metadataVisible: Boolean,
     val metadataAnchor: String,
-    val adaptiveSectioning: Boolean
+    val adaptiveSectioning: Boolean,
+    /**
+     * 歌曲图片帧(有界 JPEG,空=无封面):仅经包名/曲目校对的「当前播放的音乐软件」
+     * 封面会走到这里(见 SongArtworkRepository),校对不过就是空——不显示,不显示错的图。
+     */
+    val artworkJpeg: ArtworkJpeg = ArtworkJpeg.EMPTY,
+    /** 封面稳定键(包名+曲目身份),渲染侧按帧缓存解码位图;空串=无封面。 */
+    val artworkKey: String = "",
+    /** 对唱并发行(仅息屏消费);null = 无并发行或「显示并发歌词(对唱)」已关。 */
+    val duetLine: AodStateWireDuetLine? = null
 )
 
 internal sealed interface AodStateWireMessage {
@@ -147,6 +225,24 @@ internal data class AodStateWireEnvelope(
     val pauseRetentionEligible: Boolean = false
 )
 
+/**
+ * Decode 把「值」与「拒绝它的闸门名」一并给出,一个实现同时回答两件事:拆成两套会复制
+ * 闸门顺序,而两处顺序一旦漂移比没有原因更糟。
+ */
+internal sealed interface AodStateWireDecodeOutcome {
+    val messageOrNull: AodStateWireMessage?
+    val rejectReason: String?
+
+    data class Decoded(val message: AodStateWireMessage) : AodStateWireDecodeOutcome {
+        override val messageOrNull: AodStateWireMessage get() = message
+        override val rejectReason: String? get() = null
+    }
+
+    data class Rejected(override val rejectReason: String) : AodStateWireDecodeOutcome {
+        override val messageOrNull: AodStateWireMessage? get() = null
+    }
+}
+
 internal object AodStateWireCodec {
     fun encode(message: AodStateWireMessage): AodStateWireEnvelope? {
         if (!validEnvelopeScalars(message.revision, message.userId, message.updatedAtElapsedMs)) {
@@ -195,48 +291,70 @@ internal object AodStateWireCodec {
         }
     }
 
-    fun decode(envelope: AodStateWireEnvelope): AodStateWireMessage? {
-        if (envelope.protocol != AodStateWireContract.PROTOCOL_VERSION) return null
+    fun decode(envelope: AodStateWireEnvelope): AodStateWireMessage? =
+        decodeOutcome(envelope).messageOrNull
+
+    /**
+     * 具名被拒闸门。裸 null 让「app 与 hook 版本错位」和「载荷损坏」无法区分:前者常见于
+     * 应用升级后 hook 进程尚未重启,会自愈,根本不需要诊断;后者才需要。
+     */
+    fun decodeRejectReason(envelope: AodStateWireEnvelope): String? =
+        decodeOutcome(envelope).rejectReason
+
+    private fun decodeOutcome(envelope: AodStateWireEnvelope): AodStateWireDecodeOutcome {
+        if (envelope.protocol != AodStateWireContract.PROTOCOL_VERSION) {
+            return AodStateWireDecodeOutcome.Rejected("protocol_mismatch")
+        }
         if (!validEnvelopeScalars(
                 envelope.revision,
                 envelope.userId,
                 envelope.updatedAtElapsedMs
             )
-        ) return null
+        ) {
+            return AodStateWireDecodeOutcome.Rejected("invalid_scalars")
+        }
         return when (envelope.kind) {
             AodStateWireContract.KIND_SNAPSHOT -> {
-                val body = envelope.body ?: return null
-                val snapshot = decodeSnapshotBody(body) ?: return null
-                AodStateWireMessage.Snapshot(
+                val body = envelope.body
+                    ?: return AodStateWireDecodeOutcome.Rejected("missing_body")
+                val snapshot = decodeSnapshotBody(body)
+                    ?: return AodStateWireDecodeOutcome.Rejected("undecodable_body")
+                AodStateWireDecodeOutcome.Decoded(
+                    AodStateWireMessage.Snapshot(
+                        revision = envelope.revision,
+                        userId = envelope.userId,
+                        updatedAtElapsedMs = envelope.updatedAtElapsedMs,
+                        keepAlive = envelope.keepAlive,
+                        wakeSignal = envelope.wakeSignal,
+                        playbackActive = envelope.playbackActive,
+                        pauseRetentionEligible = envelope.pauseRetentionEligible,
+                        value = snapshot
+                    )
+                )
+            }
+            AodStateWireContract.KIND_HIDDEN -> AodStateWireDecodeOutcome.Decoded(
+                AodStateWireMessage.Hidden(
                     revision = envelope.revision,
                     userId = envelope.userId,
                     updatedAtElapsedMs = envelope.updatedAtElapsedMs,
                     keepAlive = envelope.keepAlive,
                     wakeSignal = envelope.wakeSignal,
                     playbackActive = envelope.playbackActive,
-                    pauseRetentionEligible = envelope.pauseRetentionEligible,
-                    value = snapshot
+                    pauseRetentionEligible = envelope.pauseRetentionEligible
                 )
-            }
-            AodStateWireContract.KIND_HIDDEN -> AodStateWireMessage.Hidden(
-                revision = envelope.revision,
-                userId = envelope.userId,
-                updatedAtElapsedMs = envelope.updatedAtElapsedMs,
-                keepAlive = envelope.keepAlive,
-                wakeSignal = envelope.wakeSignal,
-                playbackActive = envelope.playbackActive,
-                pauseRetentionEligible = envelope.pauseRetentionEligible
             )
-            AodStateWireContract.KIND_KEEPALIVE -> AodStateWireMessage.KeepAlive(
-                revision = envelope.revision,
-                userId = envelope.userId,
-                updatedAtElapsedMs = envelope.updatedAtElapsedMs,
-                keepAlive = envelope.keepAlive,
-                wakeSignal = envelope.wakeSignal,
-                playbackActive = envelope.playbackActive,
-                pauseRetentionEligible = envelope.pauseRetentionEligible
+            AodStateWireContract.KIND_KEEPALIVE -> AodStateWireDecodeOutcome.Decoded(
+                AodStateWireMessage.KeepAlive(
+                    revision = envelope.revision,
+                    userId = envelope.userId,
+                    updatedAtElapsedMs = envelope.updatedAtElapsedMs,
+                    keepAlive = envelope.keepAlive,
+                    wakeSignal = envelope.wakeSignal,
+                    playbackActive = envelope.playbackActive,
+                    pauseRetentionEligible = envelope.pauseRetentionEligible
+                )
             )
-            else -> null
+            else -> AodStateWireDecodeOutcome.Rejected("unknown_kind")
         }
     }
 
@@ -253,16 +371,37 @@ internal object AodStateWireCodec {
                 output.writeLong(snapshot.trackGeneration)
                 output.writeStrictBoolean(snapshot.aodEnabled)
                 output.writeStrictBoolean(snapshot.lockscreenEnabled)
-                output.writeStrictBoolean(snapshot.seamlessTransitionEnabled)
                 output.writeStrictBoolean(snapshot.positionFollowingEnabled)
                 output.writeBoundedString(snapshot.burnInPattern)
                 output.writeLong(snapshot.burnInIntervalMs)
+                output.writeStrictBoolean(snapshot.suppressStockAodContent)
+                output.writeStrictBoolean(snapshot.aodRotateWithDevice)
+                output.writeBoundedString(snapshot.aodRotationMode)
+                output.writeLong(snapshot.aodRotationSettleMs)
+                output.writeFloat(snapshot.aodCanvasAnchorLandscape)
+                output.writeFloat(snapshot.aodLandscapeTextScale)
+                output.writeStrictBoolean(snapshot.aodLandscapeHideStock)
+                output.writeStrictBoolean(snapshot.aodLandscapeFullscreen)
+                output.writeFloat(snapshot.aodLandscapeFullscreenSafeMarginPercent)
+                output.writeStrictBoolean(snapshot.aodDebugShowCanvasFrame)
+                output.writeFloat(snapshot.aodCanvasPaddingPortraitXPercent)
+                output.writeFloat(snapshot.aodCanvasPaddingPortraitYPercent)
+                output.writeFloat(snapshot.aodCanvasPaddingLandscapeXPercent)
+                output.writeFloat(snapshot.aodCanvasPaddingLandscapeYPercent)
                 output.writeBoundedString(snapshot.original)
                 output.writeBoundedString(snapshot.romanized)
                 output.writeBoundedString(snapshot.translated)
                 output.writeBoundedString(snapshot.nextLine)
+                output.writeBoundedString(snapshot.nextLineRomanized)
+                output.writeBoundedString(snapshot.nextLineTranslated)
                 output.writeBoundedString(snapshot.metadata)
+                // v7:原始歌名/歌手/专辑 + 大元数据引导态 + 标记识别版分侧(per-surface 内容链路)。
+                output.writeBoundedString(snapshot.title)
+                output.writeBoundedString(snapshot.artist)
+                output.writeBoundedString(snapshot.album)
+                output.writeStrictBoolean(snapshot.largeMetadata)
                 output.writeStrictBoolean(snapshot.alignedRight)
+                output.writeStrictBoolean(snapshot.alignedRightMarkers)
                 output.writeStrictBoolean(snapshot.lineLevelSync)
                 output.writeLong(snapshot.lineStartMs)
                 output.writeLong(snapshot.lineEndMs)
@@ -306,6 +445,31 @@ internal object AodStateWireCodec {
                     output.writeStrictBoolean(group.keepTogether)
                     output.writeDouble(group.confidence)
                 }
+                output.writeInt(snapshot.artworkJpeg.size)
+                output.write(snapshot.artworkJpeg.bytes)
+                output.writeBoundedString(snapshot.artworkKey)
+                // v4:对唱并发行(存在位 + 载荷);文本走聚合文本预算(isValidSnapshot 校验)。
+                val duet = snapshot.duetLine
+                output.writeStrictBoolean(duet != null)
+                duet?.let { line ->
+                    output.writeInt(line.words.size)
+                    output.writeBoundedString(line.text)
+                    output.writeBoundedString(line.romanized)
+                    output.writeBoundedString(line.translated)
+                    output.writeStrictBoolean(line.alignedRight)
+                    output.writeStrictBoolean(line.alignedRightMarkers)
+                    output.writeLong(line.lineStartMs)
+                    output.writeLong(line.lineEndMs)
+                    line.words.forEach { word ->
+                        output.writeBoundedString(word.text)
+                        output.writeBoundedString(word.romanized)
+                        output.writeLong(word.startMs)
+                        output.writeLong(word.endMs)
+                        output.writeStrictBoolean(word.boundaryAfter)
+                        output.writeInt(word.sourceStart)
+                        output.writeInt(word.sourceEnd)
+                    }
+                }
             }
             bytes.toByteArray().takeIf {
                 it.isNotEmpty() && it.size <= AodStateWireLimits.MAX_ENCODED_BODY_BYTES
@@ -327,7 +491,6 @@ internal object AodStateWireCodec {
             val trackGeneration = input.readLong()
             val aodEnabled = input.readStrictBoolean() ?: return null
             val lockscreenEnabled = input.readStrictBoolean() ?: return null
-            val seamlessTransitionEnabled = input.readStrictBoolean() ?: return null
             val positionFollowingEnabled = input.readStrictBoolean() ?: return null
             val burnInPattern = input.readBoundedString(
                 AodStateWireLimits.MAX_STYLE_CHARS,
@@ -335,6 +498,20 @@ internal object AodStateWireCodec {
                 budget = budget
             ) ?: return null
             val burnInIntervalMs = input.readLong()
+            val suppressStockAodContent = input.readStrictBoolean() ?: return null
+            val aodRotateWithDevice = input.readStrictBoolean() ?: return null
+            val aodRotationMode = input.readStyleString(budget) ?: return null
+            val aodRotationSettleMs = input.readLong()
+            val aodCanvasAnchorLandscape = input.readFloat()
+            val aodLandscapeTextScale = input.readFloat()
+            val aodLandscapeHideStock = input.readStrictBoolean() ?: return null
+            val aodLandscapeFullscreen = input.readStrictBoolean() ?: return null
+            val aodLandscapeFullscreenSafeMarginPercent = input.readFloat()
+            val aodDebugShowCanvasFrame = input.readStrictBoolean() ?: return null
+            val aodCanvasPaddingPortraitXPercent = input.readFloat()
+            val aodCanvasPaddingPortraitYPercent = input.readFloat()
+            val aodCanvasPaddingLandscapeXPercent = input.readFloat()
+            val aodCanvasPaddingLandscapeYPercent = input.readFloat()
             val original = input.readBoundedString(
                 AodStateWireLimits.MAX_LYRIC_CHARS,
                 allowEmpty = false,
@@ -355,12 +532,39 @@ internal object AodStateWireCodec {
                 allowEmpty = true,
                 budget = budget
             ) ?: return null
+            val nextLineRomanized = input.readBoundedString(
+                AodStateWireLimits.MAX_LYRIC_CHARS,
+                allowEmpty = true,
+                budget = budget
+            ) ?: return null
+            val nextLineTranslated = input.readBoundedString(
+                AodStateWireLimits.MAX_LYRIC_CHARS,
+                allowEmpty = true,
+                budget = budget
+            ) ?: return null
             val metadata = input.readBoundedString(
                 AodStateWireLimits.MAX_METADATA_CHARS,
                 allowEmpty = true,
                 budget = budget
             ) ?: return null
+            val title = input.readBoundedString(
+                AodStateWireLimits.MAX_METADATA_CHARS,
+                allowEmpty = true,
+                budget = budget
+            ) ?: return null
+            val artist = input.readBoundedString(
+                AodStateWireLimits.MAX_METADATA_CHARS,
+                allowEmpty = true,
+                budget = budget
+            ) ?: return null
+            val album = input.readBoundedString(
+                AodStateWireLimits.MAX_METADATA_CHARS,
+                allowEmpty = true,
+                budget = budget
+            ) ?: return null
+            val largeMetadata = input.readStrictBoolean() ?: return null
             val alignedRight = input.readStrictBoolean() ?: return null
+            val alignedRightMarkers = input.readStrictBoolean() ?: return null
             val lineLevelSync = input.readStrictBoolean() ?: return null
             val lineStartMs = input.readLong()
             val lineEndMs = input.readLong()
@@ -431,21 +635,58 @@ internal object AodStateWireCodec {
                     confidence = input.readDouble()
                 )
             }
+            val artworkSize = input.readInt()
+            if (artworkSize < 0 ||
+                artworkSize > AodStateWireLimits.MAX_ARTWORK_BYTES ||
+                artworkSize > input.available()
+            ) return null
+            val artworkBytes = ByteArray(artworkSize)
+            input.readFully(artworkBytes)
+            val artworkJpeg = ArtworkJpeg(artworkBytes)
+            // 封面键走独立预算:不占文本聚合预算(编码侧 fitAodEnhancementBudget 不为它
+            // 留头寸),仅按字符上限+UTF-8 预算自检,两端口径一致。
+            val artworkKey = input.readBoundedString(
+                AodStateWireLimits.MAX_ARTWORK_KEY_CHARS,
+                allowEmpty = true,
+                budget = Utf8Budget()
+            ) ?: return null
+            val hasDuet = input.readStrictBoolean() ?: return null
+            val duetLine = if (hasDuet) decodeDuetLine(input, budget) ?: return null else null
             if (input.available() != 0) return null
             AodStateWireSnapshot(
                 trackGeneration = trackGeneration,
                 aodEnabled = aodEnabled,
                 lockscreenEnabled = lockscreenEnabled,
-                seamlessTransitionEnabled = seamlessTransitionEnabled,
                 positionFollowingEnabled = positionFollowingEnabled,
                 burnInPattern = burnInPattern,
                 burnInIntervalMs = burnInIntervalMs,
+                suppressStockAodContent = suppressStockAodContent,
+                aodRotateWithDevice = aodRotateWithDevice,
+                aodRotationMode = aodRotationMode,
+                aodRotationSettleMs = aodRotationSettleMs,
+                aodCanvasAnchorLandscape = aodCanvasAnchorLandscape,
+                aodLandscapeTextScale = aodLandscapeTextScale,
+                aodLandscapeHideStock = aodLandscapeHideStock,
+                aodLandscapeFullscreen = aodLandscapeFullscreen,
+                aodLandscapeFullscreenSafeMarginPercent = aodLandscapeFullscreenSafeMarginPercent,
+                aodDebugShowCanvasFrame = aodDebugShowCanvasFrame,
+                aodCanvasPaddingPortraitXPercent = aodCanvasPaddingPortraitXPercent,
+                aodCanvasPaddingPortraitYPercent = aodCanvasPaddingPortraitYPercent,
+                aodCanvasPaddingLandscapeXPercent = aodCanvasPaddingLandscapeXPercent,
+                aodCanvasPaddingLandscapeYPercent = aodCanvasPaddingLandscapeYPercent,
                 original = original,
                 romanized = romanized,
                 translated = translated,
                 nextLine = nextLine,
+                nextLineRomanized = nextLineRomanized,
+                nextLineTranslated = nextLineTranslated,
                 metadata = metadata,
+                title = title,
+                artist = artist,
+                album = album,
+                largeMetadata = largeMetadata,
                 alignedRight = alignedRight,
+                alignedRightMarkers = alignedRightMarkers,
                 lineLevelSync = lineLevelSync,
                 lineStartMs = lineStartMs,
                 lineEndMs = lineEndMs,
@@ -470,8 +711,62 @@ internal object AodStateWireCodec {
                 alignmentMode = alignmentMode,
                 metadataVisible = metadataVisible,
                 metadataAnchor = metadataAnchor,
-                adaptiveSectioning = adaptiveSectioning
+                adaptiveSectioning = adaptiveSectioning,
+                artworkJpeg = artworkJpeg,
+                artworkKey = artworkKey,
+                duetLine = duetLine
             ).takeIf(::isValidSnapshot)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 对唱并发行解码(v4 起):文本/副文本走聚合文本预算,词级条数与主行共享上限。 */
+    private fun decodeDuetLine(
+        input: DataInputStream,
+        budget: Utf8Budget
+    ): AodStateWireDuetLine? {
+        return try {
+            val wordCount = input.readBoundedCount(AodStateWireLimits.MAX_WORDS) ?: return null
+            val text = input.readBoundedString(
+                AodStateWireLimits.MAX_LYRIC_CHARS, allowEmpty = false, budget = budget
+            ) ?: return null
+            val romanized = input.readBoundedString(
+                AodStateWireLimits.MAX_LYRIC_CHARS, allowEmpty = true, budget = budget
+            ) ?: return null
+            val translated = input.readBoundedString(
+                AodStateWireLimits.MAX_LYRIC_CHARS, allowEmpty = true, budget = budget
+            ) ?: return null
+            val alignedRight = input.readStrictBoolean() ?: return null
+            val alignedRightMarkers = input.readStrictBoolean() ?: return null
+            val lineStartMs = input.readLong()
+            val lineEndMs = input.readLong()
+            val words = ArrayList<AodStateWireWord>(wordCount)
+            repeat(wordCount) {
+                words += AodStateWireWord(
+                    text = input.readBoundedString(
+                        AodStateWireLimits.MAX_LYRIC_CHARS, allowEmpty = true, budget = budget
+                    ) ?: return null,
+                    romanized = input.readBoundedString(
+                        AodStateWireLimits.MAX_LYRIC_CHARS, allowEmpty = true, budget = budget
+                    ) ?: return null,
+                    startMs = input.readLong(),
+                    endMs = input.readLong(),
+                    boundaryAfter = input.readStrictBoolean() ?: return null,
+                    sourceStart = input.readInt(),
+                    sourceEnd = input.readInt()
+                )
+            }
+            AodStateWireDuetLine(
+                text = text,
+                romanized = romanized,
+                translated = translated,
+                alignedRight = alignedRight,
+                alignedRightMarkers = alignedRightMarkers,
+                lineStartMs = lineStartMs,
+                lineEndMs = lineEndMs,
+                words = words.toList()
+            )
         } catch (_: Exception) {
             null
         }
@@ -493,11 +788,36 @@ internal object AodStateWireCodec {
         ) return false
         if (snapshot.burnInPattern != normalizeAodBurnInPattern(snapshot.burnInPattern) ||
             snapshot.burnInIntervalMs != normalizeAodBurnInInterval(snapshot.burnInIntervalMs) ||
+            snapshot.aodRotationMode != normalizeAodRotationMode(snapshot.aodRotationMode) ||
+            snapshot.aodRotationSettleMs != normalizeAodRotationSettleMs(snapshot.aodRotationSettleMs) ||
+            snapshot.aodCanvasAnchorLandscape != normalizeAodCanvasAnchor(snapshot.aodCanvasAnchorLandscape) ||
+            snapshot.aodLandscapeTextScale != normalizeAodLandscapeTextScale(snapshot.aodLandscapeTextScale) ||
+            snapshot.aodLandscapeFullscreenSafeMarginPercent !=
+                normalizeAodFullscreenSafeMarginPercent(
+                    snapshot.aodLandscapeFullscreenSafeMarginPercent
+                ) ||
+            snapshot.aodCanvasPaddingPortraitXPercent != normalizeAodCanvasPaddingPercent(
+                snapshot.aodCanvasPaddingPortraitXPercent
+            ) ||
+            snapshot.aodCanvasPaddingPortraitYPercent != normalizeAodCanvasPaddingPercent(
+                snapshot.aodCanvasPaddingPortraitYPercent
+            ) ||
+            snapshot.aodCanvasPaddingLandscapeXPercent != normalizeAodCanvasPaddingPercent(
+                snapshot.aodCanvasPaddingLandscapeXPercent
+            ) ||
+            snapshot.aodCanvasPaddingLandscapeYPercent != normalizeAodCanvasPaddingPercent(
+                snapshot.aodCanvasPaddingLandscapeYPercent
+            ) ||
             snapshot.original != snapshot.original.trim() ||
             snapshot.romanized != snapshot.romanized.trim() ||
             snapshot.translated != snapshot.translated.trim() ||
             snapshot.nextLine != snapshot.nextLine.trim() ||
+            snapshot.nextLineRomanized != snapshot.nextLineRomanized.trim() ||
+            snapshot.nextLineTranslated != snapshot.nextLineTranslated.trim() ||
             snapshot.metadata != snapshot.metadata.trim() ||
+            snapshot.title != snapshot.title.trim() ||
+            snapshot.artist != snapshot.artist.trim() ||
+            snapshot.album != snapshot.album.trim() ||
             snapshot.weight != normalizeAodWeight(snapshot.weight) ||
             snapshot.textSizeMode != normalizeAodTextSize(snapshot.textSizeMode) ||
             snapshot.secondaryMode != normalizeAodSecondary(snapshot.secondaryMode) ||
@@ -516,7 +836,12 @@ internal object AodStateWireCodec {
             !budget.accept(snapshot.romanized, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
             !budget.accept(snapshot.translated, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
             !budget.accept(snapshot.nextLine, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
-            !budget.accept(snapshot.metadata, AodStateWireLimits.MAX_METADATA_CHARS, true)
+            !budget.accept(snapshot.nextLineRomanized, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+            !budget.accept(snapshot.nextLineTranslated, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+            !budget.accept(snapshot.metadata, AodStateWireLimits.MAX_METADATA_CHARS, true) ||
+            !budget.accept(snapshot.title, AodStateWireLimits.MAX_METADATA_CHARS, true) ||
+            !budget.accept(snapshot.artist, AodStateWireLimits.MAX_METADATA_CHARS, true) ||
+            !budget.accept(snapshot.album, AodStateWireLimits.MAX_METADATA_CHARS, true)
         ) return false
         val styles = listOf(
             snapshot.burnInPattern,
@@ -553,6 +878,36 @@ internal object AodStateWireCodec {
                 group.end > snapshot.original.length || !group.confidence.isFinite() ||
                 group.confidence !in 0.0..1.0
             ) return false
+        }
+        // 歌曲图片:有界 JPEG + 规范键;图与键必须同有同无(半截帧拒收)。键走独立预算
+        // (与 decode 侧一致,不占文本聚合预算)。
+        if (snapshot.artworkJpeg.size > AodStateWireLimits.MAX_ARTWORK_BYTES ||
+            (snapshot.artworkJpeg.isEmpty() != snapshot.artworkKey.isEmpty()) ||
+            snapshot.artworkKey != snapshot.artworkKey.trim() ||
+            snapshot.artworkKey.length > AodStateWireLimits.MAX_ARTWORK_KEY_CHARS ||
+            !Utf8Budget().accept(snapshot.artworkKey, AodStateWireLimits.MAX_ARTWORK_KEY_CHARS, true)
+        ) return false
+        // 对唱并发行:词级条数与主行共享上限;文本/副文本入同一聚合 UTF-8 预算;
+        // 时间窗/词级时间不得越歌长(与主行同口径,超限整包拒收)。
+        snapshot.duetLine?.let { duet ->
+            if (snapshot.words.size + duet.words.size > AodStateWireLimits.MAX_WORDS) return false
+            if (duet.text.isBlank() || duet.text != duet.text.trim() ||
+                duet.romanized != duet.romanized.trim() ||
+                duet.translated != duet.translated.trim() ||
+                duet.lineStartMs < 0L || duet.lineEndMs < duet.lineStartMs ||
+                duet.lineEndMs > snapshot.durationMs
+            ) return false
+            if (!budget.accept(duet.text, AodStateWireLimits.MAX_LYRIC_CHARS, false) ||
+                !budget.accept(duet.romanized, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+                !budget.accept(duet.translated, AodStateWireLimits.MAX_LYRIC_CHARS, true)
+            ) return false
+            for (word in duet.words) {
+                if (!budget.accept(word.text, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+                    !budget.accept(word.romanized, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+                    word.startMs < 0L || word.endMs < word.startMs ||
+                    word.endMs > snapshot.durationMs
+                ) return false
+            }
         }
         return true
     }
@@ -628,7 +983,13 @@ internal object AodStateWireCodec {
     }
 
     private const val BODY_MAGIC = 0x414F4453
-    private const val BODY_VERSION = 1
+
+    /** v7:metadata 区追加原始 title/artist/album + largeMetadata + 标记识别版分侧(主行与并发行),
+     *  让渲染面按本面「歌曲信息内容」/「识别对唱标记」独立组装与选侧(per-surface);
+     *  v6:样式区追加 aodLandscapeFullscreenSafeMarginPercent(横屏全屏化安全边界);
+     *  v5:行文本区追加 nextLineRomanized/nextLineTranslated(下一行辅助文字);
+     *  v4:对照尾部追加对唱并发行(duetLine,存在性+载荷);v3 追加歌曲图片帧。 */
+    private const val BODY_VERSION = 7
     private const val MAX_UTF8_BYTES_PER_UTF16_CHAR = 4
 }
 
@@ -642,8 +1003,16 @@ internal fun normalizeAodLineSyncFill(value: String): String = when (value) {
     else -> "Top to bottom"
 }
 
+/**
+ * 换行动画词表归一化:画布六种模式原样放行;旧词表小写形态(场景过渡 preset id 曾
+ * 混入本通道)映射到等价模式 —— 特别是 `"none"` 必须落到 `"None"`(关闭动画),
+ * 不能再被兜底成 `"Fade up"`。未知值兜底 `"Fade up"`(fail-safe,与历史行为一致)。
+ */
 internal fun normalizeAodTransition(value: String): String = when (value) {
-    "Fade up", "None" -> value
+    "Fade up", "Crossfade", "Slide up", "Slide left", "Zoom", "None" -> value
+    "continuity" -> "Fade up"
+    "crossfade" -> "Crossfade"
+    "none" -> "None"
     else -> "Fade up"
 }
 
@@ -669,6 +1038,49 @@ private fun String.isWellFormedUtf16(): Boolean {
     return true
 }
 
+/**
+ * 孤立代理项替换为 U+FFFD（等长），成对代理项原样保留。
+ * [isWellFormedUtf16] 拒收任一孤立代理项，而歌词文本来自播放器/插件/JSON 解析，
+ * 无法保证良构——一个非法码点就足以让整个快照被拒收、降级为 Hidden。
+ */
+internal fun String.sanitizeUtf16(): String {
+    if (isWellFormedUtf16()) return this
+    val out = StringBuilder(length)
+    var index = 0
+    while (index < length) {
+        val current = this[index]
+        val next = if (index + 1 < length) this[index + 1] else ' '
+        when {
+            current.isHighSurrogate() && next.isLowSurrogate() -> {
+                out.append(current).append(next)
+                index += 2
+            }
+            current.isHighSurrogate() || current.isLowSurrogate() -> {
+                out.append(REPLACEMENT_CHARACTER)
+                index++
+            }
+            else -> {
+                out.append(current)
+                index++
+            }
+        }
+    }
+    return out.toString()
+}
+
+/**
+ * 文本字段的 wire 规整：孤立代理项替换 → 去首尾空白 → 按 [maxChars] 截断（不切开代理对）
+ * → 截断后二次去尾空白。最后一步不可省——[isValidSnapshot] 要求各文本字段 `== trim()`，
+ * 截断落点正好停在空白上会破坏该不变量并让快照被拒收。
+ */
+internal fun String.normalizeAodWireText(maxChars: Int): String =
+    sanitizeUtf16().trim().takeUtf16Prefix(maxChars).trim()
+
+/** UTF-8 字节计数，与 [AodStateWireCodec] 校验侧的聚合预算同口径。 */
+internal fun aodUtf8Bytes(value: String): Int = value.toByteArray(Charsets.UTF_8).size
+
+private const val REPLACEMENT_CHARACTER = '\uFFFD'
+
 internal object AodStateWireBundleCodec {
     fun toBundle(envelope: AodStateWireEnvelope): Bundle = Bundle().apply {
         putInt(KEY_PROTOCOL, envelope.protocol)
@@ -683,7 +1095,14 @@ internal object AodStateWireBundleCodec {
         envelope.body?.let { putByteArray(KEY_BODY, it) }
     }
 
-    fun snapshotFromBundle(bundle: Bundle): AodStateWireMessage? {
+    fun snapshotFromBundle(bundle: Bundle): AodStateWireMessage? =
+        AodStateWireCodec.decode(envelopeFromBundle(bundle))
+
+    /**
+     * 抽出信封与解码分离,使被拒时能报出闸门名。Bundle 仍在这里解成自有标量/字节
+     * (Binder 还持有它的时候)。
+     */
+    fun envelopeFromBundle(bundle: Bundle): AodStateWireEnvelope {
         val kind = bundle.getInt(KEY_KIND, 0)
         val envelope = AodStateWireEnvelope(
             protocol = bundle.getInt(KEY_PROTOCOL, 0),
@@ -701,7 +1120,7 @@ internal object AodStateWireBundleCodec {
             playbackActive = bundle.getBoolean(KEY_PLAYBACK_ACTIVE, false),
             pauseRetentionEligible = bundle.getBoolean(KEY_PAUSE_RETENTION_ELIGIBLE, false)
         )
-        return AodStateWireCodec.decode(envelope)
+        return envelope
     }
 
     private const val KEY_PROTOCOL = "stateProtocol"

@@ -1,12 +1,22 @@
 package com.eza.hyperglow.aod
 
 import com.eza.hyperglow.customization.CompiledCustomization
+import com.eza.hyperglow.customization.METADATA_PARTS_DEFAULT
+import com.eza.hyperglow.customization.METADATA_SEPARATORS_DEFAULT
 import com.eza.hyperglow.customization.SceneCompiler
+import com.eza.hyperglow.customization.composeSongMetadata
+import com.eza.hyperglow.customization.resolveLineTransition
 import com.eza.hyperglow.producer.LyricKind
 import com.eza.hyperglow.producer.LyricProducerState
 import com.eza.hyperglow.producer.LyricLayoutGroup
 import com.eza.hyperglow.producer.LyricRuby
 import com.eza.hyperglow.producer.LyricWord
+
+/**
+ * 播放中无歌词 / 纯音乐 / 间奏时的占位符。用 🎶 明确表示「音乐正在播放」，
+ * 与暂停时冻结的最后快照（或不可见态）区分开，避免播放中看起来像暂停。
+ */
+internal const val PLAYING_PLACEHOLDER = "🎶"
 
 /**
  * 纯函数映射层：把 [LyricProducerState]（生产者边界）映射成 [AodDisplayState]（SystemUI 投递载荷）。
@@ -42,7 +52,9 @@ internal fun projectToDisplay(
     compiled: CompiledCustomization?,
     metadataIntroPolicy: SongMetadataIntroPolicy,
     powerSessionPolicy: AodPowerSessionPolicy,
-    userId: Int
+    userId: Int,
+    artworkJpeg: ByteArray = ByteArray(0),
+    artworkKey: String = ""
 ): AodDisplayState {
     val position = projectedPosition(state, now)
 
@@ -65,15 +77,24 @@ internal fun projectToDisplay(
     val hasTimedLyrics = state.hasTimedLyrics
     // 原 fallbackLine 条件：!unsynced && !noLyrics && document == null && status == "ready" && it.isNotBlank()
     // document==null 对应 producer 无行级数据（lyricKind==NONE 但 line 非空 → 生产者塞了无时序一行）。
+    // 行首标记(对唱（男）/（女）/（合）与段落（副歌）/（间奏）等)识别:显示侧隐去与否改由
+    // 各渲染面自己的「识别对唱标记」开关决定(见 root/aod/LyricCanvasMapper)。此处只下发原始
+    // 文本,不再按文档级开关预先剥离——快照为息屏/锁屏共用,剥离必须推迟到按面渲染时才做。
     val fallbackLine = state.line.takeIf {
         !extrapolationInvalid && !unsynced && !noLyrics && kind == LyricKind.NONE && state.status == "ready" && it.isNotBlank()
     }
     val presentable = hasActiveLine || fallbackLine != null
 
-    // --- 元数据 ---
-    val metadata = listOf(state.title, state.artist)
-        .filter { it.isNotBlank() }
-        .joinToString(" · ")
+    // --- 元数据（原始歌名/歌手/专辑随状态下发，由各渲染面按自己的「歌曲信息内容」组装）---
+    // 保持一份文档级默认组装值作为兜底(旧消费方/降级),真正的按面组装在渲染侧完成。
+    val metadata = composeSongMetadata(
+        title = state.title,
+        artist = state.artist,
+        album = state.album,
+        parts = compiled?.metadataParts ?: METADATA_PARTS_DEFAULT,
+        separators = compiled?.metadataSeparators ?: METADATA_SEPARATORS_DEFAULT,
+        hideAlbumWhenSameAsTitle = compiled?.hideAlbumWhenSameAsTitle ?: false
+    )
 
     // --- 引导大元数据状态（原 project() 的 lyricState 四分支）---
     val lyricState = when {
@@ -95,30 +116,82 @@ internal fun projectToDisplay(
     )
 
     // --- 原文/罗马音/翻译（原 project() 的 original/romanized/translated 分支）---
+    // 文本一律下发原始形态(含行首标记);隐去标记与否由渲染面按自己的开关决定。
     val presentedLineText = state.line.takeIf { hasActiveLine && !showLargeMetadata }
+    // 中文歌被错误标注日语假名注音(网易云常见:中文歌词配日语 furigana/罗马音),AOD 上
+    // 显示出来既难看又误导。语言为 zh 且 ruby 注音含假名时,拒绝整行的 ruby/罗马音
+    // (上游 8422d78)。
+    val rejectJapaneseReading = hasActiveLine && hasLanguageInconsistentKanaRuby(
+        state.language,
+        state.ruby.map { it.reading }
+    )
+    // 空档预览:无活动行(前奏/间奏/行间空档)且确有下一行文本时,主行提前显示下一行,
+    // 替代 🎶 占位符(owner 2026-10-06 定案)。外推不可信(数据源停写、外推越界/过长)时
+    // 保持占位符——预览行同样来自过期快照,不能让空档把「清空旧行」的外推防护绕过去。
+    val previewNextLine = !hasActiveLine && !extrapolationInvalid &&
+        hasTimedLyrics && state.status != "loading" && state.nextLine.trim().isNotEmpty()
+    // 大元数据引导时,占位符交给渲染面用本面「歌曲信息内容」组装后的文本替换(见 largeMetadata)。
     val original = when {
-        showLargeMetadata -> metadata
-        unsynced || noLyrics -> "♪"
+        unsynced || noLyrics -> PLAYING_PLACEHOLDER
         presentedLineText != null -> presentedLineText
-        hasTimedLyrics || state.status == "loading" -> "♪"
+        previewNextLine -> state.nextLine
+        hasTimedLyrics || state.status == "loading" -> PLAYING_PLACEHOLDER
         fallbackLine != null -> fallbackLine
-        else -> "♪"
+        else -> PLAYING_PLACEHOLDER
     }
-    val romanized = if (showLargeMetadata || unsynced || noLyrics) "" else state.romanizedLine
-    val translated = if (showLargeMetadata || unsynced || noLyrics) "" else state.translatedLine
-    val nextLine = if (showLargeMetadata || unsynced || noLyrics) "" else state.nextLine
+    // 空档预览:主行现在是下一行,辅助文字跟着换到下一行的那份(沿用原门控)。
+    val romanized = when {
+        showLargeMetadata || unsynced || noLyrics || rejectJapaneseReading -> ""
+        previewNextLine -> state.nextLineRomanized
+        else -> state.romanizedLine
+    }
+    val translated = when {
+        showLargeMetadata || unsynced || noLyrics -> ""
+        previewNextLine -> state.nextLineTranslated
+        else -> state.translatedLine
+    }
+    // 空档预览:主行已占用下一行 → 下一行槽位清空,避免同一句同时出现在主行与下一行两处。
+    val nextLine = if (showLargeMetadata || unsynced || noLyrics || previewNextLine) {
+        ""
+    } else {
+        state.nextLine
+    }
+    // 下一行的辅助文字(音标/翻译):与下一行同门控;文本不剥离对唱标记(与 translatedLine 同口径)。
+    val nextLineRomanized = if (showLargeMetadata || unsynced || noLyrics || previewNextLine) {
+        ""
+    } else {
+        state.nextLineRomanized
+    }
+    val nextLineTranslated = if (showLargeMetadata || unsynced || noLyrics || previewNextLine) {
+        ""
+    } else {
+        state.nextLineTranslated
+    }
+    // 空档预览的行窗口取下一行起点(退化窗 [nextLineStartMs, nextLineStartMs]):空档期
+    // position < nextLineStartMs,而 timedWordProgress 对退化窗恒返回 0(未唱),正是
+    // 「下一行还没开始唱」的观感;该行真正开始时窗口换成真实行窗,进度从 0 起填。
+    // 只在预览生效且未展示大元数据时覆盖:大元数据引导靠「窗口在过去 → 全亮」呈现亮色
+    // 歌曲信息,不能被改成暗色。窗口未知(nextLineStartMs == null)时保持原值(0/0)。
+    val previewWindowMs = state.nextLineStartMs.takeIf { previewNextLine && !showLargeMetadata }
 
     // --- 渲染模式（原 project() 从 state.liveCard* + prefs 混合取，现统一从 renderModes 取）---
     // 原 project() 里 weight/textSize/textSizeCustom/secondaryMode/animationMode/glowMode/
     // overflowMode/fontFamily/alignmentMode/burnIn* 全部来自 prefs；
     // lineSyncFillMode/transitionMode 来自 state.liveCard*。
-    // 生产者已把两者合并进 renderModes（Spicy 来自 liveCard*，Lyricon 来自 CompiledSurfaceProfile），
-    // 这里统一读 renderModes，与 spec clause 5/7 一致。
+    // 取值优先级：**编译后的 AOD profile > state.renderModes > （隐含）prefs**。
+    // profile 优先是「预览即实机」的前提——应用内预览读的就是这份 profile
+    // （见 PreviewComponents 的 betterLyrics = profile.animation == "BetterLyrics"）。
+    // 历史上这里只读 renderModes，而全仓只有 Lyricon 一个生产者会从 profile 回填它
+    // （producer/LyriconRenderModeMapping.toProducerRenderModes 是唯一调用点）：
+    // LyricInfo / SuperLyric 发的是硬编码默认值，Spicy 的桥白名单
+    // （bridge/SpicyBridgeStore.normalizeSpicyBridgeRenderModes）又不含 BetterLyrics，
+    // 于是这些源下「逐字动画」等设置永远到不了息屏——表现即「设置只在预览生效、实机不变」。
+    // compiled 缺失（降级 / 旧文档）时仍回落 renderModes，行为与改前一致。
     val modes = state.renderModes
     val aodProfile = compiled?.profiles?.get(SceneCompiler.SURFACE_AOD)
+    val lockscreenProfile = compiled?.profiles?.get(SceneCompiler.SURFACE_LOCKSCREEN)
     val aodEnabled = aodProfile?.enabled ?: prefs.aodEnabled
-    val lockscreenEnabled = compiled?.profiles?.get(SceneCompiler.SURFACE_LOCKSCREEN)?.enabled
-        ?: prefs.lockscreenEnabled
+    val lockscreenEnabled = lockscreenProfile?.enabled ?: prefs.lockscreenEnabled
 
     // --- 保活（原 project() 的 persistentKeepAlive + powerDecision）---
     val persistentKeepAlive = shouldKeepAodAliveFor(
@@ -143,7 +216,11 @@ internal fun projectToDisplay(
     // --- per-word（透传真实词级数据）---
     // 真实词级时间戳随 words 下发：统一扫光管线以其计算整块进度（无行级时间时），
     // 逐字卡拉OK路径（逐字源+关闭发光）以逐词时间驱动缩放/渐变。
-    val effectiveWords = if (showLargeMetadata || !hasActiveLine) emptyList() else state.words.orEmpty()
+    val effectiveWords = if (showLargeMetadata || !hasActiveLine) {
+        emptyList()
+    } else {
+        state.words.orEmpty()
+    }
 
     // --- 行级同步标志（统一走整行水平扫光）---
     // 有活动歌词行时一律行级同步，以整行水平扫光为主要效果；
@@ -151,9 +228,52 @@ internal fun projectToDisplay(
     val lineLevelSync = hasActiveLine && !showLargeMetadata
 
     // --- ruby / layoutGroup（原 presentedRow.words/ruby/layoutGroups）---
-    val words = if (showLargeMetadata || !hasActiveLine) emptyList() else effectiveWords.map(::toDisplayWord)
-    val ruby = if (showLargeMetadata || !hasActiveLine) emptyList() else state.ruby.map(::toDisplayRuby)
+    val words = if (showLargeMetadata || !hasActiveLine) {
+        emptyList()
+    } else {
+        effectiveWords.map {
+            toDisplayWord(it).let { word ->
+                if (rejectJapaneseReading) word.copy(romanized = "") else word
+            }
+        }
+    }
+    val ruby = if (showLargeMetadata || !hasActiveLine || rejectJapaneseReading) {
+        emptyList()
+    } else {
+        state.ruby.map(::toDisplayRuby)
+    }
     val layoutGroups = if (showLargeMetadata || !hasActiveLine) emptyList() else state.layoutGroups.map(::toDisplayLayoutGroup)
+
+    // --- 对唱并发行(息屏 + 锁屏卡片,移植上游 99ba119d4 duet/secondLine)---
+    // 生产者已按时间轴重叠预计算候选(契约:投影不选行),这里只做策略与格式转换:
+    // 任一曲面开启即让快照携带候选(数据面);各曲面 mapper 再按自己的 duetConcurrent
+    // 门控渲染(锁屏与息屏各自独立——上游为 AOD-only,CN+ 扩展到锁屏卡片);两面都
+    // 关闭时快照永不携带并发行(上游 duetEnabled 同语义:在源头撤走并发行,画布无
+    // per-build 对唱状态);大元数据引导/无活动行时同样不携带。
+    // 文本与分侧两套原样下发,行首标记剥离由渲染面按本面开关决定;语言不一致拒绝同样
+    // 作用于并发行的罗马音。
+    val duetConcurrent = (aodProfile?.duetConcurrent ?: true) ||
+        (lockscreenProfile?.duetConcurrent ?: true)
+    val duetLine = if (!duetConcurrent || showLargeMetadata || !hasActiveLine) {
+        null
+    } else {
+        state.duetLine?.let { line ->
+            if (line.text.isBlank()) {
+                null
+            } else {
+                AodDisplayDuetLine(
+                    text = line.text,
+                    romanized = if (rejectJapaneseReading) "" else line.romanized,
+                    translated = line.translated,
+                    alignedRight = line.alignedRight,
+                    alignedRightMarkers = line.alignedRightMarkers,
+                    lineStartMs = line.lineStartMs,
+                    lineEndMs = line.lineEndMs,
+                    words = line.words.map(::toDisplayWord)
+                )
+            }
+        }
+    }
 
     return AodDisplayState(
         visible = original.isNotBlank(),
@@ -162,21 +282,42 @@ internal fun projectToDisplay(
         trackGeneration = trackGeneration(state),
         aodEnabled = aodEnabled,
         lockscreenEnabled = lockscreenEnabled,
-        seamlessTransitionEnabled = prefs.seamlessTransitionEnabled,
         keepAlive = powerDecision.keepAlive,
         positionFollowingEnabled = prefs.experimentalPositionFollowing,
         burnInPattern = prefs.burnInPattern,
         burnInIntervalMs = prefs.burnInIntervalMs,
+        suppressStockAodContent = prefs.suppressStockAodContent,
+        aodRotateWithDevice = prefs.aodRotateWithDevice,
+        aodRotationMode = prefs.aodRotationMode,
+        aodRotationSettleMs = prefs.aodRotationSettleMs,
+        aodCanvasAnchorLandscape = prefs.aodCanvasAnchorLandscape,
+        aodLandscapeTextScale = prefs.aodLandscapeTextScale,
+        aodLandscapeHideStock = prefs.aodLandscapeHideStock,
+        aodLandscapeFullscreen = prefs.aodLandscapeFullscreen,
+        aodLandscapeFullscreenSafeMarginPercent = prefs.aodLandscapeFullscreenSafeMarginPercent,
+        aodDebugShowCanvasFrame = prefs.aodDebugShowCanvasFrame,
+        aodCanvasPaddingPortraitXPercent = prefs.aodCanvasPaddingPortraitXPercent,
+        aodCanvasPaddingPortraitYPercent = prefs.aodCanvasPaddingPortraitYPercent,
+        aodCanvasPaddingLandscapeXPercent = prefs.aodCanvasPaddingLandscapeXPercent,
+        aodCanvasPaddingLandscapeYPercent = prefs.aodCanvasPaddingLandscapeYPercent,
         wakeSignal = sessionWakeSignal(state, hasTimedLyrics),
         original = original,
         romanized = romanized,
         translated = translated,
         nextLine = nextLine,
+        nextLineRomanized = nextLineRomanized,
+        nextLineTranslated = nextLineTranslated,
         metadata = metadata,
+        title = state.title,
+        artist = state.artist,
+        album = state.album,
+        largeMetadata = showLargeMetadata,
         alignedRight = state.alignedRight,
+        alignedRightMarkers = state.alignedRightMarkers,
         lineLevelSync = lineLevelSync,
-        lineStartMs = if (hasActiveLine) state.lineStartMs else 0L,
-        lineEndMs = if (hasActiveLine) state.lineEndMs else 0L,
+        // 空档预览时行窗口取下一行起点(退化窗 → 进度恒 0 = 未唱);其余无活动行时刻保持 0/0。
+        lineStartMs = if (hasActiveLine) state.lineStartMs else previewWindowMs ?: 0L,
+        lineEndMs = if (hasActiveLine) state.lineEndMs else previewWindowMs ?: 0L,
         durationMs = state.durationMs,
         positionMs = position,
         sampledAtElapsedMs = now,
@@ -184,22 +325,55 @@ internal fun projectToDisplay(
         words = words,
         ruby = ruby,
         layoutGroups = layoutGroups,
-        weight = modes.weight,
-        textSizeMode = modes.textSize,
-        textSizeCustom = modes.textSizeCustom,
-        secondaryMode = modes.secondary,
-        animationMode = modes.animation,
-        glowMode = modes.glow,
-        lineSyncFillMode = modes.lineSyncFill,
-        overflowMode = modes.overflow,
-        transitionMode = if (noLyrics) "None" else modes.transition,
-        fontFamily = modes.font,
-        alignmentMode = prefs.alignment,
+        duetLine = duetLine,
+        weight = aodProfile?.weight ?: modes.weight,
+        textSizeMode = aodProfile?.textSize ?: modes.textSize,
+        textSizeCustom = aodProfile?.textSizeCustom ?: modes.textSizeCustom,
+        secondaryMode = aodProfile?.secondaryMode ?: modes.secondary,
+        animationMode = aodProfile?.animation ?: modes.animation,
+        glowMode = aodProfile?.glow ?: modes.glow,
+        lineSyncFillMode = aodProfile?.lineSyncFillMode ?: modes.lineSyncFill,
+        overflowMode = aodProfile?.overflow ?: modes.overflow,
+        // 换行动画与 producer 侧同一归一：profile.lineTransition 的 "Auto" 退默认 "Fade up"
+        // （不能借用场景过渡 preset id，那是 AOD↔锁屏联动的词表，语义不同）。
+        transitionMode = if (noLyrics) {
+            "None"
+        } else {
+            aodProfile?.let { resolveLineTransition(it.lineTransition, "Fade up") } ?: modes.transition
+        },
+        fontFamily = aodProfile?.fontFamily ?: modes.font,
+        // 以下三项历史上同属「从 prefs 混合取」，而 ui/ 已无任何写入方
+        // （SettingsPrefs.updateAlignment/updateMetadataAnchor/updateAdaptiveSectioning
+        //  在 ui/ 下零调用点），于是恒读旧 SharedPreferences 的残留值 = 恒取默认值，
+        // 表现同样是「设置只在预览生效、实机不变」。一并改走 profile，prefs 留作兜底。
+        alignmentMode = aodProfile?.alignment ?: prefs.alignment,
         metadataVisible = aodProfile?.metadataVisible ?: (prefs.metadataVisible != "hide"),
-        metadataAnchor = prefs.metadataAnchor,
-        adaptiveSectioning = prefs.adaptiveSectioning
+        metadataAnchor = aodProfile?.metadataAnchor ?: prefs.metadataAnchor,
+        adaptiveSectioning = aodProfile?.adaptiveSectioning ?: prefs.adaptiveSectioning,
+        artworkJpeg = artworkJpeg,
+        artworkKey = artworkKey
     )
 }
+
+/**
+ * 中文歌的 ruby 注音含日语假名 → 语言不一致,拒绝显示 ruby/罗马音(上游 8422d78)。
+ * 数据源(网易云)常给中文歌词错误标注日语 furigana,显示出来既难看又误导。
+ * 只对 zh 语言生效;日语歌的假名注音是正确数据,原样保留。
+ */
+internal fun hasLanguageInconsistentKanaRuby(
+    language: String,
+    rubyReadings: List<String>
+): Boolean {
+    val normalized = language
+        .substringBefore('-')
+        .substringBefore('_')
+    if (!normalized.equals("zh", ignoreCase = true)) return false
+    return rubyReadings.any { reading -> reading.any(::isKana) }
+}
+
+/** 假名块(平假名 U+3040-309F + 片假名 U+30A0-30FF)与半角片假名(U+FF66-FF9F)。 */
+private fun isKana(character: Char): Boolean =
+    character in '\u3040'..'\u30ff' || character in '\uff66'..'\uff9f'
 
 /** [LyricWord] → [AodDisplayWord]（与原 presentedRow.words.map 同构）。 */
 private fun toDisplayWord(word: LyricWord) = AodDisplayWord(

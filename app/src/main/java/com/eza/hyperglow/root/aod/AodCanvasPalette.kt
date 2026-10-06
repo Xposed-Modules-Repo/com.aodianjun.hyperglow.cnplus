@@ -1,0 +1,84 @@
+package com.eza.hyperglow.root.aod
+
+import android.graphics.Color
+import kotlin.math.roundToInt
+
+internal data class AodResolvedPalette(
+    val secondaryText: Int,
+    val metadataText: Int,
+    val nextLineText: Int,
+    val sungText: Int,
+    val unsungText: Int,
+    val glow: Int,
+    val accent: Int
+)
+
+internal fun resolveAodPalette(tokens: Map<String, String>): AodResolvedPalette =
+    AodResolvedPalette(
+        secondaryText = resolvePaletteColor(tokens["secondaryText"], Color.WHITE),
+        metadataText = resolvePaletteColor(tokens["metadataText"], 0xFFB3B3B3.toInt()),
+        nextLineText = resolvePaletteColor(tokens["nextLineText"], Color.WHITE),
+        sungText = resolvePaletteColor(tokens["sungText"], Color.WHITE),
+        unsungText = resolvePaletteColor(tokens["unsungText"], Color.WHITE),
+        glow = resolvePaletteColor(tokens["glow"], Color.WHITE),
+        accent = resolvePaletteColor(tokens["accent"], Color.WHITE)
+    )
+
+/**
+ * 第二行歌词取色(实机 AodLyricCanvasView 与预览 PreviewComponents 同源):
+ * 两种呈现形态都取「下一行颜色」(nextLineText) —— 「辅助文字显示第二行歌词」只借
+ * 辅助文字的字号/亮度样式,不借「辅助行颜色」(secondaryText),否则"下一行颜色"
+ * 设置对该形态完全失效。取色与呈现形态解耦,防止再按形态分叉取色。
+ */
+internal fun secondLineColorArgb(
+    presentation: SecondLinePresentation,
+    palette: AodResolvedPalette
+): Int = when (presentation) {
+    // 两种呈现形态同取「下一行颜色」:辅助文字形态只借字号/亮度样式,不借「辅助行颜色」。
+    SecondLinePresentation.AS_SECONDARY,
+    SecondLinePresentation.STANDALONE,
+    SecondLinePresentation.NONE -> palette.nextLineText
+}
+
+private fun resolvePaletteColor(token: String?, fallback: Int): Int = when {
+    token == "dimmed" -> opaqueRgb(
+        (((fallback ushr 16) and 0xFF) * 0.72f).roundToInt(),
+        (((fallback ushr 8) and 0xFF) * 0.72f).roundToInt(),
+        ((fallback and 0xFF) * 0.72f).roundToInt()
+    )
+    // 自定义字体颜色:"#RRGGBB" 形式的 token(解析失败时回退默认色)
+    else -> parseOpaqueColorOrNull(token) ?: fallback
+}
+
+/** 解析 "#RGB"/"#RRGGBB"/"#AARRGGBB" 为不透明 ARGB;非色值 token 返回 null(纯函数,可单测)。 */
+internal fun parseOpaqueColorOrNull(token: String?): Int? {
+    if (token == null || token.length !in intArrayOf(4, 7, 9) || token[0] != '#') return null
+    val hex = token.substring(1)
+    for (c in hex) {
+        if (Character.digit(c, 16) < 0) return null
+    }
+    return when (hex.length) {
+        3 -> {
+            val r = Character.digit(hex[0], 16)
+            val g = Character.digit(hex[1], 16)
+            val b = Character.digit(hex[2], 16)
+            opaqueRgb(r * 17, g * 17, b * 17)
+        }
+        6 -> opaqueRgb(
+            hex.substring(0, 2).toInt(16),
+            hex.substring(2, 4).toInt(16),
+            hex.substring(4, 6).toInt(16)
+        )
+        else -> opaqueRgb(
+            hex.substring(2, 4).toInt(16),
+            hex.substring(4, 6).toInt(16),
+            hex.substring(6, 8).toInt(16)
+        )
+    }
+}
+
+private fun opaqueRgb(red: Int, green: Int, blue: Int): Int =
+    (0xFF shl 24) or
+        (red.coerceIn(0, 255) shl 16) or
+        (green.coerceIn(0, 255) shl 8) or
+        blue.coerceIn(0, 255)

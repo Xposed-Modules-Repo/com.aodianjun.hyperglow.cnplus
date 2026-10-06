@@ -14,19 +14,24 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.root.readHierarchyField
+import com.eza.hyperglow.aod.AOD_ROTATION_MODE_PORTRAIT
+import com.eza.hyperglow.aod.DEFAULT_CANVAS_PADDING_PERCENT
+import com.eza.hyperglow.aod.DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT
 import com.eza.hyperglow.customization.CompiledCustomization
+import com.eza.hyperglow.customization.metadataExpectedExtraLines
 import com.eza.hyperglow.customization.CompiledSurfaceProfile
 import com.eza.hyperglow.customization.SceneCompiler
 import com.eza.hyperglow.root.capability.XiaomiCapability
 import com.eza.hyperglow.root.capability.XiaomiCapabilityResolver
 import com.eza.hyperglow.root.projection.LyricKeepAliveSignal
 import com.eza.hyperglow.root.projection.LyricRenderContent
+import com.eza.hyperglow.root.projection.LyricRetentionAnchor
 import com.eza.hyperglow.root.projection.LyricSnapshot
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
 import com.eza.hyperglow.root.projection.SystemUiLyricProjectionRuntime
 import com.eza.hyperglow.root.projection.SystemUiLyricSubscriber
-import com.eza.hyperglow.root.projection.freezeAt
 import com.eza.hyperglow.root.projection.isAuthorizedForPresentation
+import com.eza.hyperglow.root.projection.nextLyricRetentionAnchor
 import com.eza.hyperglow.root.projection.pauseLingerRemainingMs
 import com.eza.hyperglow.root.projection.shouldRenewAodDraw
 import com.eza.hyperglow.root.projection.shouldRequestAodWake
@@ -42,260 +47,11 @@ import com.eza.hyperglow.root.transition.SystemUiClockMorphHook
 import com.eza.hyperglow.root.transition.TransitionRect
 import com.eza.hyperglow.root.transition.animateLinkageView
 import com.eza.hyperglow.root.transition.fadeOutLinkageView
-import com.eza.hyperglow.root.transition.isDimmedAodDisplayState
 import com.eza.hyperglow.root.transition.presentationRectInWindow
 import com.eza.hyperglow.root.transition.resetLinkageView
 import com.eza.hyperglow.root.transition.transitionRectInWindow
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
-
-internal data class AodSurfaceRect(
-    val left: Int,
-    val top: Int,
-    val right: Int,
-    val bottom: Int
-) {
-    val width: Int get() = right - left
-    val height: Int get() = bottom - top
-}
-
-internal data class AodRenderedClockBounds(
-    val top: Int,
-    val bottom: Int
-) {
-    val height: Int get() = bottom - top
-}
-
-private const val BRIGHT_LINKAGE_CLOCK_RESERVE_FRACTION = 0.35f
-
-internal fun resolveRenderedAodSceneZone(
-    managedZone: AodSceneZone,
-    renderedBounds: AodRenderedClockBounds?,
-    rootHeight: Int,
-    margin: Int
-): AodSceneZone {
-    if (managedZone == AodSceneZone.STOCK || renderedBounds == null ||
-        renderedBounds.height <= 0 || rootHeight <= 0
-    ) return managedZone
-    val freeAbove = (renderedBounds.top - margin).coerceAtLeast(0)
-    val freeBelow = (rootHeight - renderedBounds.bottom - margin).coerceAtLeast(0)
-    return when {
-        freeAbove > freeBelow -> AodSceneZone.CLOCK_BOTTOM
-        freeBelow > freeAbove -> AodSceneZone.CLOCK_TOP
-        else -> managedZone
-    }
-}
-
-/**
- * @param rememberedPhysicalBounds the last physical measurement taken on a root of the same height.
- *   The physical clock cannot be measured while the panel is dark, so every re-attach in that state
- *   falls through to the managed position — which is where the clock was asked to go, not where the
- *   stock AOD clock actually is. On this device those differ by hundreds of pixels, so the lyrics
- *   appeared far from their configured place until the panel lit and the real bounds resolved. A
- *   measurement already taken is better evidence than a position we merely requested.
- */
-internal fun resolvedAodClockBounds(
-    renderedBounds: AodRenderedClockBounds?,
-    controlledTop: Int?,
-    controlledBottom: Int?,
-    measuredTop: Int,
-    measuredBottom: Int,
-    exactPhysicalBounds: AodRenderedClockBounds? = null,
-    rememberedPhysicalBounds: AodRenderedClockBounds? = null
-): AodRenderedClockBounds {
-    val controlled = if (controlledTop != null && controlledBottom != null) {
-        AodRenderedClockBounds(controlledTop, controlledBottom)
-    } else {
-        null
-    }
-    val validRendered = renderedBounds?.takeIf { it.height > 0 }
-    val validControlled = controlled?.takeIf { it.height > 0 }
-    val validPhysical = exactPhysicalBounds?.takeIf { it.height > 0 }
-    val validRemembered = rememberedPhysicalBounds?.takeIf { it.height > 0 }
-    return when {
-        validPhysical != null -> validPhysical
-        validRemembered != null -> validRemembered
-        validControlled != null -> validControlled
-        validRendered != null -> validRendered
-        else -> AodRenderedClockBounds(measuredTop, measuredBottom)
-    }
-}
-
-internal fun selectPhysicalAodClockBounds(
-    systemUiBounds: AodRenderedClockBounds?,
-    aodControllerBounds: AodRenderedClockBounds?
-): AodRenderedClockBounds? = systemUiBounds ?: aodControllerBounds
-
-/**
- * Held stable position of the AOD clock, used as an anchor for lyric placement.
- *
- * @param sinceElapsedMs monotonic time the held position was last confirmed (set to the current
- *   bounds).
- */
-internal data class AodClockAnchor(
-    val top: Int,
-    val bottom: Int,
-    val sinceElapsedMs: Long
-)
-
-/** How long a held clock position may go unconfirmed before it is treated as a genuine move. */
-internal const val AOD_CLOCK_ANCHOR_HOLD_MS = 40_000L
-
-/**
- * Stabilizes the clock bounds used for lyric placement against fast oscillation (e.g. the media
- * header toggling the AOD layout, which squeezes/releases the clock by hundreds of pixels). The
- * anchor holds the last *confirmed* clock position: as long as the raw bounds keep returning to it
- * (oscillation), the anchor stays put so the lyric never jumps. It only relocates when the held
- * position has gone unconfirmed for [AOD_CLOCK_ANCHOR_HOLD_MS] — a genuinely persistent move.
- */
-internal fun stabilizeAodClockAnchor(
-    previous: AodClockAnchor?,
-    raw: AodRenderedClockBounds,
-    nowElapsedMs: Long,
-    holdMs: Long = AOD_CLOCK_ANCHOR_HOLD_MS
-): AodClockAnchor {
-    if (raw.top >= raw.bottom) return previous ?: AodClockAnchor(raw.top, raw.bottom, nowElapsedMs)
-    if (previous == null) return AodClockAnchor(raw.top, raw.bottom, nowElapsedMs)
-    if (raw.top == previous.top && raw.bottom == previous.bottom) {
-        // Held position reconfirmed: refresh so oscillation never ages it out.
-        return previous.copy(sinceElapsedMs = nowElapsedMs)
-    }
-    return if (nowElapsedMs - previous.sinceElapsedMs >= holdMs) {
-        AodClockAnchor(raw.top, raw.bottom, nowElapsedMs)
-    } else {
-        previous
-    }
-}
-
-internal fun brightLinkageClockBounds(rootHeight: Int): AodRenderedClockBounds =
-    AodRenderedClockBounds(0, (rootHeight * BRIGHT_LINKAGE_CLOCK_RESERVE_FRACTION).roundToInt())
-
-internal fun shouldUseBrightClockMorphGeometry(
-    linkageMode: Boolean,
-    morphingToAod: Boolean,
-    linkageAwaitingDim: Boolean,
-    displayState: Int
-): Boolean = linkageMode && !isDimmedAodDisplayState(displayState) &&
-    (morphingToAod || linkageAwaitingDim)
-
-internal fun calculateAodSurfaceRect(
-    rootWidth: Int,
-    rootHeight: Int,
-    stockBottom: Int,
-    margin: Int,
-    desiredWidth: Int,
-    desiredHeight: Int,
-    translationX: Int = 0,
-    safeBottom: Int? = null,
-    anchor: String = "below_stock_clock",
-    verticalBias: Float = 0.5f
-): AodSurfaceRect {
-    val boundedWidth = desiredWidth.coerceIn(0, rootWidth.coerceAtLeast(0))
-    val maxLeft = (rootWidth - boundedWidth).coerceAtLeast(0)
-    val left = ((rootWidth - boundedWidth) / 2 + translationX).coerceIn(0, maxLeft)
-    val visibleBottom = (minOf(rootHeight, safeBottom ?: rootHeight) - margin).coerceAtLeast(0)
-    val safeTop = (stockBottom + margin).coerceIn(0, visibleBottom)
-    val height = desiredHeight.coerceIn(0, visibleBottom - safeTop)
-    val top = when (anchor) {
-        "screen_center" -> safeTop + (visibleBottom - safeTop - height) / 2
-        "screen_bottom_safe" -> visibleBottom - height
-        "custom_vertical_bias" -> safeTop +
-            ((visibleBottom - safeTop - height) * verticalBias.coerceIn(0f, 1f)).roundToInt()
-        else -> safeTop
-    }
-    return AodSurfaceRect(left, top, left + boundedWidth, top + height)
-}
-
-internal fun stockBottomInRoot(rootWindowY: Int, childWindowY: Int, childHeight: Int): Int =
-    childWindowY - rootWindowY + childHeight
-
-internal fun hasUsableAodRootSize(width: Int, height: Int): Boolean = width > 0 && height > 0
-
-internal fun aodSceneSafeCanvas(
-    rootWidth: Int,
-    rootHeight: Int,
-    clockTop: Int,
-    lyricTopSafe: Int,
-    margin: Int,
-    zone: AodSceneZone
-): PlacementRect = if (zone == AodSceneZone.CLOCK_BOTTOM) {
-    val top = lyricTopSafe.coerceIn(0, rootHeight)
-    val bottom = (clockTop - margin).coerceIn(top, rootHeight)
-    PlacementRect(0f, top.toFloat(), rootWidth.toFloat(), bottom.toFloat())
-} else {
-    PlacementRect(0f, 0f, rootWidth.toFloat(), rootHeight.toFloat())
-}
-
-internal fun aodPlacementMaxHeightFraction(
-    configuredFraction: Float,
-    zone: AodSceneZone
-): Float = if (zone == AodSceneZone.CLOCK_BOTTOM) 1f else configuredFraction
-
-internal fun shouldRenderAodSnapshot(
-    sceneActive: Boolean,
-    snapshotVisible: Boolean,
-    featureEnabled: Boolean,
-    profileEnabled: Boolean,
-    transitionFailed: Boolean,
-    spotifyAuthorized: Boolean = true
-): Boolean = sceneActive && snapshotVisible && spotifyAuthorized && featureEnabled &&
-    profileEnabled && !transitionFailed
-
-internal fun isNewAodWakeSignal(previous: Long, incoming: Long): Boolean =
-    incoming != 0L && incoming != previous
-
-internal fun retainedAodSnapshotAfterUpdate(
-    incoming: LyricSnapshot,
-    lastVisible: LyricSnapshot?,
-    retained: LyricSnapshot?,
-    mediaPlayerPresent: Boolean,
-    nowElapsedMs: Long,
-    pauseLingerMs: Long = 5_000L
-): LyricSnapshot? = when {
-    incoming.visible -> null
-    !mediaPlayerPresent -> null
-    incoming.pauseRetentionEligible -> {
-        val pauseAtElapsedMs = incoming.updatedAtElapsedMs.coerceIn(0L, nowElapsedMs)
-        val candidate = retained?.takeIf { it.pauseRetentionEligible } ?: lastVisible?.freezeAt(
-            pauseAtElapsedMs,
-            keepAliveWhileFrozen = false
-        )?.copy(playbackActive = false, pauseRetentionEligible = true)
-        candidate?.takeIf {
-            pauseLingerRemainingMs(it.sampledAtElapsedMs, pauseLingerMs, nowElapsedMs) != null
-        }
-    }
-    incoming.playbackActive -> {
-        val candidate = retained?.takeIf { it.playbackActive } ?: lastVisible?.freezeAt(
-            nowElapsedMs,
-            keepAliveWhileFrozen = lastVisible.keepAlive
-        )?.copy(playbackActive = true, pauseRetentionEligible = false)
-        candidate?.let { expirePausedAodKeepAlive(it, nowElapsedMs) }
-    }
-    else -> null
-}
-
-internal fun expirePausedAodKeepAlive(
-    retained: LyricSnapshot,
-    nowElapsedMs: Long
-): LyricSnapshot {
-    if (!retained.keepAlive) return retained
-    val pausedForMs = (nowElapsedMs - retained.sampledAtElapsedMs).coerceAtLeast(0L)
-    return if (pausedForMs >= PAUSED_AOD_KEEP_ALIVE_MS) {
-        retained.copy(keepAlive = false)
-    } else {
-        retained
-    }
-}
-
-internal const val PAUSED_AOD_KEEP_ALIVE_MS = 30_000L
-
-internal fun smoothAodRevealProgress(progress: Float): Float {
-    val value = progress.coerceIn(0f, 1f)
-    return value * value * (3f - 2f * value)
-}
-
-internal fun shouldRetryManagedAodPosition(attempts: Int, maximumAttempts: Int): Boolean =
-    attempts < maximumAttempts
 
 internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private const val TAG = "AodSurfaceController"
@@ -305,13 +61,14 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private var attachmentGeneration = 0L
     private var environment = SurfaceEnvironment(LyricSurfaceKind.AOD, 0L)
     private var rootRef = WeakReference<ViewGroup>(null)
-    private var burnInContainerRef = WeakReference<FrameLayout>(null)
+    private var burnInContainerRef = WeakReference<ViewGroup>(null)
     private var surface: LinearLayout? = null
     private var lyricCanvas: AodLyricCanvasView? = null
     private var spicyAnimationView: AodSpicyAnimationView? = null
     private var latestSnapshot: LyricSnapshot? = null
     private var lastVisibleSnapshot: LyricSnapshot? = null
     private var retainedMediaSnapshot: LyricSnapshot? = null
+    private var retentionAnchor: LyricRetentionAnchor? = null
     private var stockMediaPlayerPresent = false
     private var customization: CompiledCustomization? = null
     private var runtimeProfile: CompiledSurfaceProfile? = null
@@ -324,9 +81,26 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private var lastSnapshotTrace: String? = null
     private var lastBrightClockMorphPhase: Boolean? = null
     private var lastClockGeometryAuthority: String? = null
+    private var lastDrawWakePulseResult: AodDrawWakePulseResult? = null
+    private var lastDrawWakeRuntimeClass = ""
+    private var postHandoffDiagnosticGeneration = 0L
+    private var postHandoffEarlyGeneration = -1L
+    private var postHandoffLateGeneration = -1L
     private var rememberedPhysicalClockBounds: AodRenderedClockBounds? = null
     private var rememberedPhysicalClockRootHeight = 0
+    /** rememberedPhysicalClockBounds 最近一次写入的单调时钟,用于判断缓存是否已过期。 */
+    private var rememberedPhysicalClockBoundsSinceElapsedMs = Long.MIN_VALUE
     @Volatile private var stockWidgetControlActive = false
+    @Volatile private var suppressStockAodContent = false
+    @Volatile private var suppressGateActive = false
+    @Volatile private var clockPinActive = false
+    @Volatile private var currentRotationStep = AodOrientationStep.PORTRAIT
+    private var aodRotateWithDevice = false
+    private var aodLandscapeFullscreen = false
+    private var aodRotationMode = AOD_ROTATION_MODE_PORTRAIT
+    private var aodRotationSettleMs = 1_000L
+    /** 系统时钟保留区:抑制系统内容前最后一次实测的物理时钟顶部位置。 */
+    private var stockClockReserveTop: Int? = null
     @Volatile private var burnInPattern = "static_bottom"
     private var burnInIntervalMs = 60_000L
     private var sceneZone = AodSceneZone.STOCK
@@ -337,6 +111,9 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private var aodControllerClockBounds: AodRenderedClockBounds? = null
     private var renderedClockBounds: AodRenderedClockBounds? = null
     private var clockAnchor: AodClockAnchor? = null
+
+    /** 根高度变化丢锚时继承的防抖记忆(旧锚 sinceElapsedMs),消费一次后清空。 */
+    private var droppedAnchorHoldSinceMs: Long? = null
     private val renderedClockRootLocation = IntArray(2)
     private val renderedClockUnion = Rect()
     private val renderedClockScratch = Rect()
@@ -371,7 +148,27 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private var stockMotionAlphaFrom = 1f
     private var stockMotionAlphaTo = 1f
     private var drawWakeRenewalActive = false
+    // Stock settle drift watchdog: MIUI moves the AOD clock to a burn-in initial
+    // position about 10s after AOD entry (AODUpdatePositionController, translated via
+    // setTranslationY, which never fires OnLayoutChange). The follow-up hook can miss it,
+    // so we re-check the physical clock bounds on a schedule and force a geometry refresh.
+    private var stockSettleCheckScheduled = false
+    private var stockSettleCheckIndex = 0
+    private val stockSettleCheckIntervals = longArrayOf(
+        10_000L, 10_000L, 15_000L, 20_000L, 30_000L,
+        40_000L, 60_000L, 80_000L, 120_000L, 160_000L, 240_000L
+    )
+    private val stockSettleCheck = object : Runnable {
+        override fun run() {
+            stockSettleCheckScheduled = false
+            checkStockSettleDrift()
+        }
+    }
+
+    private var renderStallWatchdogScheduled = false
+    private var lastPlacedTrace: String? = null
     private var managedPositionRetryCount = 0
+    private var managedPositionUnavailable = false
     private var initialRevealPending = true
     private var initialRevealActive = false
     private var initialRevealStartedAt = 0L
@@ -398,6 +195,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 return
             }
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             latestSnapshot = latestSnapshot?.takeUnless { it === retained }
             setStockWidgetControlActive(false)
@@ -502,6 +300,25 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             mainHandler.postDelayed(this, DRAW_WAKE_RENEW_INTERVAL_MS)
         }
     }
+    /**
+     * 渲染停摆看门狗(issue #6):切歌 + 锁屏过渡并发窗口里,快照应用链路可能停摆、
+     * Draw wake renewal 被关掉后没有任何事件再把它拉起来,画布节律也随之停止,
+     * AOD 只能等下一次锁屏 attach 重放才恢复。看门狗在「息屏 + 已附着 + 场景激活 +
+     * 快照可渲染 + 仍在播放」时周期自检,发现停摆就强制重放快照并补画布唤醒脉冲。
+     */
+    private val renderStallWatchdog = object : Runnable {
+        override fun run() {
+            if (!renderStallWatchdogScheduled) return
+            mainHandler.postDelayed(this, RENDER_STALL_WATCHDOG_INTERVAL_MS)
+            runCatching { recoverRenderStallIfNeeded() }
+        }
+    }
+    private val postHandoffDiagnosticEarly = Runnable {
+        logPostHandoffSurfaceState("+1s", postHandoffEarlyGeneration)
+    }
+    private val postHandoffDiagnosticLate = Runnable {
+        logPostHandoffSurfaceState("+7s", postHandoffLateGeneration)
+    }
     private val initialRevealFrame = object : Runnable {
         override fun run() {
             if (!initialRevealActive) return
@@ -535,6 +352,17 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 ) {
                     mainHandler.postDelayed(this, MANAGED_BURN_IN_RETRY_MS)
                 } else {
+                    // The controller geometry never resolved on this ROM. Release managed
+                    // control so the scene follows Xiaomi's stock clock (enabling the
+                    // stock-geometry measurement path) instead of staying pinned to the
+                    // initial top fallback with control nominally still on. 仅限「实时跟随
+                    // 系统时钟」开启:锚定(固定)模式下时钟由 integral pin 接管,耗尽只记
+                    // 日志,不释放控制、不置 latch(issue #33 锚定优先)。
+                    val aodClockFollow = currentAodProfile().aodClockFollow
+                    if (shouldReleaseManagedControlOnExhaustion(aodClockFollow)) {
+                        managedPositionUnavailable = true
+                        setStockWidgetControlActive(false)
+                    }
                     HookLogger.i(TAG, "Managed AOD position unavailable; using stock geometry")
                 }
             }
@@ -607,15 +435,27 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 observeDisplayState(root)
                 AodPositionHook.observeAodRoot(root)
                 if (clockAnchor == null) {
+                    val nowSeedingElapsedMs = SystemClock.elapsedRealtime()
                     rememberedPhysicalClockBounds
                         ?.takeIf { rememberedPhysicalClockRootHeight == root.height }
+                        ?.takeIf {
+                            nowSeedingElapsedMs - rememberedPhysicalClockBoundsSinceElapsedMs <=
+                                REMEMBERED_CLOCK_MAX_AGE_MS
+                        }
                         ?.let { b ->
-                            clockAnchor = AodClockAnchor(b.top, b.bottom, SystemClock.elapsedRealtime())
+                            clockAnchor = AodClockAnchor(b.top, b.bottom, nowSeedingElapsedMs)
                             HookLogger.i(TAG, "Anchor seeded from remembered bounds ${b.top}..${b.bottom} (re-attach throttle)")
                         }
                 } else if (rememberedPhysicalClockRootHeight != root.height) {
+                    // 根高度变化丢弃锚时继承防抖记忆(issue #23 建议三):新锚的 hold 窗口
+                    // 从旧锚的确认时刻起算,而不是重新计满 40s。
+                    droppedAnchorHoldSinceMs = clockAnchor?.sinceElapsedMs
                     clockAnchor = null
-                    HookLogger.i(TAG, "Display root height changed; anchor dropped")
+                    HookLogger.i(
+                        TAG,
+                        "Display root height changed; anchor dropped (hold since inherited=" +
+                            "$droppedAnchorHoldSinceMs)"
+                    )
                 }
                 val directSurface = buildSurface(root)
                 surface = directSurface
@@ -627,7 +467,10 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 )
                 LinkageTransitionCoordinator.registerSurface(this)
                 AodPowerCoordinator.onSurfaceAttached()
+                startRenderStallWatchdog()
+                startStockSettleWatchdog()
                 LinkageTransitionCoordinator.onAodSurfaceMode(AodPositionHook.isLinkageMode())
+                applySuppressionAndRotation(latestSnapshot)
                 val generation = attachmentGeneration
                 root.post {
                     if (generation == attachmentGeneration && rootRef.get() === root) {
@@ -742,6 +585,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             cancelPausedKeepAliveExpiry()
             cancelPauseLingerExpiry()
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             latestSnapshot = null
             setStockWidgetControlActive(false)
@@ -760,13 +604,17 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         else if (lastVisibleSnapshot == null) {
             lastVisibleSnapshot = SystemUiLyricProjectionRuntime.projection.cachedVisibleSnapshot()
         }
+        val nowElapsedMs = SystemClock.elapsedRealtime()
+        retentionAnchor = nextLyricRetentionAnchor(incomingSnapshot, retentionAnchor, nowElapsedMs)
         retainedMediaSnapshot = retainedAodSnapshotAfterUpdate(
             incomingSnapshot,
             lastVisibleSnapshot,
             retainedMediaSnapshot,
+            retentionAnchor,
             stockMediaPlayerPresent,
-            SystemClock.elapsedRealtime(),
-            customization?.pauseLingerMs ?: 5_000L
+            nowElapsedMs,
+            customization?.pauseLingerMs ?: 5_000L,
+            pauseRetentionEnabled = customization?.pauseShowContent ?: false
         )
         schedulePausedKeepAliveExpiry(retainedMediaSnapshot)
         schedulePauseLingerExpiry(retainedMediaSnapshot)
@@ -790,6 +638,8 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                     "keepAlive=${resolvedSnapshot.keepAlive} " +
                     "render=${canRenderAod(resolvedSnapshot)} " +
                     "surface=${surface != null}/${surface?.visibility} " +
+                    "effAlpha=${surface?.let(::effectiveSurfaceAlpha)} " +
+                    "alphaChain=${surface?.let(::surfaceAlphaChain)} " +
                     "root=${rootRef.get()?.width}x${rootRef.get()?.height} " +
                     "failed=$transitionFailedHidden"
             if (snapshotTrace != lastSnapshotTrace) {
@@ -802,12 +652,15 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             burnInIntervalMs != resolvedSnapshot.burnInIntervalMs
         burnInPattern = resolvedSnapshot.burnInPattern
         burnInIntervalMs = resolvedSnapshot.burnInIntervalMs
+        if (burnInScheduleChanged) managedPositionUnavailable = false
         setStockWidgetControlActive(
             resolvedSnapshot.positionFollowingEnabled &&
                 canRenderAod(resolvedSnapshot) &&
-                XiaomiCapabilityResolver.hasCapability(XiaomiCapability.AOD_POSITION_UPDATES),
+                XiaomiCapabilityResolver.hasCapability(XiaomiCapability.AOD_POSITION_UPDATES) &&
+                shouldAttemptManagedPosition(managedPositionUnavailable, burnInScheduleChanged),
             restartSchedule = burnInScheduleChanged
         )
+        applySuppressionAndRotation(resolvedSnapshot)
         if (!resolvedSnapshot.positionFollowingEnabled && wasFollowingPosition) {
             environment = environment.copy(
                 burnInTranslationX = 0f,
@@ -842,7 +695,10 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             return
         }
         if (!layoutSurface(root, burnInContainer, directSurface)) return
-        lyricCanvas?.setContent(resolvedSnapshot.toAodCanvasContent(effectiveAodProfile()))
+        logRenderProfileProbe("main", resolvedSnapshot, effectiveAodProfile())
+        lyricCanvas?.setContent(
+                    resolvedSnapshot.toAodCanvasContent(effectiveAodProfile(), duet = true)
+                )
         lastRenderContent = renderContent
         lyricCanvas?.visibility = if (demo) View.GONE else View.VISIBLE
         spicyAnimationView?.visibility = if (demo) View.VISIBLE else View.GONE
@@ -859,7 +715,10 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         }
         if (retained != retainedMediaSnapshot) retainedMediaSnapshot = retained
         schedulePausedKeepAliveExpiry(retained)
-        val effectiveKeepAlive = retained?.keepAlive ?: signal.keepAlive
+        // 心跳 keepAlive=false 不具租约过期权威(issue #22):播放中宽限为续期,与下方
+        // playback-active 脉搏注释同源;全量快照的 keepAlive=false 不受影响。
+        val effectiveKeepAlive = retained?.keepAlive
+            ?: heartbeatKeepAliveWithGrace(signal.keepAlive, signal.playbackActive)
         latestSnapshot = latestSnapshot?.copy(
             updatedAtElapsedMs = signal.updatedAtElapsedMs,
             keepAlive = effectiveKeepAlive,
@@ -886,6 +745,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         customization = null
         runtimeProfile = null
         setStockWidgetControlActive(false)
@@ -898,21 +758,37 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         setStockWidgetControlActive(false)
         hideSurfaceOnly(pulse = false)
     }
 
     override fun onCustomization(configuration: CompiledCustomization) {
         customization = configuration
+        val receivedAod = configuration.profiles[SceneCompiler.SURFACE_AOD]
+        // 诊断留痕:确认本控制器确实收到了配置以及收到的 aod 档位(与 projection 侧
+        // 「Configuration applied」配对,区分「没收到」与「收到了但渲染读了别的 profile」)。
+        HookLogger.w(
+            TAG,
+            "Customization received: aodAnim=${receivedAod?.animation} " +
+                "aodGlow=${receivedAod?.glow} rtNull=${runtimeProfile == null}"
+        )
+        AodBrightnessController.setBoostEnabled(configuration.aodBrightnessBoost)
+        AodBrightnessController.setBrightnessOverride(
+            configuration.aodBrightnessOverride,
+            configuration.aodBrightnessLevel
+        )
         val retained = retainedMediaSnapshot?.takeIf { snapshot ->
-            !snapshot.pauseRetentionEligible || pauseLingerRemainingMs(
-                snapshot.sampledAtElapsedMs,
-                configuration.pauseLingerMs,
-                SystemClock.elapsedRealtime()
-            ) != null
+            !snapshot.pauseRetentionEligible || configuration.pauseShowContent &&
+                pauseLingerRemainingMs(
+                    snapshot.sampledAtElapsedMs,
+                    configuration.pauseLingerMs,
+                    SystemClock.elapsedRealtime()
+                ) != null
         }
         if (retainedMediaSnapshot != null && retained == null) {
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             latestSnapshot = null
             cancelPauseLingerExpiry()
@@ -953,6 +829,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             SystemClock.elapsedRealtime()
         ) ?: run {
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             latestSnapshot = latestSnapshot?.takeUnless { it === retained }
             setStockWidgetControlActive(false)
@@ -986,10 +863,13 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
 
     private fun detachCurrent() {
         attachmentGeneration++
+        stopRenderStallWatchdog()
+        stopStockSettleWatchdog()
         mainHandler.removeCallbacks(geometryUpdate)
         mainHandler.removeCallbacks(stockMotionSettleTimeout)
         mainHandler.removeCallbacks(managedBurnInStart)
         mainHandler.removeCallbacks(managedBurnInAdvance)
+        cancelPostHandoffDiagnostics()
         cancelPausedKeepAliveExpiry()
         cancelPauseLingerExpiry()
         pendingStockMotionUpdate = null
@@ -997,8 +877,25 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         cancelStockMotionTransition(resetAlpha = false)
         positionUpdates.clear()
         stockWidgetControlActive = false
+        managedPositionUnavailable = false
+        managedPositionRetryCount = 0
+        suppressStockAodContent = false
+        suppressGateActive = false
+        stockClockReserveTop = null
         AodPositionHook.restoreStockTranslation()
         AodPositionHook.abandonManagedSession()
+        AodPositionHook.setSuppressActive(false)
+        AodPositionHook.setHoldStockPosition(false)
+        AodPositionHook.setIntegralClockPin(false)
+        // 不在每次 detach 时清空跨 controller 锚定(issue #36):旋转/LinkageTransition 会
+        // 导致同一 AOD 会话内 surface 高频重建,清锚会让锚点落到已漂移的请求值,
+        // 防下移失效、旋转回竖屏回不到原位。锚定只在 AOD 显示真正关闭后清空
+        // (见 AodPowerCoordinator.onAodDisplayState)。
+        clockPinActive = false
+        AodSurfaceHook.clearSuppressedState()
+        AodOrientationMonitor.detach()
+        AodPowerStateMonitor.detach()
+        currentRotationStep = AodOrientationStep.PORTRAIT
         setDrawWakeRenewalActive(false)
         finishInitialReveal()
         AodPowerCoordinator.onSurfaceDetached()
@@ -1024,6 +921,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         stockMediaPlayerPresent = false
         customization = null
         runtimeProfile = null
@@ -1037,9 +935,12 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         initialRevealDurationMs = 0L
         transitionFailedHidden = false
         lastLayoutBlockTrace = null
+        lastPlacedTrace = null
         lastSnapshotTrace = null
         lastBrightClockMorphPhase = null
         lastClockGeometryAuthority = null
+        lastDrawWakePulseResult = null
+        lastDrawWakeRuntimeClass = ""
         sceneZone = AodSceneZone.STOCK
         controlledClockTop = null
         controlledClockBottom = null
@@ -1056,6 +957,8 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             return
         }
         stockWidgetControlActive = active
+        // 位置决策路由在此切换(managed ↔ 原厂透传),issue #33 建议三:转换必须可见。
+        HookLogger.i(TAG, "Stock widget control active=$active")
         if (active) {
             startManagedBurnInSchedule()
         } else {
@@ -1078,6 +981,136 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         mainHandler.post(managedBurnInStart)
     }
 
+    /** suppress 空场:保留系统时钟占位区,让后续关闭抑制时布局不塌陷。 */
+    private fun holdStockSuppression(snapshot: LyricSnapshot?) {
+        val root = rootRef.get()
+        val physical = selectPhysicalAodClockBounds(systemUiClockBounds, aodControllerClockBounds)
+            ?: AodPositionHook.renderedTargetBoundsInRoot(root ?: return)
+        stockClockReserveTop = physical?.top
+        if (snapshot != null && snapshot.visible) AodPositionHook.setHoldStockPosition(true)
+    }
+
+    private fun applyStockSuppression(suppress: Boolean, snapshot: LyricSnapshot?) {
+        if (suppressGateActive == suppress) {
+            if (suppress) holdStockSuppression(snapshot)
+            return
+        }
+        suppressGateActive = suppress
+        suppressStockAodContent = suppress
+        AodPositionHook.setSuppressActive(suppress)
+        AodSurfaceHook.setSuppressionGate(suppress)
+        if (suppress) {
+            burnInContainerRef.get()?.let(AodSurfaceHook::registerSuppressedRoot)
+            holdStockSuppression(snapshot)
+        } else {
+            AodSurfaceHook.clearSuppressedState()
+            stockClockReserveTop = null
+            AodPositionHook.setHoldStockPosition(false)
+        }
+        HookLogger.i(TAG, "Stock content suppression active=$suppress")
+    }
+
+    /** 是否应抑制系统息屏内容:全局开关 或 (横屏 && 随设备旋转 && 横屏隐藏开关)。 */
+    private fun shouldSuppressStock(snapshot: LyricSnapshot?, renderable: Boolean): Boolean {
+        if (!renderable || snapshot == null) return false
+        return shouldHideStockAodContent(
+            suppressBase = snapshot.suppressStockAodContent,
+            landscapeStep = currentRotationStep != AodOrientationStep.PORTRAIT,
+            rotateWithDevice = snapshot.aodRotateWithDevice,
+            landscapeHideStock = snapshot.aodLandscapeHideStock
+        )
+    }
+
+    private fun onOrientationStepResolved(step: AodOrientationStep) {
+        if (currentRotationStep == step) return
+        currentRotationStep = step
+        lyricCanvas?.setRotationStep(step)
+        // 旋转步进变化会影响「横屏隐藏系统息屏内容」的求值:进横屏时隐藏、回落竖屏时恢复。
+        val latest = latestSnapshot
+        applyStockSuppression(
+            shouldSuppressStock(latest, latest != null && canRenderAod(latest)),
+            latest
+        )
+        requestGeometryUpdate()
+    }
+
+    /** 从快照应用抑制 + 旋转配置;不足一次渲染时两者均关闭。 */
+    private fun applySuppressionAndRotation(snapshot: LyricSnapshot?) {
+        val renderable = snapshot != null && canRenderAod(snapshot)
+        val playbackActive = snapshot?.playbackActive ?: false
+        val suppress = shouldSuppressStock(snapshot, renderable)
+        applyStockSuppression(suppress, snapshot)
+        // 关闭「实时跟随系统时钟」(锚定模式)且模块在渲染 AOD 时,钉住系统时钟位置
+        // (不随防烧屏沉降下移),但保留时钟显示 —— 与「隐藏系统时钟」解耦(issue #26)。
+        // 暂停/没有播放(!playbackActive)时不钉住,让时钟回到系统位置、随防烧屏正常移动。
+        val pinClock = renderable && playbackActive && !currentAodProfile().aodClockFollow
+        // 自定义时钟 Y 偏移仅作用于「钉住」状态:把 App 端滑块值推到 AodPositionHook,
+        // 叠加到被钉住的系统时钟 Y 上;未钉住时清零,确保不施加偏移。
+        AodPositionHook.setClockYOffset(if (pinClock) (customization?.aodClockYOffset ?: 0) else 0)
+        applyClockPin(pinClock)
+        applyRotation(snapshot?.takeIf { renderable })
+    }
+
+    /** 系统时钟 Y 钉住:仅由 [applySuppressionAndRotation] 驱动,带变化检测避免反复调用。 */
+    private fun applyClockPin(active: Boolean) {
+        if (clockPinActive == active) return
+        clockPinActive = active
+        AodPositionHook.setIntegralClockPin(active)
+        HookLogger.i(TAG, "System clock position pin=$active")
+    }
+
+    private fun applyRotation(snapshot: LyricSnapshot?) {
+        val rotate = snapshot?.aodRotateWithDevice == true
+        val mode = snapshot?.aodRotationMode ?: AOD_ROTATION_MODE_PORTRAIT
+        val settle = snapshot?.aodRotationSettleMs ?: 1_000L
+        val anchorLandscape = snapshot?.aodCanvasAnchorLandscape ?: 0.5f
+        val textScale = snapshot?.aodLandscapeTextScale ?: 1f
+        val fullscreen = snapshot?.aodLandscapeFullscreen == true
+        val fullscreenSafeMargin =
+            snapshot?.aodLandscapeFullscreenSafeMarginPercent
+                ?: DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT
+        val debugShowCanvasFrame = snapshot?.aodDebugShowCanvasFrame == true
+        val padPX = snapshot?.aodCanvasPaddingPortraitXPercent ?: DEFAULT_CANVAS_PADDING_PERCENT
+        val padPY = snapshot?.aodCanvasPaddingPortraitYPercent ?: DEFAULT_CANVAS_PADDING_PERCENT
+        val padLX = snapshot?.aodCanvasPaddingLandscapeXPercent ?: DEFAULT_CANVAS_PADDING_PERCENT
+        val padLY = snapshot?.aodCanvasPaddingLandscapeYPercent ?: DEFAULT_CANVAS_PADDING_PERCENT
+        aodRotateWithDevice = rotate
+        aodLandscapeFullscreen = fullscreen
+        aodRotationMode = mode
+        aodRotationSettleMs = settle
+        lyricCanvas?.updateOrientation(
+            rotate = rotate,
+            mode = mode,
+            landscapeTextScale = textScale,
+            landscapeAnchor = anchorLandscape,
+            landscapeFullscreen = fullscreen,
+            debugShowCanvasFrame = debugShowCanvasFrame,
+            paddingPortraitXPercent = padPX,
+            paddingPortraitYPercent = padPY,
+            paddingLandscapeXPercent = padLX,
+            paddingLandscapeYPercent = padLY,
+            landscapeFullscreenSafeMarginPercent = fullscreenSafeMargin
+        )
+        if (rotate && !AodOrientationMonitor.isAttached()) {
+            val context = rootRef.get()?.context
+            if (context != null) {
+                AodOrientationMonitor.attach(context, mode, settle) { step ->
+                    mainHandler.post { onOrientationStepResolved(step) }
+                }
+            }
+        } else if (!rotate) {
+            AodOrientationMonitor.detach()
+            onOrientationStepResolved(AodOrientationStep.PORTRAIT)
+        } else {
+            // 旋转已附着:刷新模式与防抖窗口。
+            AodOrientationMonitor.attach(
+                rootRef.get()?.context ?: return,
+                mode,
+                settle
+            ) { step -> mainHandler.post { onOrientationStepResolved(step) } }
+        }
+    }
+
     private fun updateLifetimeGuard() {
         val snapshot = latestSnapshot
         // The draw-wake renewal pulses mWakeLock on the AOD root to force Xiaomi's doze
@@ -1086,6 +1119,9 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         // capability: that symbol is independent of mWakeLock, and gating on it silently
         // freezes AOD updates on versions where the probe fails. pulseDrawWakeLock is
         // guarded by runCatching, so an absent field fails harmlessly.
+        // 播放态额外取 Lyricon 中心服务的真值:切歌 BUFFERING/位置未知窗口里 app 侧快照会
+        // 短暂报 playbackActive=false(issue #6),若只信快照,续期会在缓冲窗口被关掉且
+        // 没有事件再拉起,直到下次锁屏 attach 才恢复。
         val active = shouldRenewAodDraw(
             surfaceKind = surfaceKind,
             attached = rootRef.get() != null,
@@ -1094,7 +1130,8 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 snapshot != null && canRenderAod(snapshot),
             pendingStockMotion = pendingStockMotionUpdate != null,
             keepAlive = snapshot?.keepAlive == true,
-            playbackActive = snapshot?.playbackActive == true
+            playbackActive = snapshot?.playbackActive == true ||
+                AodWakeBroker.isLyriconPlaybackActive()
         )
         setDrawWakeRenewalActive(active)
     }
@@ -1103,10 +1140,138 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         if (drawWakeRenewalActive == active) return
         drawWakeRenewalActive = active
         mainHandler.removeCallbacks(drawWakeRenewal)
-        HookLogger.i(TAG, "Draw wake renewal active=$active")
+        // 续期被关时带上 alpha 链现场:0.3.83 的祖先 alpha 门控回归靠这行定位。
+        val offContext = if (!active) {
+            val directSurface = surface
+            " effAlpha=${directSurface?.let(::effectiveSurfaceAlpha)}" +
+                " alphaChain=${directSurface?.let(::surfaceAlphaChain)}"
+        } else {
+            ""
+        }
+        HookLogger.i(TAG, "Draw wake renewal active=$active$offContext")
         if (!active) return
         rootRef.get()?.let(::pulseDrawWakeLock)
         mainHandler.postDelayed(drawWakeRenewal, DRAW_WAKE_RENEW_INTERVAL_MS)
+    }
+
+    private fun startStockSettleWatchdog() {
+        stopStockSettleWatchdog()
+        stockSettleCheckIndex = 0
+        scheduleNextStockSettleCheck()
+    }
+
+    private fun stopStockSettleWatchdog() {
+        stockSettleCheckScheduled = false
+        mainHandler.removeCallbacks(stockSettleCheck)
+        stockSettleCheckIndex = 0
+    }
+
+    private fun scheduleNextStockSettleCheck() {
+        if (stockSettleCheckScheduled) return
+        stockSettleCheckScheduled = true
+        val delay = if (stockSettleCheckIndex < stockSettleCheckIntervals.size) {
+            stockSettleCheckIntervals[stockSettleCheckIndex++]
+        } else {
+            STOCK_SETTLE_RETRY_MS
+        }
+        mainHandler.postDelayed(stockSettleCheck, delay)
+    }
+
+    private fun checkStockSettleDrift() {
+        val root = rootRef.get()
+        val directSurface = surface
+        if (root == null || directSurface == null ||
+            directSurface.visibility != View.VISIBLE
+        ) {
+            scheduleNextStockSettleCheck()
+            return
+        }
+        val physical = selectPhysicalAodClockBounds(
+            systemUiClockBounds,
+            aodControllerClockBounds
+        ) ?: AodPositionHook.renderedTargetBoundsInRoot(root)
+        val anchor = clockAnchor
+        if (physical != null && anchor != null &&
+            physical.bottom - anchor.bottom > STOCK_SETTLE_DRIFT_PX
+        ) {
+            // 为防止防烧屏沉降把时钟逐步下拖而 anchor 未及时跟随,这里仅请求一次几何刷新;
+            // anchor 的更新完全交给 stabilizeAodClockAnchor:下行立即硬同步(issue #23 补充),
+            // 因此刷新后 anchor 会立刻吸附到新的 physical 底部,24px 阈值不会再把锚困在旧位。
+            HookLogger.i(
+                TAG,
+                "Stock settle drift detected +${physical.bottom - anchor.bottom}px " +
+                    "anchor=${anchor.top}..${anchor.bottom} " +
+                    "physical=${physical.top}..${physical.bottom}; requesting geometry refresh"
+            )
+            requestGeometryUpdate()
+        }
+        scheduleNextStockSettleCheck()
+    }
+
+    private fun startRenderStallWatchdog() {
+        if (renderStallWatchdogScheduled) return
+        renderStallWatchdogScheduled = true
+        mainHandler.postDelayed(renderStallWatchdog, RENDER_STALL_WATCHDOG_INTERVAL_MS)
+    }
+
+    private fun stopRenderStallWatchdog() {
+        renderStallWatchdogScheduled = false
+        mainHandler.removeCallbacks(renderStallWatchdog)
+    }
+
+    private fun recoverRenderStallIfNeeded() {
+        val root = rootRef.get() ?: return
+        val directSurface = surface ?: return
+        if (!isSceneActive() || !directSurface.isAttachedToWindow) return
+        // 亮屏时 AOD 本来就不呈现,不做任何恢复。
+        if (root.display?.state == android.view.Display.STATE_ON) return
+        val snapshot = latestSnapshot ?: return
+        if (!canRenderAod(snapshot)) return
+        val playbackLive = snapshot.playbackActive || snapshot.keepAlive ||
+            AodWakeBroker.isLyriconPlaybackActive()
+        if (!playbackLive) return
+        val now = SystemClock.elapsedRealtime()
+        // 恢复 1:续期掉线。过渡/缓冲窗口把 renewal 关掉后,若期间没有新的快照/心跳
+        // 事件到达,updateLifetimeGuard 不会再被调用——看门狗直接补一次评估和脉冲。
+        if (!drawWakeRenewalActive) {
+            HookLogger.i(
+                TAG,
+                "Render stall watchdog: draw renewal inactive while playing; re-arming rev=${snapshot.revision}"
+            )
+            updateLifetimeGuard()
+            if (!drawWakeRenewalActive) pulseDrawWakeLock(root)
+        }
+        // 恢复 2:行级时间轴内容在播放中本应持续重绘,但画布长时间没有 onDraw——
+        // 强制重放当前快照,走完整 setContent/syncCadence 路径重启画布节律。
+        val lastDrawAt = lyricCanvas?.lastDrawAtElapsedMs() ?: 0L
+        if (lyricCanvas?.isTimingEffectActive() == true && lastDrawAt > 0L &&
+            now - lastDrawAt > RENDER_STALL_THRESHOLD_MS
+        ) {
+            HookLogger.i(
+                TAG,
+                "Render stall watchdog: canvas stalled for ${now - lastDrawAt}ms; " +
+                    "replaying snapshot rev=${snapshot.revision}"
+            )
+            lastRenderContent = null
+            onLyricSnapshot(snapshot)
+            rootRef.get()?.let(::pulseDrawWakeLock)
+            return
+        }
+        // 恢复 3:投影缓存里已有更新的可见快照却没被本 surface 应用(应用链路在过渡窗口
+        // 停摆)——重放投影最新可见快照,不等下一次 attach。
+        val cachedVisible = SystemUiLyricProjectionRuntime.projection.cachedVisibleSnapshot()
+        if (cachedVisible != null && cachedVisible.visible &&
+            cachedVisible.revision > snapshot.revision
+        ) {
+            HookLogger.i(
+                TAG,
+                "Render stall watchdog: projection ahead " +
+                    "rev=${cachedVisible.revision}>${snapshot.revision}; replaying"
+            )
+            lastRenderContent = null
+            onLyricSnapshot(cachedVisible)
+            rootRef.get()?.let(::pulseDrawWakeLock)
+        }
     }
 
     private fun startInitialReveal(directSurface: View, durationMs: Long) {
@@ -1145,7 +1310,25 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
-                lyricCanvas = AodLyricCanvasView(context, useDozeHandlerCadence = true).also {
+                // 省电降帧是纯优化,attach 失败不得中断 surface 构建(真机 NPE 曾致 AOD 整段空白):
+                // 后果只是降帧失效,由 isPowerSaverActive() 恒 false 兜底。
+                // 降帧还受用户开关(CompiledCustomization.aodPowerSaver,缺省开启)门控:
+                // 关闭时总闸恒 false,画布始终按帧上限渲染。
+                runCatching { AodPowerStateMonitor.attach(context) }
+                    .onFailure {
+                        HookLogger.w(TAG, "Power state monitor attach failed; saver disabled", it)
+                    }
+                lyricCanvas = AodLyricCanvasView(
+                    context,
+                    useDozeHandlerCadence = true,
+                    powerSaverProvider = {
+                        isAodPowerSaverEffective(
+                            customization?.aodPowerSaver,
+                            AodPowerStateMonitor.isPowerSaverActive()
+                        )
+                    },
+                    refreshRateCapProvider = { customization?.aodRefreshRateCap ?: 0 }
+                ).also {
                     it.layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -1167,7 +1350,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
 
     private fun layoutSurface(
         root: ViewGroup,
-        burnInContainer: FrameLayout,
+        burnInContainer: ViewGroup,
         directSurface: View
     ): Boolean {
         if (!hasUsableAodRootSize(root.width, root.height)) {
@@ -1199,14 +1382,21 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             systemUiClockBounds,
             aodControllerClockBounds
         )
+        val nowElapsedMs = SystemClock.elapsedRealtime()
         if (physicalClockBounds != null && root.height > 0) {
             rememberedPhysicalClockBounds = physicalClockBounds
             rememberedPhysicalClockRootHeight = root.height
+            rememberedPhysicalClockBoundsSinceElapsedMs = nowElapsedMs
         }
-        // A remembered measurement only describes this layout. A different root height means a
-        // different display or configuration, and the old bounds say nothing about it.
+        // A remembered measurement only describes this layout and only for a short time. The
+        // physical clock cannot be read while the panel is dark, but a stale raw sample (e.g. from
+        // one transiently wrong probe) must not keep being reused as "fresh" evidence during later
+        // read gaps — that is what locked the lyrics low in #38.
         val rememberedBounds = rememberedPhysicalClockBounds
             ?.takeIf { rememberedPhysicalClockRootHeight == root.height }
+            ?.takeIf {
+                nowElapsedMs - rememberedPhysicalClockBoundsSinceElapsedMs <= REMEMBERED_CLOCK_MAX_AGE_MS
+            }
         val rawClockBounds = if (brightLinkage && physicalClockBounds == null) {
             brightLinkageClockBounds(root.height)
         } else {
@@ -1223,13 +1413,28 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         // Stabilize against fast clock-bound oscillation (e.g. the media header toggling the AOD
         // layout). The anchor holds the outer clock extent so the lyric placement below/above the
         // clock no longer jumps; it only relocates on a genuinely sustained move.
-        val anchor = stabilizeAodClockAnchor(
-            clockAnchor,
-            rawClockBounds,
-            SystemClock.elapsedRealtime()
-        )
-        clockAnchor = anchor
-        val effectiveClockBounds = AodRenderedClockBounds(anchor.top, anchor.bottom)
+        //
+        // "aodClockFollow" (实时时钟跟随) 开启时,直接采用本次实际测得的时钟位置(rawClockBounds),
+        // 跳过锚定防抖,让歌词布局立即跟上系统时钟的真实移动(不因长锚定而滞后错位)。
+        //
+        // 锚定模式:物理读数缺失是**瞬时缺口**,不是时钟真的移动了。此时沿用已锚定的稳定位置,
+        // 不再用 (可能是过期的) remembered 值去喂锚定器——否则 stale 的低位值会被当成"下行"硬
+        // 同步进锚、把歌词压到低位,且真实位置上行恢复又被 40s 防抖压住,长期锁死(#38)。
+        val aodClockFollow = currentAodProfile().aodClockFollow
+        val effectiveClockBounds = if (aodClockFollow) {
+            rawClockBounds
+        } else {
+            val anchor = resolveAnchoredAodClockBounds(
+                hasFreshPhysical = physicalClockBounds != null,
+                previousAnchor = clockAnchor,
+                rawClockBounds = rawClockBounds,
+                nowElapsedMs = nowElapsedMs,
+                seedSinceElapsedMs = droppedAnchorHoldSinceMs ?: -1L
+            )
+            droppedAnchorHoldSinceMs = null
+            clockAnchor = anchor
+            AodRenderedClockBounds(anchor.top, anchor.bottom)
+        }
         val effectiveClockTop = effectiveClockBounds.top
         val effectiveClockBottom = effectiveClockBounds.bottom
         val clockGeometryAuthority = when {
@@ -1255,7 +1460,8 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 AodSceneZone.CLOCK_TOP,
                 effectiveClockBounds,
                 root.height,
-                margin
+                margin,
+                (root.height * AOD_ZONE_FLIP_HYSTERESIS_FRACTION).toInt()
             )
         } else if (controlledClockTop != null && controlledClockBottom != null &&
             sceneZone != AodSceneZone.STOCK
@@ -1266,25 +1472,58 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 sceneZone,
                 effectiveClockBounds,
                 root.height,
-                margin
+                margin,
+                (root.height * AOD_ZONE_FLIP_HYSTERESIS_FRACTION).toInt()
             )
         }
         val profile = currentAodProfile()
-        android.util.Log.d(
-            "AODMetadata",
-            "layoutSurface compiled.enabled=${profile.enabled} " +
-                "metadataVisible=${profile.metadataVisible} " +
-                "widgets=${profile.widgets.map { it.type }} " +
-                "runtime=${runtimeProfile?.metadataVisible}"
-        )
-        val metadataHeight = if (profile.metadataVisible &&
-            profile.widgets.any { it.type == "metadata" }
+        // 横屏全屏激活时,placement 借用「自定义位置」的整屏自由几何路径并居中,使画布 rect 覆盖
+        // 整屏(不再受 maxHeightFraction 限制),内容在画布内经旋转+自适应缩放铺满(issue #49)。
+        // 仅影响 placement rect;渲染内容继续用用户原始 profile,竖屏/普通横屏行为不变。
+        val fullscreenPlacement =
+            aodRotateWithDevice &&
+            currentRotationStep != AodOrientationStep.PORTRAIT &&
+            aodLandscapeFullscreen
+        val layoutProfile = if (fullscreenPlacement) {
+            profile.copy(
+                maxHeightFraction = 1f,
+                anchor = "custom_vertical_bias",
+                verticalBias = 0.5f
+            )
+        } else {
+            profile
+        }
+        val metadataHeight = if (layoutProfile.metadataVisible &&
+            layoutProfile.widgets.any { it.type == "metadata" }
         ) {
-            metadataWidgetHeightDp(profile.metadataSizePercent) * density
+            // 歌曲信息内容(per-surface):高度预算按本面 profile 的 parts/separators 推导,
+            // 与画布按面组装的口径一致(改一面不再影响另一面的布局预算)。
+            val extraLines = metadataExpectedExtraLines(
+                layoutProfile.metadataParts,
+                layoutProfile.metadataSeparators
+            )
+            // 歌曲图片槽边长(dp):关闭自适应时取固定自定义边长,静态高度预算需按图片入账,
+            // 否则大尺寸图片会被元数据组件裁切。
+            val artworkHeightDp = if (layoutProfile.artworkVisible) {
+                artworkSideDp(
+                    layoutProfile.metadataSizePercent,
+                    root.resources.displayMetrics.scaledDensity /
+                        density.coerceAtLeast(0.1f),
+                    layoutProfile.artworkAdaptiveScale,
+                    layoutProfile.artworkSizeDp
+                )
+            } else {
+                0f
+            }
+            metadataWidgetHeightDp(
+                layoutProfile.metadataSizePercent,
+                extraLines,
+                artworkHeightDp
+            ) * density
         } else {
             0f
         }
-        val desiredHeight = root.height * profile.maxHeightFraction
+        val desiredHeight = root.height * layoutProfile.maxHeightFraction
         val measurements = profile.widgets.mapNotNull { widget ->
             when (widget.type) {
                 "lyrics" -> WidgetMeasurement(
@@ -1297,7 +1536,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         }
         // The custom bias anchor is user-controlled and should roam the entire screen Y range,
         // including above the stock clock and mid-screen, so give it a full-screen canvas.
-        val safeCanvas = if (profile.anchor == "custom_vertical_bias") {
+        val safeCanvas = if (layoutProfile.anchor == "custom_vertical_bias") {
             PlacementRect(0f, 0f, root.width.toFloat(), root.height.toFloat())
         } else {
             aodSceneSafeCanvas(
@@ -1310,9 +1549,9 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             )
         }
         val placement = PlacementEngine.resolve(
-            profile.copy(
+            layoutProfile.copy(
                 maxHeightFraction = aodPlacementMaxHeightFraction(
-                    profile.maxHeightFraction,
+                    layoutProfile.maxHeightFraction,
                     layoutZone
                 )
             ),
@@ -1346,7 +1585,10 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                 latestSnapshot?.takeIf {
                     !it.metadata.startsWith("AOD DEMO")
                 }?.let {
-                    lyricCanvas?.setContent(it.toAodCanvasContent(nextRuntimeProfile))
+                    logRenderProfileProbe("layout-replay", it, nextRuntimeProfile)
+                    lyricCanvas?.setContent(
+                        it.toAodCanvasContent(nextRuntimeProfile, duet = true)
+                    )
                     lastRenderContent = it.renderContent()
                 }
             }
@@ -1355,12 +1597,36 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         val placedWidth = placed?.width?.roundToInt() ?: 0
         val maxLeft = (root.width - placedWidth).coerceAtLeast(0)
         val shiftedLeft = ((placed?.left?.roundToInt() ?: 0) + horizontalShift).coerceIn(0, maxLeft)
-        val rect = AodSurfaceRect(
+        val placedRect = AodSurfaceRect(
             shiftedLeft,
             placed?.top?.roundToInt() ?: 0,
             shiftedLeft + placedWidth,
             placed?.bottom?.roundToInt() ?: 0
         )
+        // 横屏(非全屏):交换画布 rect 宽高,使横持视角下的画布呈横宽形(否则旋转 90° 后
+        // 用户看到的画布仍沿竖屏放置的「宽>高」变成「高>宽」,长宽没有交换)。交换先于
+        // 时钟避让,让交换后更高的 rect 仍能被整体下推出时钟区;全屏横屏已是整屏画布,无需交换。
+        val landscapeRectSwap =
+            aodRotateWithDevice &&
+                currentRotationStep != AodOrientationStep.PORTRAIT &&
+                !fullscreenPlacement
+        val orientedRect = if (landscapeRectSwap) {
+            swapAodSurfaceRectForLandscape(placedRect, root.width, root.height)
+        } else {
+            placedRect
+        }
+        // 自定义位置由用户通过 verticalBias 主动设定(全屏画布)。此模式下歌词应无视系统时钟的
+        // 下移,固定在用户选择的位置,不做硬避让("自定义位置"即用户已按自身喜好摆放)。
+        val rect = if (profile.anchor == "custom_vertical_bias") {
+            orientedRect
+        } else {
+            avoidStockClockOverlap(
+                orientedRect,
+                physicalClockBounds,
+                margin,
+                root.height
+            )
+        }
         if (rect.width <= 0 || rect.height <= 0) {
             failClosedLayout(
                 directSurface,
@@ -1381,6 +1647,14 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
             View.MeasureSpec.makeMeasureSpec(rect.height, View.MeasureSpec.EXACTLY)
         )
         directSurface.layout(rect.left, rect.top, rect.right, rect.bottom)
+        val placedTrace = "rect=${rect.left}..${rect.bottom} " +
+            "stock=$effectiveClockTop..$effectiveClockBottom zone=$layoutZone " +
+            "rot=$currentRotationStep fs=$fullscreenPlacement " +
+            "w=${rect.width} h=${rect.height} mhf=${layoutProfile.maxHeightFraction}"
+        if (placedTrace != lastPlacedTrace) {
+            lastPlacedTrace = placedTrace
+            HookLogger.i(TAG, "Lyric surface placed $placedTrace")
+        }
         if (stockMotionRevealPending) {
             stockMotionRevealPending = false
             directSurface.alpha = 0f
@@ -1399,7 +1673,10 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         if (visible && !snapshot.metadata.startsWith("AOD DEMO") &&
             lyricCanvas?.visibility != View.VISIBLE
         ) {
-            lyricCanvas?.setContent(snapshot.toAodCanvasContent(effectiveAodProfile()))
+            logRenderProfileProbe("reveal", snapshot, effectiveAodProfile())
+            lyricCanvas?.setContent(
+                    snapshot.toAodCanvasContent(effectiveAodProfile(), duet = true)
+                )
             lyricCanvas?.visibility = View.VISIBLE
         }
         if (visible && initialRevealPending && !handoffActive) {
@@ -1416,6 +1693,33 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         updateLifetimeGuard()
         if (visible) LinkageTransitionCoordinator.onSurfaceReady(LyricSurfaceKind.AOD)
         return true
+    }
+
+    /**
+     * Guards against the stock AOD clock drifting over the lyric surface. MIUI translates the
+     * clock to a rotating burn-in position roughly 10s after AOD entry; when the follow-up
+     * chain misses that move the lyric rect ends up underneath the clock. If the rect overlaps
+     * the physically measured clock bounds, relocate it below the clock when there is room.
+     */
+    private fun avoidStockClockOverlap(
+        rect: AodSurfaceRect,
+        physicalClockBounds: AodRenderedClockBounds?,
+        margin: Int,
+        rootHeight: Int
+    ): AodSurfaceRect {
+        val clock = physicalClockBounds ?: return rect
+        if (clock.height <= 0) return rect
+        val overlaps = rect.top < clock.bottom && rect.bottom > clock.top
+        if (!overlaps) return rect
+        val belowTop = clock.bottom + margin
+        val height = rect.height
+        if (belowTop + height > rootHeight - margin) return rect
+        HookLogger.i(
+            TAG,
+            "Stock clock overlap avoided: clock=${clock.top}..${clock.bottom} " +
+                "lyric=${rect.top}..${rect.bottom} -> below@$belowTop"
+        )
+        return AodSurfaceRect(rect.left, belowTop, rect.right, belowTop + height)
     }
 
     private fun renderedStockClockBounds(
@@ -1551,12 +1855,14 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     }
 
     override fun setHandoffActive(active: Boolean) {
+        val wasActive = handoffActive
         handoffActive = active
         if (active) {
             initialRevealPending = false
             finishInitialReveal()
         }
         lyricCanvas?.setHandoffActive(active)
+        if (wasActive && !active && isSceneActive()) schedulePostHandoffDiagnostics()
     }
 
     override fun animateFrom(
@@ -1604,6 +1910,26 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
 
     private fun effectiveAodProfile(): CompiledSurfaceProfile =
         runtimeProfile ?: currentAodProfile()
+
+    private var lastRenderProbeKey = ""
+
+    /**
+     * 诊断探针(配置下发排查):渲染时实际读到的 profile 档位与快照自带档位。
+     * 只在值变化时留痕,与快照侧 `AodProjectionProbe`、画布侧 `Render mode` 日志配对,
+     * 定位「配置已 applied 但画布仍渲染旧档」断点在哪一跳。
+     */
+    private fun logRenderProfileProbe(
+        source: String,
+        snapshot: LyricSnapshot,
+        profile: CompiledSurfaceProfile
+    ) {
+        val key = "$source custNull=${customization == null} rtNull=${runtimeProfile == null} " +
+            "profileAnim=${profile.animation} profileGlow=${profile.glow} " +
+            "snapAnim=${snapshot.animationMode} snapGlow=${snapshot.glowMode}"
+        if (key == lastRenderProbeKey) return
+        lastRenderProbeKey = key
+        HookLogger.w(TAG, "Render profile probe: $key")
+    }
 
     private fun canRenderAod(snapshot: LyricSnapshot): Boolean =
         XiaomiCapabilityResolver.hasCapability(XiaomiCapability.AOD_SURFACE) &&
@@ -1669,26 +1995,31 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
         if (shouldSchedule) mainHandler.post(geometryUpdate)
     }
 
-    private fun findBurnInContainer(root: ViewGroup): FrameLayout? {
+    private fun findBurnInContainer(root: ViewGroup): ViewGroup? {
         // Walk the class hierarchy: the field may be declared on AODView or a superclass,
-        // and HyperOS may have renamed it. Try the canonical name first.
+        // and HyperOS may have renamed it. Try the canonical name first. HyperOS 3 declares
+        // the field as plain android.view.View — the runtime instance is still the clock
+        // container, so accept any ViewGroup (the surface attaches to root.overlay; the
+        // container is only measured and observed).
         var klass: Class<*>? = root.javaClass
         while (klass != null && klass != Any::class.java) {
+            val current = klass
             runCatching {
-                klass!!.getDeclaredField("mTableModeContainer").apply { isAccessible = true }
-                    .get(root) as? FrameLayout
+                current.getDeclaredField("mTableModeContainer").apply { isAccessible = true }
+                    .get(root) as? ViewGroup
             }.getOrNull()?.let { return it }
-            klass = klass!!.superclass
+            klass = current.superclass
         }
-        // Type-based fallback: find the first FrameLayout-typed declared field that holds
+        // Type-based fallback: find the first ViewGroup-typed declared field that holds
         // a non-null value. Catches HyperOS renames where the type is preserved.
         klass = root.javaClass
         while (klass != null && klass != Any::class.java) {
+            val current = klass
             runCatching {
-                for (field in klass!!.declaredFields) {
-                    if (!FrameLayout::class.java.isAssignableFrom(field.type)) continue
+                for (field in current.declaredFields) {
+                    if (!ViewGroup::class.java.isAssignableFrom(field.type)) continue
                     field.isAccessible = true
-                    val value = field.get(root) as? FrameLayout
+                    val value = field.get(root) as? ViewGroup
                     if (value != null) {
                         HookLogger.i(
                             TAG,
@@ -1698,7 +2029,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
                     }
                 }
             }
-            klass = klass!!.superclass
+            klass = current.superclass
         }
         // Last resort: AODView typically extends FrameLayout. Use root itself so the
         // surface can still render; clock geometry falls back to measured bounds.
@@ -1739,7 +2070,39 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private fun isSurfaceRenderActive(): Boolean {
         val directSurface = surface ?: return false
         if (!directSurface.isAttachedToWindow || directSurface.visibility != View.VISIBLE) return false
-        return lyricCanvas?.visibility == View.VISIBLE || spicyAnimationView?.visibility == View.VISIBLE
+        if (lyricCanvas?.visibility != View.VISIBLE && spicyAnimationView?.visibility != View.VISIBLE) {
+            return false
+        }
+        // Xiaomi can hide the whole AODView by ancestor alpha while our child stays VISIBLE.
+        // Keep linkage handoff exception: transition alpha is intentionally zero during morph.
+        // 只有 alpha 乘积恰为 0 才算隐藏;doze 期间的正常压暗/淡出(0 < a < 1)仍需
+        // draw-wake 脉冲,否则 AodPositionHook 应用的时钟位移不会被合成渲染,
+        // 表现为 AOD 位置固定失效(0.3.83 回归)。
+        return handoffActive || effectiveSurfaceAlpha(directSurface) > 0f
+    }
+
+    private fun effectiveSurfaceAlpha(view: View): Float {
+        var value = view.alpha * view.transitionAlpha
+        var ancestor = view.parent as? View
+        var depth = 0
+        while (ancestor != null && depth++ < MAX_ALPHA_CHAIN_DEPTH) {
+            value *= ancestor.alpha * ancestor.transitionAlpha
+            if (value == 0f) return value
+            ancestor = ancestor.parent as? View
+        }
+        return value
+    }
+
+    private fun surfaceAlphaChain(view: View): String {
+        val parts = ArrayList<String>(MAX_ALPHA_CHAIN_DEPTH + 1)
+        var current: View? = view
+        var depth = 0
+        while (current != null && depth++ < MAX_ALPHA_CHAIN_DEPTH) {
+            parts += "${current.javaClass.simpleName}:${current.visibility}:${current.alpha}/${current.transitionAlpha}"
+            current = current.parent as? View
+        }
+        if (current != null) parts += "…"
+        return parts.joinToString(">")
     }
 
     private fun requestWakeIfAllowed(root: ViewGroup, directSurface: View, wakeRequired: Boolean) {
@@ -1753,13 +2116,89 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     }
 
     private fun pulseDrawWakeLock(root: ViewGroup) {
-        runCatching {
-            val wakeLock = readHierarchyField(root, "mWakeLock") ?: return
+        val wakeLock = readHierarchyField(root, "mWakeLock")
+        if (wakeLock == null) {
+            reportDrawWakePulse(AodDrawWakePulseResult.MISSING_WAKE_LOCK, "")
+            return
+        }
+        val runtimeClass = wakeLock.javaClass.name
+        val setMaximum = runCatching {
             wakeLock.javaClass.getMethod("setMaxAcquireTime", Long::class.javaPrimitiveType)
-                .invoke(wakeLock, DRAW_WAKE_LOCK_MS)
+        }.getOrNull()
+        val acquire = runCatching {
             wakeLock.javaClass.getMethod("acquire", String::class.java)
-                .invoke(wakeLock, "HyperGlowUpdate")
-        }.onFailure { HookLogger.w(TAG, "Draw pulse failed", it) }
+        }.getOrNull()
+        if (setMaximum == null || acquire == null) {
+            reportDrawWakePulse(AodDrawWakePulseResult.MISSING_METHOD, runtimeClass)
+            return
+        }
+        try {
+            setMaximum.invoke(wakeLock, DRAW_WAKE_LOCK_MS)
+            acquire.invoke(wakeLock, "HyperGlowUpdate")
+            reportDrawWakePulse(AodDrawWakePulseResult.SUCCESS, runtimeClass)
+        } catch (error: Exception) {
+            reportDrawWakePulse(AodDrawWakePulseResult.INVOCATION_FAILED, runtimeClass, error)
+        }
+    }
+
+    private fun reportDrawWakePulse(
+        result: AodDrawWakePulseResult,
+        runtimeClass: String,
+        error: Exception? = null
+    ) {
+        if (!shouldLogDrawWakePulseResult(lastDrawWakePulseResult, result) &&
+            runtimeClass == lastDrawWakeRuntimeClass
+        ) return
+        lastDrawWakePulseResult = result
+        lastDrawWakeRuntimeClass = runtimeClass
+        val message = "Draw wake pulse result=${result.name.lowercase()} " +
+            "class=${runtimeClass.ifEmpty { "none" }}"
+        if (result == AodDrawWakePulseResult.SUCCESS) HookLogger.i(TAG, message)
+        else HookLogger.w(TAG, message, error)
+    }
+
+    private fun schedulePostHandoffDiagnostics() {
+        postHandoffDiagnosticGeneration++
+        postHandoffEarlyGeneration = postHandoffDiagnosticGeneration
+        postHandoffLateGeneration = postHandoffDiagnosticGeneration
+        mainHandler.removeCallbacks(postHandoffDiagnosticEarly)
+        mainHandler.removeCallbacks(postHandoffDiagnosticLate)
+        mainHandler.postDelayed(postHandoffDiagnosticEarly, POST_HANDOFF_EARLY_MS)
+        mainHandler.postDelayed(postHandoffDiagnosticLate, POST_HANDOFF_LATE_MS)
+    }
+
+    private fun cancelPostHandoffDiagnostics() {
+        postHandoffDiagnosticGeneration++
+        postHandoffEarlyGeneration = -1L
+        postHandoffLateGeneration = -1L
+        mainHandler.removeCallbacks(postHandoffDiagnosticEarly)
+        mainHandler.removeCallbacks(postHandoffDiagnosticLate)
+    }
+
+    /**
+     * handoff(AOD→锁屏联动)结束瞬间是竞态高发点:锁屏侧接管、小米收表面、draw wake
+     * 续期三件事在此交汇。+1s/+7s 两次快照把可见性、alpha 链、几何与 wake 结局一行
+     * 打齐;generation 匹配保证只记录最近一次 handoff 的结论。
+     */
+    private fun logPostHandoffSurfaceState(label: String, generation: Long) {
+        if (!HookLogger.traceEnabled || generation != postHandoffDiagnosticGeneration) return
+        val root = rootRef.get()
+        val directSurface = surface
+        val canvas = lyricCanvas
+        HookLogger.i(
+            TAG,
+            "Post-handoff $label role=$sceneRole handoff=$handoffActive " +
+                "display=${root?.display?.state ?: -1} " +
+                "root=${root?.width}x${root?.height} attached=${directSurface?.isAttachedToWindow} " +
+                "surface=${directSurface?.visibility} alpha=${directSurface?.alpha}/" +
+                "${directSurface?.transitionAlpha} rect=${directSurface?.left},${directSurface?.top}.." +
+                "${directSurface?.right},${directSurface?.bottom} scale=${directSurface?.scaleX}/" +
+                "${directSurface?.scaleY} translation=${directSurface?.translationX}/" +
+                "${directSurface?.translationY} canvas=${canvas?.visibility} " +
+                "effAlpha=${directSurface?.let(::effectiveSurfaceAlpha)} " +
+                "alphaChain=${directSurface?.let(::surfaceAlphaChain)} " +
+                "render=${latestSnapshot?.let(::canRenderAod)} wake=$lastDrawWakePulseResult"
+        )
     }
 
     private fun wakeAodSurface(root: ViewGroup, directSurface: View) {
@@ -1774,6 +2213,12 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
 
     private const val DRAW_WAKE_LOCK_MS = 5_500L
     private const val DRAW_WAKE_RENEW_INTERVAL_MS = DRAW_WAKE_LOCK_MS / 2L
+    /** 渲染停摆看门狗自检周期:足够频繁以在 stale 窗口内恢复,又不会喧宾夺主。 */
+    private const val RENDER_STALL_WATCHDOG_INTERVAL_MS = 5_000L
+    private const val POST_HANDOFF_EARLY_MS = 1_000L
+    private const val POST_HANDOFF_LATE_MS = 7_000L
+    /** 行级时间轴内容播放中超过该时长没有 onDraw 即视为画布停摆。 */
+    private const val RENDER_STALL_THRESHOLD_MS = 8_000L
     private const val AOD_ANIMATION_FRAME_MS = 16L
     private const val SURFACE_MARGIN_DP = 12f
     private const val MIN_LYRIC_HEIGHT_DP = 96f
@@ -1781,6 +2226,7 @@ internal object AodSurfaceController : SystemUiLyricSubscriber, LinkageSurface {
     private const val STOCK_MOTION_FADE_OUT_MS = 150L
     private const val STOCK_MOTION_FADE_IN_MS = 180L
     private const val MIN_RENDERED_CLOCK_ALPHA = 0.02f
+    private const val MAX_ALPHA_CHAIN_DEPTH = 6
     private const val MANAGED_BURN_IN_RETRY_MS = 1_000L
     private const val MAX_MANAGED_POSITION_RETRIES = 5
     private val DEFAULT_AOD_PROFILE = SceneCompiler.compile(SceneCompiler.safeDefaultDocument())

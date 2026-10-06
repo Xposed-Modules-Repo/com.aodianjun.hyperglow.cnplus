@@ -3,11 +3,15 @@ package com.eza.hyperglow.root.aod
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.HookRegistry
 import com.eza.hyperglow.root.hierarchyField
 import com.eza.hyperglow.root.readHierarchyField
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
@@ -15,15 +19,133 @@ import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
 
-internal object AodPositionHook {
-    private data class ControllerState(
-        var lastStockTranslationX: Int? = null,
-        var lastStockTranslationY: Float? = null,
-        var managedStep: Int = -1,
-        var currentManagedDecision: AodClockPlacementDecision? = null,
-        var pendingManagedDecision: AodClockPlacementDecision? = null
-    )
+internal data class ControllerState(
+    var lastStockTranslationX: Int? = null,
+    var lastStockTranslationY: Float? = null,
+    var managedStep: Int = -1,
+    var currentManagedDecision: AodClockPlacementDecision? = null,
+    var pendingManagedDecision: AodClockPlacementDecision? = null
+)
 
+/**
+ * controller 更替重建时的新状态播种:继承跨 controller 生命周期的时钟锚定
+ * (issue #33);无继承值时锚定字段留空,由 stockResolution 经 resolveStockAnchorSeed
+ * 按几何就绪情况播种(几何未就绪时保持留空、本帧透传,绝不用请求值兜底,issue #66)。
+ */
+internal fun seedControllerState(inheritedX: Int?, inheritedY: Float?): ControllerState =
+    ControllerState(lastStockTranslationX = inheritedX, lastStockTranslationY = inheritedY)
+
+/**
+ * 位置决策路由(纯函数,锁定优先级契约):suppressStockAodContent > 时钟钉住
+ * (pinClockVisible,issue #26/#33)> managed 防烧屏位移。返回 true 走 managed
+ * 位移;false 走原厂透传(freeze 由调用方按 pin/hold 决定)。
+ */
+internal fun routesToManagedPath(
+    suppressActive: Boolean,
+    stockWidgetControlActive: Boolean,
+    pinClockVisible: Boolean
+): Boolean = !suppressActive && stockWidgetControlActive && !pinClockVisible
+
+/** 冻结时的钉住 Y:锚定值 + 一次性用户偏移(锚定基准不逐帧累积);未冻结原样透传。 */
+internal fun pinnedClockAppliedY(
+    anchorY: Float,
+    offsetPx: Int,
+    freeze: Boolean,
+    requestedY: Float
+): Float = if (freeze) anchorY + offsetPx else requestedY
+
+/**
+ * 由系统防烧屏计数器(mAodMoveCurrent)推出垂直步进,公式与 naturalAodTranslation /
+ * AODUpdatePositionController 的 f = mTranslationYStep*vstep - mViewTop + mTranslationY
+ * 严格一致:mode0 在 3 列网格里 verticalStep=halfStep/3,mode2/3 纯垂直 verticalStep=halfStep,
+ * 其余 mode 不参与垂直位移返回 0。
+ */
+internal fun burnInVerticalStep(mode: Int, moveCurrent: Int): Int {
+    val halfStep = moveCurrent / 2
+    return when (mode) {
+        0 -> halfStep / 3
+        2, 3 -> halfStep
+        else -> 0
+    }
+}
+
+internal enum class StockAnchorSeedSource { INHERITED, NATURAL_BASELINE }
+
+internal data class StockAnchorSeed(
+    val anchorY: Float?,
+    val source: StockAnchorSeedSource?
+)
+
+/**
+ * 锚点播种决策(纯函数,issue #66 根因二):
+ * - 已有锚定值 → 原样继承(同一 AOD 会话内重建不重置,issue #36);
+ * - 无锚定值且几何就绪 → 未位移基准 baseTranslationY - viewTop,即系统 step=0 时的
+ *   f(与 naturalAodTranslation(moveCurrent=0) 同值,但不依赖 mode 白名单——步进项为 0
+ *   时 y 与 mode 无关);
+ * - 几何未就绪(AOD 刚进入字段未初始化:step<=0 / viewHeight<=0 / 非有限)→ anchorY=null,
+ *   调用方本帧透传且不播种。绝不用已位移的 requestedY 充当锚点——它会被
+ *   lastStockTranslationY 固化并被后续帧永久继承,「钉住生效却钉在下移后的位置」。
+ */
+internal fun resolveStockAnchorSeed(
+    seededY: Float?,
+    geometry: AodClockGeometry
+): StockAnchorSeed {
+    if (seededY != null) return StockAnchorSeed(seededY, StockAnchorSeedSource.INHERITED)
+    val geometryReady = geometry.baseTranslationY.isFinite() &&
+        geometry.translationYStep.isFinite() &&
+        geometry.translationYStep > 0f &&
+        geometry.viewHeight > 0
+    if (!geometryReady) return StockAnchorSeed(null, null)
+    return StockAnchorSeed(
+        geometry.baseTranslationY - geometry.viewTop,
+        StockAnchorSeedSource.NATURAL_BASELINE
+    )
+}
+
+/**
+ * 是否需要把实际渲染视图(targetView.translationY)强制钉到决策的应用 Y。
+ *
+ * issue #39:锚定/冻结场景下 `updateTranslation` 的入参替换疑似不被效果层采纳,
+ * 系统时钟仍随防烧屏在往复区间自由移动,导致 appliedY 已算出但渲染位置不跟随。
+ * 仅当 STOCK 时钟被钉住(Y 被改写成非请求值)时才做强制写回——managed 位移与普通
+ * 透传(applied==requested)不触碰,避免干扰已有稳定行为。X 恒透传,无需写回。
+ */
+internal fun needsClockYWriteback(decision: AodClockPlacementDecision): Boolean =
+    decision.zone == AodSceneZone.STOCK &&
+        decision.appliedTranslationY != decision.requestedTranslationY
+
+/**
+ * 系统时钟 STOCK 直通决策(纯函数,锁定 issue #39 契约)。
+ *
+ * [requestedY] 是本帧系统请求的防烧屏漂移值,[appliedY] 是经 [pinnedClockAppliedY]
+ * 钉住后实际下发的值,二者必须分别落到 decision 的 requested/applied 字段。此前把
+ * appliedY 同时写进两个字段,使 [needsClockYWriteback] 恒为 false,冻结时渲染层写回
+ * (`pinRenderedClockY`)永不触发——appliedY 虽已算出,效果层仍随防烧屏自由移动(issue #39)。
+ * 未冻结时 appliedY == requestedY,行为不变。
+ */
+internal fun stockClockDecision(
+    requestedX: Int,
+    requestedY: Float,
+    appliedY: Float,
+    geometry: AodClockGeometry,
+    zoneChanged: Boolean
+): AodClockPlacementDecision {
+    val top = (appliedY + geometry.viewTop).toInt()
+    return AodClockPlacementDecision(
+        requestedTranslationX = requestedX,
+        requestedTranslationY = requestedY,
+        appliedTranslationX = requestedX,
+        appliedTranslationY = appliedY,
+        clockTop = top,
+        clockBottom = top + geometry.viewHeight,
+        lyricTopSafe = top.coerceAtLeast(0),
+        zone = AodSceneZone.STOCK,
+        zoneChanged = zoneChanged,
+        overridden = false
+    )
+}
+
+internal object AodPositionHook {
     private data class PositionResolution(val decision: AodClockPlacementDecision)
 
     private data class ManagedAdvance(
@@ -43,6 +165,7 @@ internal object AodPositionHook {
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private const val FEATURE_ID = "aod-position"
     private val hookedClassLoaders = Collections.synchronizedSet(
         Collections.newSetFromMap(WeakHashMap<ClassLoader, Boolean>())
     )
@@ -53,27 +176,26 @@ internal object AodPositionHook {
     private val targetRootLocation = IntArray(2)
 
     fun install(module: XposedModule, classLoader: ClassLoader) {
-        val controller = runCatching { classLoader.loadClass(CONTROLLER_CLASS) }.getOrNull() ?: return
-        val update = controller.getDeclaredMethod(
-            "updateTranslation",
-            Boolean::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType,
-            Float::class.javaPrimitiveType
-        ).apply { isAccessible = true }
-        val updatePosition = classLoader.loadClass(DOZE_HOST_CLASS)
-            .getDeclaredMethod("updatePosition").apply { isAccessible = true }
+        val update = SymbolResolver.resolveMethod(
+            classLoader,
+            FEATURE_ID,
+            SymbolRequest.method(CONTROLLER_CLASS, "updateTranslation", "boolean", "int", "float")
+        ) ?: return
+        val updatePosition = SymbolResolver.resolveMethod(
+            classLoader,
+            FEATURE_ID,
+            SymbolRequest.method(DOZE_HOST_CLASS, "updatePosition")
+        ) ?: return
         if (!hookedClassLoaders.add(classLoader)) return
-        module.deoptimize(update)
-        module.deoptimize(updatePosition)
-        module.hook(update).intercept(PositionHooker)
-        module.hook(updatePosition).intercept(PositionCompletionHooker)
+        HookRegistry.hook(module, FEATURE_ID, update, PositionHooker)
+        HookRegistry.hook(module, FEATURE_ID, updatePosition, PositionCompletionHooker)
         HookLogger.i(TAG, "AOD position hook installed")
     }
 
     fun observeAodRoot(root: Any) {
         val controller = readHierarchyField(root, "mPositionController") ?: return
         synchronized(controllerStates) {
-            controllerStates.getOrPut(controller) { ControllerState() }
+            controllerStateFor(controller)
             lastControllerRef = WeakReference(controller)
         }
         captureTargetView(controller)
@@ -129,6 +251,19 @@ internal object AodPositionHook {
             } else {
                 chain.proceed()
             }
+            if (decision != null && needsClockYWriteback(decision)) {
+                // issue #39/#66:updateTranslation 的入参替换与 targetView 写回均未被效果层
+                // 采纳,时钟仍随防烧屏位移。这里把权威字段 controller.mTranslationY(按系统
+                // 公式反解出锁定 appliedY 所需的基准值)与渲染视图 translationY 一并钉到
+                // 应用值,并回读确认写入落到显示层,使锚定/冻结真正生效。
+                if (controller != null) logStockClockReadback(controller, decision)
+                pinRenderedClockY(
+                    controller,
+                    decision.appliedTranslationY,
+                    decision.requestedTranslationY,
+                    geometry = controller?.let { readClockGeometry(it) }
+                )
+            }
             val translationX = decision?.appliedTranslationX?.toFloat()
                 ?: requestedX?.toFloat()
                 ?: return result
@@ -156,6 +291,104 @@ internal object AodPositionHook {
             return result
         }
     }
+
+    /** suppressStockAodContent 激活时的直通标记(见 AodSurfaceController / AodSurfaceHook)。 */
+    @Volatile
+    private var suppressActive = false
+    /** 歌词时段冻结系统组件束(不做 managed 位移,也不让系统时钟沉降漂移)。 */
+    @Volatile
+    private var holdStockPosition = false
+    /**
+     * 按住系统时钟可见但钉住其位置:关闭「实时跟随系统时钟」时置位。与 [holdStockPosition]
+     * 不同 —— 此处不停用 managed 位移,也不隐藏时钟,只在原厂透传路径把 Y 固定在上次
+     * 锚定位置,令时钟不随防烧屏沉降下移(见 issue #26)。
+     */
+    @Volatile
+    private var pinClockVisible = false
+    /**
+     * 自定义系统时钟钉住位置的垂直偏移(px)。仅当关闭「实时跟随系统时钟」且正在渲染
+     * AOD(pinClock 激活)时,叠加到被钉住的时钟 Y 上。默认 0(不偏移)。
+     */
+    @Volatile
+    private var clockYOffsetPx = 0
+
+    fun setSuppressActive(active: Boolean) {
+        suppressActive = active
+        if (active) abandonManagedSession()
+    }
+
+    fun setHoldStockPosition(active: Boolean) {
+        holdStockPosition = active
+    }
+
+    fun setIntegralClockPin(active: Boolean) {
+        pinClockVisible = active
+    }
+
+    fun setClockYOffset(px: Int) {
+        clockYOffsetPx = px
+    }
+
+    /**
+     * 跨 controller 生命周期继承的时钟锚定(issue #33):controllerStates 以弱引用
+     * controller 为 key,controller 更替即丢锚,新状态会以"当前(可能已下移)请求值"
+     * 就地重锚,防下移从此失效。锚定值镜像保存在本单例中,controller 重建时继承;
+     * AOD 真正会话结束(显示完全关闭)时清零 —— 跨会话重新锚定到当前系统位置仍
+     * 是设计行为。
+     *
+     * 注意:清零必须绑定"真实会话结束"(AOD 显示 OFF),而非每次 surface attach/detach
+     * 重建(旋转、LinkageTransition 会触发高频重建)。同一 AOD 会话内的重建若清锚,
+     * 锚点会落到已漂移的请求值,防下移失效、旋转回竖屏回不到原位(issue #36)。
+     */
+    @Volatile
+    private var inheritedAnchorX: Int? = null
+    @Volatile
+    private var inheritedAnchorY: Float? = null
+    private var lastPinnedLogKey = ""
+    private var lastManagedPinSkipLogged = false
+    private var lastRenderedPinKey = ""
+    private var lastStockReadbackKey = ""
+    private var lastPinPostFrameKey = ""
+    private var pinSamplerScheduled = false
+
+    private var lastAnchorResetElapsedMs = Long.MIN_VALUE
+
+    /** 仅当 AOD 真正退出(显示完全关闭且持续过脉冲窗口,见 AodPowerCoordinator)时清空跨 controller 锚定。 */
+    fun resetStockAnchor(cause: String) {
+        inheritedAnchorX = null
+        inheritedAnchorY = null
+        lastPinnedLogKey = ""
+        lastManagedPinSkipLogged = false
+        lastRenderedPinKey = ""
+        lastStockReadbackKey = ""
+        // issue #62:记录距上次清锚的间隔,脉冲抖动触发的高频清锚可直接从间隔暴露。
+        val now = SystemClock.elapsedRealtime()
+        val interval = if (lastAnchorResetElapsedMs == Long.MIN_VALUE) {
+            "first"
+        } else {
+            "${now - lastAnchorResetElapsedMs}ms"
+        }
+        lastAnchorResetElapsedMs = now
+        HookLogger.i(TAG, "Stock anchor reset ($cause, interval=$interval)")
+    }
+
+    /**
+     * 取 controller 对应状态;controller 首次出现(或被 GC 后重建)时播种继承锚定并
+     * 记录一次,替代裸 getOrPut 的静默重置(issue #33 建议三)。
+     */
+    private fun controllerStateFor(controller: Any): ControllerState {
+        controllerStates[controller]?.let { return it }
+        val seeded = seedControllerState(inheritedAnchorX, inheritedAnchorY)
+        controllerStates[controller] = seeded
+        HookLogger.i(
+            TAG,
+            "Position state rebuilt; anchor " +
+                (if (inheritedAnchorY != null) "inherited y=$inheritedAnchorY" else "pending geometry")
+        )
+        return seeded
+    }
+
+    fun isSuppressActive(): Boolean = suppressActive
 
     fun restoreStockTranslation() {
         val restore = synchronized(controllerStates) {
@@ -201,6 +434,16 @@ internal object AodPositionHook {
     }
 
     fun advanceManagedPosition(pattern: String, animated: Boolean = true): Boolean {
+        // 时钟钉住激活时 managed 位移被锚定优先级接管(issue #33 建议二):
+        // 调度器按"managed 不可用"处理,退避后回退到原厂几何。
+        if (pinClockVisible) {
+            if (!lastManagedPinSkipLogged) {
+                lastManagedPinSkipLogged = true
+                HookLogger.i(TAG, "Managed advance skipped: clock pin active")
+            }
+            return false
+        }
+        lastManagedPinSkipLogged = false
         val advance = synchronized(controllerStates) {
             val controller = lastControllerRef.get() ?: return@synchronized null
             val state = controllerStates[controller] ?: return@synchronized null
@@ -213,6 +456,9 @@ internal object AodPositionHook {
             val stockY = state.lastStockTranslationY ?: natural?.y ?: return@synchronized null
             state.lastStockTranslationX = stockX
             state.lastStockTranslationY = stockY
+            // managed 建立决策时同步镜像锚定(issue #33 建议一)。
+            inheritedAnchorX = stockX
+            inheritedAnchorY = stockY
             val previousStep = state.managedStep
             val previousDecision = state.currentManagedDecision
             val nextStep = previousStep + 1
@@ -299,15 +545,30 @@ internal object AodPositionHook {
     ): PositionResolution? {
         val geometry = readClockGeometry(controller) ?: return null
         return synchronized(controllerStates) {
-            val state = controllerStates.getOrPut(controller) { ControllerState() }
+            val state = controllerStateFor(controller)
             state.pendingManagedDecision?.let { pending ->
                 state.pendingManagedDecision = null
                 return@synchronized PositionResolution(pending)
             }
             state.lastStockTranslationX = requestedX
-            state.lastStockTranslationY = requestedY
             lastControllerRef = WeakReference(controller)
-            if (AodSurfaceController.isStockWidgetControlActive()) {
+            if (suppressActive) {
+                // suppressStockAodContent 直通:系统组件束被抑制为 GONE 后无需再做
+                // managed 位移;hold 时冻结库存挂钩位,防系统时钟沉降把布局继续下拖。
+                state.managedStep = -1
+                state.currentManagedDecision = null
+                state.pendingManagedDecision = null
+                return@synchronized stockResolution(
+                    state, requestedX, requestedY, geometry,
+                    freeze = holdStockPosition, zoneChanged = false
+                )
+            }
+            if (routesToManagedPath(
+                    suppressActive = false,
+                    stockWidgetControlActive = AodSurfaceController.isStockWidgetControlActive(),
+                    pinClockVisible = pinClockVisible
+                )
+            ) {
                 val current = state.currentManagedDecision
                 if (current != null) {
                     val refreshed = managedAodClockDecision(
@@ -321,7 +582,13 @@ internal object AodPositionHook {
                         state.managedStep = -1
                         state.currentManagedDecision = null
                         PositionResolution(
-                            stockDecision(requestedX, requestedY, geometry, zoneChanged = true)
+                            stockClockDecision(
+                                requestedX,
+                                requestedY,
+                                requestedY,
+                                geometry,
+                                zoneChanged = true
+                            )
                         )
                     } else {
                         val placementChanged = managedAodPlacementChanged(current, refreshed)
@@ -342,33 +609,89 @@ internal object AodPositionHook {
                     }?.let(::PositionResolution)
                 }
             } else {
+                // 原厂透传(或 pin 激活时对 managed 的接管)。pinClockVisible 时把 Y 钉在
+                // 上次锚定位置,令系统时钟在关闭「实时跟随系统时钟」时不随防烧屏沉降下移,
+                // 同时保留时钟显示(issue #26);pin 与 managed 位移互斥,锚定优先
+                // (issue #33 建议二),pin 释放后 managed 从 step 0 重排。
+                if (pinClockVisible && state.currentManagedDecision != null) {
+                    HookLogger.i(TAG, "Managed displacement bypassed by clock pin")
+                }
                 val zoneChanged = state.currentManagedDecision != null
                 state.managedStep = -1
                 state.currentManagedDecision = null
                 state.pendingManagedDecision = null
-                PositionResolution(stockDecision(requestedX, requestedY, geometry, zoneChanged))
+                return@synchronized stockResolution(
+                    state, requestedX, requestedY, geometry,
+                    freeze = pinClockVisible, zoneChanged = zoneChanged
+                )
             }
         }
     }
 
-    private fun stockDecision(
+    /**
+     * 系统时钟库存直通决策。freeze 时把 Y 钉在上次锚定值,令时钟不随请求的防烧屏
+     * drift 下移;首次(尚无锚定值)以本次请求值作为锚定起点。
+     */
+    private fun stockResolution(
+        state: ControllerState,
         requestedX: Int,
         requestedY: Float,
         geometry: AodClockGeometry,
+        freeze: Boolean,
         zoneChanged: Boolean
-    ): AodClockPlacementDecision {
-        val top = (requestedY + geometry.viewTop).toInt()
-        return AodClockPlacementDecision(
-            requestedTranslationX = requestedX,
-            requestedTranslationY = requestedY,
-            appliedTranslationX = requestedX,
-            appliedTranslationY = requestedY,
-            clockTop = top,
-            clockBottom = top + geometry.viewHeight,
-            lyricTopSafe = top.coerceAtLeast(0),
-            zone = AodSceneZone.STOCK,
-            zoneChanged = zoneChanged,
-            overridden = false
+    ): PositionResolution {
+        // 锚定起点取上次锚定值(防烧屏沉降时时钟被钉住);freeze 时把该原始锚定值保留在
+        // lastStockTranslationY,仅对本次应用到时钟的 Y 叠加用户自定义偏移,避免逐帧累积。
+        //
+        // issue #66 根因二(锚点语义):首次播种若取 requestedY,锚点会带上系统已发生的防烧屏
+        // 位移(requestedY 是当前步进 drift 后的值),导致「钉住生效却钉在下移后的位置」——
+        // 实机日志已印证该兜底会把偏移锚点固化进 lastStockTranslationY。因此改由
+        // resolveStockAnchorSeed 决策:已有锚定值 → 继承(同一 AOD 会话内重建不重置,issue #36);
+        // 无锚定值且几何就绪 → 未位移基准 baseTranslationY - viewTop;几何未就绪(AOD 刚进入)
+        // → 本帧透传且不播种,宁可晚一帧也不让位移值固化。
+        val seed = resolveStockAnchorSeed(state.lastStockTranslationY, geometry)
+        if (seed.anchorY == null) {
+            // 几何未就绪:透传本帧请求,不写任何锚点状态,待下一帧几何可用再锚定。
+            val key = "defer " + Math.round(requestedY)
+            if (key != lastPinnedLogKey) {
+                lastPinnedLogKey = key
+                HookLogger.i(
+                    TAG,
+                    "Stock clock anchor deferred requestedY=$requestedY " +
+                        "mViewTop=${geometry.viewTop} mViewHeight=${geometry.viewHeight} " +
+                        "step=${geometry.translationYStep} base=${geometry.baseTranslationY}"
+                )
+            }
+            return PositionResolution(
+                stockClockDecision(requestedX, requestedY, requestedY, geometry, zoneChanged)
+            )
+        }
+        val anchorY = seed.anchorY
+        state.lastStockTranslationY = anchorY
+        // 锚定镜像到跨 controller 生命周期持有者(issue #33 建议一)。
+        inheritedAnchorX = state.lastStockTranslationX
+        inheritedAnchorY = anchorY
+        val appliedY = pinnedClockAppliedY(anchorY, clockYOffsetPx, freeze, requestedY)
+        if (freeze && appliedY != requestedY) {
+            // 钉住生效现场,仅变化时记录(建议三):请求 Y 持续漂移而应用 Y 被钉住。
+            // 附锚点来源与原始几何(issue #66 定性需求:区分 inherited/natural_baseline 与
+            // 几何取值,验证锚点是否仍可能来自位移后的值)。
+            val key = "a=" + Math.round(anchorY) + " o=" + clockYOffsetPx +
+                " s=" + seed.source
+            if (key != lastPinnedLogKey) {
+                lastPinnedLogKey = key
+                HookLogger.i(
+                    TAG,
+                    "Stock clock pinned anchorY=$anchorY appliedY=$appliedY " +
+                        "requestedY=$requestedY offset=$clockYOffsetPx " +
+                        "source=${seed.source} natural=${geometry.baseTranslationY - geometry.viewTop} " +
+                        "mViewTop=${geometry.viewTop} mViewHeight=${geometry.viewHeight} " +
+                        "step=${geometry.translationYStep} base=${geometry.baseTranslationY}"
+                )
+            }
+        }
+        return PositionResolution(
+            stockClockDecision(requestedX, requestedY, appliedY, geometry, zoneChanged)
         )
     }
 
@@ -388,15 +711,39 @@ internal object AodPositionHook {
         hierarchyField(owner.javaClass, name) ?: throw NoSuchFieldException(name)
 
     private fun readIntField(controller: Any, name: String): Int =
-        requireField(controller, name).getInt(controller)
+        readNumericField(controller, requireField(controller, name)).toInt()
 
     private fun readFloatField(controller: Any, name: String): Float =
-        requireField(controller, name).getFloat(controller)
+        readNumericField(controller, requireField(controller, name)).toFloat()
+
+    /**
+     * 按声明类型把数值写进字段(issue #66 根因:mTranslationY 在设备固件里是 int,
+     * setFloat 会抛 IllegalArgumentException,写入从未生效)。int/long 取整后窄化写,
+     * float/double 原样写,其余类型返回 false 交由调用方记日志。
+     */
+    private fun writeNumberField(controller: Any, name: String, value: Float): Boolean {
+        val field = requireField(controller, name)
+        return when (field.type) {
+            java.lang.Integer.TYPE -> {
+                field.setInt(controller, Math.round(value)); true
+            }
+            java.lang.Long.TYPE -> {
+                field.setLong(controller, Math.round(value).toLong()); true
+            }
+            java.lang.Float.TYPE -> {
+                field.setFloat(controller, value); true
+            }
+            java.lang.Double.TYPE -> {
+                field.setDouble(controller, value.toDouble()); true
+            }
+            else -> false
+        }
+    }
 
     private fun readFodSafeBottom(controller: Any?): Int? = runCatching {
         controller ?: return null
         val shown = requireField(controller, "mIsGxzwIconShow").getBoolean(controller)
-        val y = requireField(controller, "mGxzwIconY").getInt(controller)
+        val y = readIntField(controller, "mGxzwIconY")
         y.takeIf { shown && it > 0 }
     }.getOrNull()
 
@@ -406,6 +753,192 @@ internal object AodPositionHook {
         if (previous === target) return
         targetViewRef = WeakReference(target)
         HookLogger.i(TAG, "AOD position target captured=${target?.javaClass?.name}")
+    }
+
+    /**
+     * 把系统时钟钉到锚点(issue #66 根治)。
+     *
+     * 系统防烧屏定位公式(反编译 AODUpdatePositionController 确认):
+     *     f = mTranslationYStep * step - mViewTop + mTranslationY
+     *     targetView.setTranslationY(f)
+     * 其中 step 即 updateTranslation(z, i, f) 的步进索引 i,随整分钟位移递增;
+     * mTranslationY 是设备固件里的 int 字段(此前 setFloat 抛 IllegalArgumentException,
+     * 写入从未生效,日志 controllerY=231.0->null 可证)。
+     *
+     * 要让时钟锁定在锚点 appliedY,只需令 f = appliedY,反解出应写入的权威字段:
+     *     mTranslationY = appliedY + mViewTop - mTranslationYStep * step
+     * 这样系统下一帧自算的 f 恒等于 appliedY,无需再事后改 view,也绕开了「hook 在系统
+     * 下发位移后才纠正、天然落后一拍」的问题。translationY 同步写一次作为即时呈现
+     * (本帧系统在 proceed 时已按旧 f 画过),后续帧由权威字段驱动。
+     *
+     * 写入按声明类型分派(int/long/float/double),避免 ROM 改类型时静默失败;写后同线程
+     * 回读 + 跳过一帧回读,确认落到显示层。
+     *
+     * 安全性:pin 激活时 managed 位移互斥绕过(routesToManagedPath / advanceManagedPosition
+     * 均因 pinClockVisible 提前 return),mTranslationY(geometry.baseTranslationY)仅被
+     * managed 路径读取,故 pin 期间改写它不会干扰 managed 逻辑。
+     */
+    private fun pinRenderedClockY(
+        controller: Any?,
+        appliedY: Float,
+        requestedY: Float,
+        geometry: AodClockGeometry?
+    ) {
+        val target = targetViewRef.get() ?: return
+        val pin = Runnable {
+            val live = targetViewRef.get() ?: return@Runnable
+            val beforeView = live.translationY
+            var beforeController: Float? = null
+            var afterController: Float? = null
+            var fieldDesc: String? = null
+            if (controller != null) {
+                runCatching {
+                    val field = requireField(controller, "mTranslationY")
+                    beforeController = runCatching { readNumericField(controller, field).toFloat() }.getOrNull()
+                    // 反解 f = appliedY 所需的 mTranslationY 基准值。系统步进来自 controller
+                    // 的 mAodMoveCurrent 计数器(naturalAodTranslation 同款),垂直步进按
+                    // mode 取 halfStep/3(mode0) 或 halfStep(mode2/3);缺几何时退化为
+                    // 直接写 appliedY(对应 verticalStep 项为 0 的旧行为)。
+                    val verticalStep = if (geometry != null) {
+                        val moveCurrent =
+                            runCatching { readIntField(controller, "mAodMoveCurrent") }
+                                .getOrDefault(0)
+                        burnInVerticalStep(geometry.mode, moveCurrent)
+                    } else {
+                        0
+                    }
+                    val baseTarget = if (geometry != null) {
+                        appliedY + geometry.viewTop - geometry.translationYStep * verticalStep
+                    } else {
+                        appliedY
+                    }
+                    val wrote = writeNumberField(controller, "mTranslationY", baseTarget)
+                    afterController = runCatching { readNumericField(controller, field).toFloat() }.getOrNull()
+                    fieldDesc = field.declaringClass.name + "#" + field.name +
+                        " type=" + field.type.name +
+                        " final=" + java.lang.reflect.Modifier.isFinal(field.modifiers) +
+                        " base=" + Math.round(baseTarget) +
+                        " vstep=" + verticalStep +
+                        " write=" + (if (!wrote) "unsupported" else if (afterController != null &&
+                            kotlin.math.abs(afterController!! - baseTarget) < 0.5f
+                        ) "ok" else "noop")
+                }.onFailure { fieldDesc = "err=" + it.javaClass.simpleName + ":" + it.message }
+            }
+            if (live.translationY != appliedY) live.translationY = appliedY
+            // 与写入同一线程立即回读,消除跨线程时序误判(写发生在主线程,回读亦须同线程)。
+            val afterView = live.translationY
+            val key = "y=" + Math.round(appliedY) + " c=" + afterController +
+                " v=" + Math.round(afterView) + " r=" + Math.round(requestedY)
+            if (key != lastRenderedPinKey) {
+                lastRenderedPinKey = key
+                HookLogger.i(
+                    TAG,
+                    "Rendered clock pinned appliedY=$appliedY requestedY=$requestedY " +
+                        "controllerY=$beforeController->$afterController " +
+                        "viewY=$beforeView->$afterView " +
+                        "y=${live.y} top=${live.top} " +
+                        "topMargin=${(live.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin} " +
+                        "paddingTop=${live.paddingTop} " +
+                        "field=$fieldDesc view=${live.javaClass.name}"
+                )
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            pin.run()
+        } else {
+            mainHandler.post(pin)
+        }
+        // 跳过一帧 layout 后于主线程回读:确认权威字段驱动的 f 是否锁定在 appliedY。
+        mainHandler.postDelayed({
+            logPinPostFrame(controller, appliedY, requestedY)
+        }, PIN_POST_FRAME_DELAY_MS)
+        schedulePinSampler(controller)
+    }
+
+    /**
+     * pin 期间的低频无条件采样(issue #66 实机反馈):现有 pin/post-frame 日志均按值
+     * 去重,「无日志窗口」恰好可能掩盖漂移——22:50→22:56 没有任何 pin 日志,无法区分
+     * 是值真没变还是去重键没变。此采样不看任何去重键,每 2s 在主线程固定打一行
+     * view/controller 定位量:漂移是一次性跳变还是持续渐变、发生在哪个时间窗,由
+     * 采样序列直接读出。自续跑直到 pin 关闭或视图销毁。
+     */
+    private fun schedulePinSampler(controller: Any?) {
+        if (pinSamplerScheduled) return
+        pinSamplerScheduled = true
+        mainHandler.postDelayed({
+            pinSamplerScheduled = false
+            if (!pinClockVisible) return@postDelayed
+            val live = targetViewRef.get() ?: return@postDelayed
+            val stored = controller?.let {
+                runCatching { readFloatField(it, "mTranslationY") }.getOrNull()
+            }
+            val moveCurrent = controller?.let {
+                runCatching { readIntField(it, "mAodMoveCurrent") }.getOrNull()
+            }
+            val topMargin =
+                (live.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin
+            HookLogger.i(
+                TAG,
+                "Pin sample anchor=$inheritedAnchorY " +
+                    "viewY=${live.translationY} y=${live.y} top=${live.top} " +
+                    "topMargin=$topMargin controllerY=$stored " +
+                    "moveCurrent=$moveCurrent attached=${live.isAttachedToWindow}"
+            )
+            schedulePinSampler(controller)
+        }, PIN_SAMPLE_INTERVAL_MS)
+    }
+
+    /**
+     * pin 写回后跳过一帧,在主线程回读显示层各候选定位量(issue #66 建议一/二)。
+     *
+     * 上一版在 hook 调用线程回读,既无法排除「跨线程时序」也无法观测「下一帧 layout 是否
+     * 覆盖」。此处在写回完成 + 越过至少一帧 layout 后,同线程读 translationY/y/top/
+     * topMargin/paddingTop 与 mTranslationY:
+     *  - translationY 已被改回非 appliedY → 系统在下帧覆盖,需换写入目标(top/topMargin);
+     *  - translationY 仍是 appliedY 但视觉在新位置 → translationY 不参与最终定位,权威在 top;
+     *  - mTranslationY 与写入值的关系 → 区分「反射写入无效」与「写入后被覆盖」。
+     * 仅值变化时记录,避免整分钟位移周期外刷屏。
+     */
+    private fun logPinPostFrame(controller: Any?, appliedY: Float, requestedY: Float) {
+        val live = targetViewRef.get() ?: return
+        val stored = controller?.let {
+            runCatching { readFloatField(it, "mTranslationY") }.getOrNull()
+        }
+        val topMargin = (live.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin
+        val key = "t=" + Math.round(live.translationY) +
+            " y=" + Math.round(live.y) +
+            " top=" + live.top +
+            " tm=" + topMargin +
+            " c=" + stored
+        if (key == lastPinPostFrameKey) return
+        lastPinPostFrameKey = key
+        HookLogger.i(
+            TAG,
+            "Rendered clock post-frame appliedY=$appliedY requestedY=$requestedY " +
+                "translationY=${live.translationY} y=${live.y} top=${live.top} " +
+                "topMargin=$topMargin paddingTop=${live.paddingTop} " +
+                "controllerY=$stored attached=${live.isAttachedToWindow}"
+        )
+    }
+
+    /**
+     * issue #39 建议一:`proceed` 之后回读 controller 的 `mTranslationY`,确认入参替换是否
+     * 被系统采纳。此前日志只能看到「下发了什么」,看不到「系统实际存了什么」,是最大盲区。
+     * 仅 STOCK 被钉住时回读,取值变化时记录一次,避免刷屏。
+     */
+    private fun logStockClockReadback(controller: Any, decision: AodClockPlacementDecision) {
+        val stored = runCatching { readFloatField(controller, "mTranslationY") }.getOrNull() ?: return
+        val key = "f=" + Math.round(stored) +
+            " a=" + Math.round(decision.appliedTranslationY) +
+            " r=" + Math.round(decision.requestedTranslationY)
+        if (key != lastStockReadbackKey) {
+            lastStockReadbackKey = key
+            HookLogger.i(
+                TAG,
+                "Stock clock read-back controller mTranslationY=$stored " +
+                    "appliedY=${decision.appliedTranslationY} requestedY=${decision.requestedTranslationY}"
+            )
+        }
     }
 
     private fun effectiveAlpha(view: View): Float {
@@ -424,6 +957,11 @@ internal object AodPositionHook {
     private const val DOZE_HOST_CLASS = "com.miui.aod.DozeHost"
     private const val LINKAGE_MODE = 3
     private const val MIN_VISIBLE_ALPHA = 0.02f
+    // pin 写回后跳过一帧 layout 再回读(issue #66 建议一):略大于 60fps 一帧,
+    // 使「系统是否在下一帧 layout 覆盖 translationY」可被观测。
+    private const val PIN_POST_FRAME_DELAY_MS = 32L
+    // pin 期间的低频采样间隔(issue #66):2s 一行,绕开值去重,覆盖漂移时间窗。
+    private const val PIN_SAMPLE_INTERVAL_MS = 2000L
     private const val TAG = "AodPositionHook"
 }
 
@@ -446,3 +984,27 @@ internal fun shouldAnimateAodPosition(
     overridden: Boolean,
     placementChanged: Boolean
 ): Boolean = requested && (!overridden || placementChanged)
+
+/**
+ * 按装箱 `Number` 读取数值型 ROM 字段,交由调用方窄化。
+ *
+ * 固件对字段宽度不自洽:已普查机型(`DEV-2344.0.0.0.1-07031920`、`DEV-2446.3.0.1-09042206`)上
+ * `AODUpdatePositionController.mTranslationY` 是 int,而 `mTranslationYStep` 是 float。
+ * 窄访问器(`getInt`/`getFloat`)按字段类型校验,宽度不符时抛 `IllegalArgumentException`;而
+ * `readClockGeometry` 把整个 body 包在 runCatching 里,该抛出被读成「没有时钟几何」而非失败,
+ * 于是在机型上静默禁用了托管位移与原厂控件保持,且无任何上报。
+ *
+ * 宽度校验的宽严随运行时变化,故读侧不能依赖任何一种策略——装箱读取对所有数值宽度都成立:
+ * 宿主机 JDK(JDK 21/25 实测)对 `getFloat` 读 int 字段是宽容的(int→float 属无损加宽),
+ * 而设备侧 ART 按精确类型校验、双向都抛。只用装箱读取即对两者都正确。
+ *
+ * 写侧同一宽度问题已由 `AodPositionHook.writeNumberField`(issue #66)按 `field.type` 分派修好,
+ * 此处把读侧补成对称写法——同一字段、同一已知宽度事实,读写两侧此前只修了一侧。
+ *
+ * 「存在」不等于「宽度」:宽度变化仍应是非事件,故此处不断言字段类型,只做装箱读取与窄化。
+ *
+ * 顶层函数而非 `AodPositionHook` 成员:纯反射、无状态,且不触发该 object 的静态初始化
+ * (其初始化依赖 Android 运行时),从而可被 JVM 单元测试直接覆盖。
+ */
+internal fun readNumericField(owner: Any, field: java.lang.reflect.Field): Number =
+    field.get(owner) as Number

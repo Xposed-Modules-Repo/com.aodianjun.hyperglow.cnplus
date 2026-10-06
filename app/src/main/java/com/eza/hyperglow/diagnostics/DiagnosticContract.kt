@@ -16,10 +16,19 @@ internal object DiagnosticLimits {
     const val LOGCAT_BYTES = 160 * 1024
     const val CRASH_BYTES = 64 * 1024
     const val LSPOSED_BYTES = 64 * 1024
+    /** App 进程日志镜像在 logs 段内的专属预算;剩余预算留给 SystemUI 侧 logcat。 */
+    const val APP_TRACE_BYTES = 96 * 1024
     const val MEDIA_METADATA_BYTES = 512
     const val LYRIC_LINE_BYTES = 8 * 1024
     const val CAPTURE_TTL_MS = 30L * 60L * 1000L
     const val COMMAND_TIMEOUT_MS = 5_000L
+
+    /**
+     * root 探测是唯一一条可能等人操作(授权弹窗)的命令:root 管理器弹窗后命令要等用户
+     * 点按,共享的 5s 命令窗口会在用户几秒后确认时先行超时并销毁进程,报告只剩 `error`
+     * 且没有任何证据。
+     */
+    const val ROOT_PROBE_TIMEOUT_MS = 15_000L
 }
 
 @Serializable
@@ -48,7 +57,7 @@ internal enum class HyperGlowReportCategory(
     COMPATIBILITY("compatibility", "Compatibility", false),
     AOD_SURFACE("aod_surface", "AOD surface", true),
     LOCKSCREEN_SURFACE("lockscreen_surface", "Lock screen surface", true),
-    PLAYBACK_BRIDGE("playback_bridge", "Spotify bridge", true),
+    PLAYBACK_BRIDGE("playback_bridge", "Playback / lyrics bridge", true),
     SYSTEM_UI_FAILURE("systemui_failure", "System UI crash or restart", true),
     CONFIGURATION("configuration", "Configuration", true),
     OTHER("other", "Other", true);
@@ -287,7 +296,9 @@ internal object DiagnosticReportCodec {
             translatedLine.utf8Size() > DiagnosticLimits.LYRIC_LINE_BYTES
         ) return false
         return if (present) {
-            trackUri.startsWith("spotify:track:") && title.isNotBlank()
+            // trackUri 格式随歌词源而异（spotify:track:… / lyricon:… / superlyric:… /
+            // lyricinfo:…），只要求非空；source 字段携带具体源名。
+            trackUri.isNotBlank() && title.isNotBlank()
         } else {
             metadata.all(String::isEmpty) && lineIndex == -1 &&
                 originalLine.isEmpty() && romanizedLine.isEmpty() && translatedLine.isEmpty() &&
@@ -297,6 +308,7 @@ internal object DiagnosticReportCodec {
 
     private val PROFILE_STATES = setOf(
         "no_systemui_report",
+        "available",
         "verified_profile",
         "verified_profile_missing_symbols",
         "unsupported_profile",
@@ -315,7 +327,10 @@ internal object DiagnosticReportCodec {
         "systemui_package",
         "xiaomi_aod_package",
         "spotify_package",
-        "spotify_bridge"
+        // spotify_bridge 是旧失败码，保留以便 decode 旧版报告；新码 producer_bridge
+        // 覆盖所有歌词源（Spicy EX / Lyricon / SuperLyric / LyricInfo）。
+        "spotify_bridge",
+        "producer_bridge"
     )
     private val CAPTURE_OUTCOMES = setOf(
         "not_requested",
@@ -355,6 +370,7 @@ internal object DiagnosticReportCodec {
         "lockscreenKeepAwake",
         "raiseToAod",
         "positionFollowing",
+        "burnInPattern",
         "diagnosticLogging",
         "diagnosticLoggingDuringCapture"
     )

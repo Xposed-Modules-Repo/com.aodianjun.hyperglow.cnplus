@@ -22,10 +22,32 @@ class AodRenderPreferencesTest {
     }
 
     @Test
+    fun customFontFamiliesPassThroughAndUnsafeTokensFallBack() {
+        // 自定义字体令牌必须原样通过:同一函数用于 wire 快照的拒收校验,任何改写都会
+        // 让整帧被拒或被钳成 spotify —— 前端表现即"字体只在预览生效"。
+        assertEquals("noto-sc", normalizeAodFontFamily("noto-sc"))
+        assertEquals("custom", normalizeAodFontFamily("custom"))
+        assertEquals("custom:yzzqdbtb", normalizeAodFontFamily("custom:yzzqdbtb"))
+        // id 白名单之外的令牌一律回落内置默认,避免令牌变成路径片段。
+        assertEquals("spotify", normalizeAodFontFamily("custom:../x"))
+        assertEquals("spotify", normalizeAodFontFamily("custom:"))
+        assertEquals("spotify", normalizeAodFontFamily("custom:" + "a".repeat(33)))
+        assertEquals("spotify", normalizeAodFontFamily("custom:字体"))
+    }
+
+    @Test
     fun legacyAnimationNamesMigrateToGradient() {
         assertEquals("Gradient", normalizeAodAnimation("Spotlight word"))
         assertEquals("Gradient", normalizeAodAnimation("Karaoke fill"))
         assertEquals("Minimal", normalizeAodAnimation("Minimal"))
+    }
+
+    @Test
+    fun betterLyricsAnimationNameSurvivesNormalization() {
+        // 「BetterLyrics」档原样通过:同一函数用于 wire 快照的拒收校验,任何改写都会让
+        // 整帧被拒或新档静默失效。
+        assertEquals("BetterLyrics", normalizeAodAnimation("BetterLyrics"))
+        assertEquals("Gradient", normalizeAodAnimation(null))
     }
 
     @Test
@@ -53,6 +75,17 @@ class AodRenderPreferencesTest {
     }
 
     @Test
+    fun refreshRateCapAllowsOnlyOfferedSteps() {
+        assertEquals(0, normalizeAodRefreshRateCap(0))
+        assertEquals(60, normalizeAodRefreshRateCap(60))
+        assertEquals(90, normalizeAodRefreshRateCap(90))
+        assertEquals(120, normalizeAodRefreshRateCap(120))
+        assertEquals(0, normalizeAodRefreshRateCap(30))
+        assertEquals(0, normalizeAodRefreshRateCap(144))
+        assertEquals(0, normalizeAodRefreshRateCap(-1))
+    }
+
+    @Test
     fun keepAwakeDurationAllowsOnlyOfferedSessionLengths() {
         assertEquals(-1L, normalizeKeepAwakeDurationMs(-1L))
         assertEquals(300_000L, normalizeKeepAwakeDurationMs(300_000L))
@@ -70,12 +103,12 @@ class AodRenderPreferencesTest {
 
         assertEquals(true, config.aodEnabled)
         assertEquals(false, config.lockscreenEnabled)
-        assertEquals(true, config.seamlessTransitionEnabled)
         assertEquals("auto", config.alignment)
         assertEquals("Main only", config.secondaryMode)
         assertEquals("Wrap", config.overflowMode)
         assertEquals("hide", config.metadataVisible)
         assertEquals("top", config.metadataAnchor)
+        assertEquals(100, config.metadataSizePercent)
         assertEquals("Medium", config.weight)
         assertEquals("normal", config.textSize)
         assertEquals("spotify", config.fontFamily)
@@ -92,11 +125,35 @@ class AodRenderPreferencesTest {
         assertFalse(config.raiseToAod)
         assertFalse(config.suppressLockscreenEditorLongPress)
         assertFalse(config.experimentalMode)
+        assertEquals(true, config.aodBrightnessBoost)
+        assertEquals(0, config.aodRefreshRateCap)
+        assertEquals(true, config.aodPowerSaver)
     }
 
     @Test
-    fun schemaVersionIsStampedForFutureMigrations() {
-        assertEquals(1, AodRenderPreferences.SCHEMA_VERSION)
-        assertEquals("schema_version", AodRenderPreferences.SCHEMA_VERSION_KEY)
+    fun effectiveRotationModeTreatsPortraitAsAutoWhenRotationOn() {
+        // issue #29:开关开启而模式仍未设置(portrait)时,读取联动视作 auto,旋转才会生效。
+        assertEquals(
+            AOD_ROTATION_MODE_AUTO,
+            effectiveAodRotationMode(true, AOD_ROTATION_MODE_PORTRAIT)
+        )
+        assertEquals(
+            AOD_ROTATION_MODE_AUTO,
+            effectiveAodRotationMode(true, AOD_ROTATION_MODE_AUTO)
+        )
+        // 开关关闭:无论模式为何都保留(不影响旋转),portrait 保持不变。
+        assertEquals(
+            AOD_ROTATION_MODE_PORTRAIT,
+            effectiveAodRotationMode(false, AOD_ROTATION_MODE_PORTRAIT)
+        )
+        // 用户显式选定的横屏模式不被联动改写。
+        assertEquals(
+            AOD_ROTATION_MODE_LANDSCAPE,
+            effectiveAodRotationMode(true, AOD_ROTATION_MODE_LANDSCAPE)
+        )
+        assertEquals(
+            AOD_ROTATION_MODE_LANDSCAPE_REVERSE,
+            effectiveAodRotationMode(true, AOD_ROTATION_MODE_LANDSCAPE_REVERSE)
+        )
     }
 }

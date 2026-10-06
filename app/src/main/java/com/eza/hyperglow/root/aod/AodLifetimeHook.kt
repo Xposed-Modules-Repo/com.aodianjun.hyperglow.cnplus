@@ -3,7 +3,10 @@ package com.eza.hyperglow.root.aod
 import android.os.Handler
 import android.os.Looper
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.HookRegistry
 import com.eza.hyperglow.root.readHierarchyField
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
@@ -14,29 +17,57 @@ import java.util.WeakHashMap
 
 object AodLifetimeHook {
     private const val CONTROLLER_CLASS = "com.miui.aod.doze.MiuiShowStyleController"
+    private const val FEATURE_ID = "aod-lifetime"
     private val hookedClassLoaders = Collections.synchronizedSet(
         Collections.newSetFromMap(WeakHashMap<ClassLoader, Boolean>())
     )
 
     fun install(module: XposedModule, classLoader: ClassLoader) {
-        val controllerClass = runCatching { classLoader.loadClass(CONTROLLER_CLASS) }.getOrNull()
-            ?: return
+        val controllerClass = SymbolResolver.resolveClass(
+            classLoader, FEATURE_ID, CONTROLLER_CLASS
+        ) ?: return
         if (!hookedClassLoaders.add(classLoader)) return
+        // 观察点 B-1:一次性 dump 方法/字段表。show 侧入口未知,HyperOS 升级后方法名会漂移,
+        // 这份表让下一次抓取日志时能直接对照真实签名,不必反编译 systemui。
+        dumpControllerSurface(controllerClass)
         for (constructor in controllerClass.declaredConstructors) {
             constructor.isAccessible = true
-            module.hook(constructor).intercept(ControllerConstructorHooker)
+            HookRegistry.hook(module, FEATURE_ID, constructor, ControllerConstructorHooker)
         }
         for (methodName in POLICY_HIDE_METHODS) {
-            val method = controllerClass.getDeclaredMethod(methodName)
-            method.isAccessible = true
-            module.deoptimize(method)
-            module.hook(method).intercept(PolicyHideHooker(method))
+            val method = SymbolResolver.resolveMethod(
+                classLoader, FEATURE_ID, SymbolRequest.method(CONTROLLER_CLASS, methodName)
+            ) ?: continue
+            HookRegistry.hook(module, FEATURE_ID, method, PolicyHideHooker(method))
         }
+        installWindowActionProbes(module, controllerClass)
+        installVisibilityTelemetry(module, classLoader)
         HookLogger.i(
             TAG,
             "AOD lifetime hooks installed constructors=${controllerClass.declaredConstructors.size} " +
                 "policyMethods=${POLICY_HIDE_METHODS.size}"
         )
+    }
+
+    /**
+     * 观察点 C(上游 b0254d5):DozeHost.setAodVisibility 遥测。当歌词 guard 名义上激活但
+     * 系统仍要求隐藏 AOD 时,把参数与 guard 状态记入日志,用于排查"谁在 guard 激活时
+     * 关掉了 AOD"。纯观察,不改变宿主行为。
+     */
+    private fun installVisibilityTelemetry(module: XposedModule, classLoader: ClassLoader) {
+        val hostClass = SymbolResolver.resolveClass(
+            classLoader, FEATURE_ID, "com.miui.aod.DozeHost"
+        ) ?: return
+        val methods = hostClass.declaredMethods.filter { it.name == "setAodVisibility" }
+        methods.forEach { method ->
+            runCatching {
+                method.isAccessible = true
+                HookRegistry.hook(module, FEATURE_ID, method, VisibilityTelemetryHooker(method))
+            }.onFailure { error ->
+                HookLogger.w(TAG, "AOD visibility telemetry hook unavailable method=${method.name}", error)
+            }
+        }
+        HookLogger.i(TAG, "AOD visibility telemetry hooks installed methods=${methods.size}")
     }
 
     private object ControllerConstructorHooker : Hooker {
@@ -47,14 +78,99 @@ object AodLifetimeHook {
         }
     }
 
+    /**
+     * 观察点 A:policy hide 的放行/抑制全记录。抑制路径已有 AodLifetimeController 日志,
+     * 但放行的 hide 此前完全静默——而放行正是窗口真正关闭的时刻。09:53 故障链里
+     * 09:53:02.8 后 surface 被 detach,却没有任何日志能回答"是谁、以什么参数关掉的"。
+     * 放行时补记参数与调用栈前四帧,直接指认调用方(音乐状态变化?超时?传感器?)。
+     */
     private class PolicyHideHooker(private val method: Method) : Hooker {
         override fun intercept(chain: Chain): Any? {
-            if (AodLifetimeController.suppressPolicyHide(chain.thisObject, method)) return null
+            val suppressed = AodLifetimeController.suppressPolicyHide(chain.thisObject, method)
+            if (suppressed) return null
+            val args = chain.args.joinToString(", ") { it.toString() }
+            val caller = Thread.currentThread().stackTrace
+                .drop(3).take(4)
+                .joinToString(" <- ") { it.methodName }
+            HookLogger.i(
+                TAG,
+                "policyHide ${method.name} allowed args=[$args] caller=$caller"
+            )
             return chain.proceed()
         }
     }
 
+    /**
+     * 观察点 B-2:show/hide 类无参 void 方法的纯观察探针,不改行为。回答"前奏期间系统有
+     * 没有尝试重新拉起窗口"——若 show 侧从未 enter,则复活机制需要主动触发而非等待。
+     * POLICY_HIDE_METHODS 已由 [PolicyHideHooker] 覆盖(带 caller 栈),此处排除避免重复 hook。
+     */
+    private fun installWindowActionProbes(module: XposedModule, controllerClass: Class<*>) {
+        var installed = 0
+        for (method in controllerClass.declaredMethods) {
+            if (method.returnType != Void.TYPE || method.parameterTypes.isNotEmpty()) continue
+            if (method.name !in WINDOW_ACTION_METHODS) continue
+            runCatching {
+                method.isAccessible = true
+                HookRegistry.hook(module, FEATURE_ID, method, WindowActionProbeHooker(method))
+                installed++
+            }
+        }
+        HookLogger.i(TAG, "window action probes installed=$installed candidates=${WINDOW_ACTION_METHODS.size}")
+    }
+
+    private class WindowActionProbeHooker(private val method: Method) : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            HookLogger.i(TAG, "ctlAction ${method.name} enter")
+            return try {
+                chain.proceed().also { HookLogger.i(TAG, "ctlAction ${method.name} exit") }
+            } catch (error: Throwable) {
+                HookLogger.i(TAG, "ctlAction ${method.name} threw=${error.javaClass.simpleName}")
+                throw error
+            }
+        }
+    }
+
+    private class VisibilityTelemetryHooker(private val method: Method) : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            // 宿主移交接缝:本 hook 每次可见性变化都拿到活的 DozeHost,是 ROM 预加载/复用
+            // AOD 插件(实例早于构造器 hook)时唯一能供出唤醒宿主的接缝。两个边沿都收编,
+            // 不只 hide,确保 AOD 拉起期间捕获的引用就是稍后服务唤醒的同一份(上游 99ba119)。
+            AodWakeBroker.adoptHost(chain.thisObject, "set_aod_visibility")
+            val hidden = chain.args.firstOrNull() as? Boolean == false
+            if (hidden) {
+                HookLogger.i(
+                    TAG,
+                    "DozeHost.setAodVisibility hide args=${chain.args.size} " +
+                        "sig=${method.parameterTypes.joinToString(",") { it.simpleName }} " +
+                        "guard=${AodLifetimeController.isLyricActive()}"
+                )
+            }
+            return chain.proceed()
+        }
+    }
+
+    private fun dumpControllerSurface(controllerClass: Class<*>) {
+        runCatching {
+            controllerClass.declaredMethods.sortedBy { it.name }.forEach { method ->
+                HookLogger.i(
+                    TAG,
+                    "ctl method ${method.name}(" +
+                        method.parameterTypes.joinToString(", ") { it.simpleName } +
+                        "): ${method.returnType.simpleName}"
+                )
+            }
+            controllerClass.declaredFields.sortedBy { it.name }.forEach { field ->
+                HookLogger.i(TAG, "ctl field ${field.name}: ${field.type.simpleName}")
+            }
+        }.onFailure { HookLogger.w(TAG, "controller surface dump failed", it) }
+    }
+
     private val POLICY_HIDE_METHODS = listOf("smartHide", "hideDoze")
+    private val WINDOW_ACTION_METHODS = setOf(
+        "showDoze", "show", "hide", "updateState", "update",
+        "setVisible", "setShowing", "dismiss", "refresh"
+    )
     private const val TAG = "AodLifetimeHook"
 }
 
@@ -76,10 +192,23 @@ object AodLifetimeController {
     }
 
     @Synchronized
+    fun isLyricActive(): Boolean = lyricActive
+
+    /**
+     * Drops pending delayed work owned by this generation so it cannot fire after the
+     * old module class loader is retired by hot reload.
+     */
+    @Synchronized
+    fun cancelPendingForReload() {
+        clearPendingHideLocked()
+    }
+
+    @Synchronized
     fun setLyricActive(active: Boolean) {
         if (lyricActive == active) return
         lyricActive = active
         HookLogger.i(TAG, "Lyric lifetime guard active=$active cause=$guardCause")
+        AodBrightnessController.setLyricGuardActive(active)
         if (active) {
             clearPendingHideLocked()
             activeController.get()?.let(::cancelPolicyTimeouts)

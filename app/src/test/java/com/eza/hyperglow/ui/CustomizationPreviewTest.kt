@@ -1,9 +1,16 @@
 package com.eza.hyperglow.ui
 
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.style.TextAlign
 import com.eza.hyperglow.customization.SceneCompiler
 import com.eza.hyperglow.customization.SurfaceProfile
+import com.eza.hyperglow.root.aod.nextLineTextSizeSp
+import com.eza.hyperglow.root.aod.parseOpaqueColorOrNull
+import com.eza.hyperglow.root.aod.secondaryReadingTextSizeSp
+import com.eza.hyperglow.root.aod.secondaryTranslationTextSizeSp
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -51,5 +58,200 @@ class CustomizationPreviewTest {
         val visible = withMetadataVisible(hidden, true)
         assertTrue(visible.metadataVisible)
         assertTrue(visible.widgets.any { it.type == "metadata" })
+    }
+
+    @Test
+    fun paletteColorWritesAndClearsEverySemanticKey() {
+        // 每个语义色键都能独立写入任意 hex 颜色
+        var palette = emptyMap<String, String>()
+        for (key in PaletteColor.entries) {
+            palette = applyPaletteColor(palette, key, "#123456")
+        }
+        for (key in PaletteColor.entries) {
+            assertEquals("#123456", palette[key.token])
+            assertEquals("#123456", paletteValue(palette, key))
+        }
+
+        // default 只清除对应键并回落默认,其余键保留
+        palette = applyPaletteColor(palette, PaletteColor.METADATA_TEXT, PALETTE_DEFAULT)
+        assertNull(palette[PaletteColor.METADATA_TEXT.token])
+        assertEquals(PALETTE_DEFAULT, paletteValue(palette, PaletteColor.METADATA_TEXT))
+        assertEquals("#123456", palette[PaletteColor.NEXT_LINE_TEXT.token])
+        assertEquals("#123456", palette[PaletteColor.SUNG_TEXT.token])
+    }
+
+    @Test
+    fun paletteEffectiveArgbFallsBackScalesDimmedAndReadsHex() {
+        // 缺省回退到键默认色(歌曲信息默认为灰)
+        assertEquals(
+            PaletteColor.METADATA_TEXT.defaultArgb,
+            paletteEffectiveArgb(emptyMap(), PaletteColor.METADATA_TEXT)
+        )
+        // 任意 hex 原样生效
+        assertEquals(
+            0xFF123456.toInt(),
+            paletteEffectiveArgb(mapOf(PaletteColor.ACCENT.token to "#123456"), PaletteColor.ACCENT)
+        )
+        // dimmed 预设按 72% 亮度折算白色(255 * 0.72 ≈ 184 = 0xB8)
+        assertEquals(
+            0xFFB8B8B8.toInt(),
+            paletteEffectiveArgb(
+                mapOf(PaletteColor.SUNG_TEXT.token to PALETTE_DIMMED),
+                PaletteColor.SUNG_TEXT
+            )
+        )
+    }
+
+    @Test
+    fun argbToColorTokenDropsAlphaChannel() {
+        assertEquals("#FFD9A0", argbToColorToken(0xFFFFD9A0.toInt()))
+        assertEquals("#000000", argbToColorToken(0xFF000000.toInt()))
+    }
+
+    @Test
+    fun parseHexColorInputAcceptsFlexibleHexCodes() {
+        // 取色弹窗的代码输入:允许省略 #、大小写混写、首尾空白;透明度按既有语义忽略。
+        assertEquals(0xFF66CCFF.toInt(), parseHexColorInput("#66CCFF"))
+        assertEquals(0xFF66CCFF.toInt(), parseHexColorInput("66ccff"))
+        assertEquals(0xFF66CCFF.toInt(), parseHexColorInput("  #66CCFF  "))
+        assertEquals(0xFFFF8800.toInt(), parseHexColorInput("#F80"))
+        assertEquals(0xFF00AABB.toInt(), parseHexColorInput("#CC00AABB"))
+    }
+
+    @Test
+    fun parseHexColorInputRejectsGarbage() {
+        assertNull(parseHexColorInput(""))
+        assertNull(parseHexColorInput("   "))
+        assertNull(parseHexColorInput("#GGHHII"))
+        assertNull(parseHexColorInput("#12345"))
+        assertNull(parseHexColorInput("reddish"))
+    }
+
+    @Test
+    fun presetColorsParseAndRoundTripCanonically() {
+        // 预设颜色与颜色 token 名字词表同源:每项可解析且 canonical hex 回写一致(选中态比对依赖此式)。
+        for ((token, _) in PRESET_COLORS) {
+            val parsed = parseOpaqueColorOrNull(token)
+            assertTrue("preset $token must parse", parsed != null)
+            assertEquals(token, argbToColorToken(parsed!!))
+        }
+    }
+
+    @Test
+    fun everyPaletteKeySurvivesSceneCompilation() {
+        // 每个语义色键都必须通过编译白名单(SceneCompiler / SystemUi 两侧 SEMANTIC_COLORS),
+        // 数量随枚举走,不写死 —— 否则删/加键后本测试会静默放过漏配的白名单。
+        val palette = PaletteColor.entries.associate { it.token to "#123456" }
+        val compiled = SceneCompiler.compile(
+            com.eza.hyperglow.customization.CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(palette = palette)
+                )
+            )
+        )
+        val aod = compiled.profiles.getValue(SceneCompiler.SURFACE_AOD)
+        for (key in PaletteColor.entries) {
+            assertEquals("#123456", aod.palette[key.token])
+        }
+    }
+
+    @Test
+    fun previewMetadataTextSizeScalesWithUserPercent() {
+        // 与实机 metadataPaint 同源:14sp 基准 × metadataSizeMultiplier。
+        assertEquals(14f, previewMetadataTextSizeSp(100).value, 0.0001f)
+        assertEquals(7f, previewMetadataTextSizeSp(50).value, 0.0001f)
+        assertEquals(28f, previewMetadataTextSizeSp(200).value, 0.0001f)
+        // 越界值收敛到 50%~200%。
+        assertEquals(7f, previewMetadataTextSizeSp(1).value, 0.0001f)
+        assertEquals(28f, previewMetadataTextSizeSp(900).value, 0.0001f)
+    }
+
+    @Test
+    fun previewTextSizeFollowsDeviceLengthAdaptiveFormula() {
+        // 与实机 setContent 同源:baseTextSizeSp 随行长降档(28/26/24/23sp)× LIVE_CARD_SIZE_MULTIPLIER。
+        assertEquals(28f * 0.68f, previewBaseTextSizeSp("short", "normal", 100), 0.001f)
+        assertEquals(26f * 0.68f, previewBaseTextSizeSp("a".repeat(14), "normal", 100), 0.001f)
+        assertEquals(24f * 0.68f, previewBaseTextSizeSp("a".repeat(22), "normal", 100), 0.001f)
+        assertEquals(23f * 0.68f, previewBaseTextSizeSp("a".repeat(30), "normal", 100), 0.001f)
+        // 字号档倍率与实机 textSizeModeMultiplier 一致(large=1.2/xlarge=1.5,custom=百分比)。
+        assertEquals(28f * 0.68f * 1.2f, previewBaseTextSizeSp("short", "large", 100), 0.001f)
+        assertEquals(28f * 0.68f * 1.5f, previewBaseTextSizeSp("short", "xlarge", 100), 0.001f)
+        assertEquals(28f * 0.68f * 1.5f, previewBaseTextSizeSp("short", "custom", 150), 0.001f)
+    }
+
+    @Test
+    fun previewSecondaryAndNextLineSizesMatchDeviceFormula() {
+        // 与实机 setContent 同源:音标 0.48×base;14/13sp 可读性下限按 baseSp 等比封顶,
+        // 主行被字号档/LIVE_CARD_SIZE_MULTIPLIER 压小时辅助形态仍明显小于主行。
+        assertEquals(11.8f, secondaryReadingTextSizeSp(19.04f), 0.01f)
+        assertEquals(18f, secondaryReadingTextSizeSp(38f), 0.001f)
+        assertEquals(10.8f, secondaryTranslationTextSizeSp(19.04f), 0.01f)
+        assertEquals(17f, secondaryTranslationTextSizeSp(38f), 0.001f)
+        // 真机案例(2026-10-01):LIVE_CARD_SIZE_MULTIPLIER=0.68 下长行 base=23×0.68=15.64sp,
+        // 修复前被 14/13sp 下限顶到 ≈0.9 倍主行,辅助形态视觉失效。
+        assertEquals(9.7f, secondaryReadingTextSizeSp(15.64f), 0.01f)
+        assertEquals(8.7f, secondaryTranslationTextSizeSp(15.64f), 0.01f)
+        // 下一行固定 15sp,不随字号档位缩放。
+        assertEquals(15f, nextLineTextSizeSp(), 0.001f)
+    }
+
+    @Test
+    fun previewSecondaryAlphaFollowsDeviceBrightnessFormula() {
+        // 与实机 drawSecondaryLine 同一公式:bright=不透明,dim 走 AOD 亮度补偿下限。
+        assertEquals(1f, previewSecondaryAlpha(true), 0.001f)
+        assertEquals(0.56f, previewSecondaryAlpha(false), 0.001f)
+    }
+
+    @Test
+    fun previewCardColorMatchesDeviceTokenMap() {
+        // 与实机 AdaptiveLyricCardBackgroundView.cardColorRgb 同一 token 映射(alpha 由 cardAlpha 单独控制)。
+        assertEquals(0x1ED760, previewCardColor("accent", 100).toArgb() and 0xFFFFFF)
+        assertEquals(0x333333, previewCardColor("dark_gray", 100).toArgb() and 0xFFFFFF)
+        assertEquals(0x1A1A1A, previewCardColor("black", 100).toArgb() and 0xFFFFFF)
+        assertEquals(0x1A1A1A, previewCardColor("blur", 100).toArgb() and 0xFFFFFF)
+        assertEquals(0xFFFFFF, previewCardColor("white", 100).toArgb() and 0xFFFFFF)
+        // Compose Color 的 alpha 走 8-bit 量化(0.5f → 128/255),按通道值断言避免浮点容差踩量化误差。
+        assertEquals(128, previewCardColor("black", 50).toArgb() ushr 24)
+        assertEquals(255, previewCardColor("black", 100).toArgb() ushr 24)
+    }
+
+    @Test
+    fun previewRowAlignmentMatchesDeviceResolution() {
+        // 与实机 alignmentFor/setContent 同源(resolveRowAlignmentMode):
+        // 显式行对齐直接生效;auto 跟随主对齐解析(主 auto 时按歌词方向右对齐)。
+        assertEquals(TextAlign.Start, previewRowTextAlign("start", "end", false))
+        assertEquals(TextAlign.Center, previewRowTextAlign("center", "start", true))
+        assertEquals(TextAlign.End, previewRowTextAlign("end", "center", false))
+        assertEquals(TextAlign.Center, previewRowTextAlign("auto", "center", false))
+        assertEquals(TextAlign.End, previewRowTextAlign("auto", "auto", true))
+        assertEquals(TextAlign.Start, previewRowTextAlign("auto", "auto", false))
+        // 非法值按 auto 处理。
+        assertEquals(TextAlign.End, previewRowTextAlign("bogus", "end", false))
+    }
+
+    @Test
+    fun previewCardHeightAdaptsToContentWithinBounds() {
+        // 内容有多高卡片就多高:主字号 xlarge + 副文本/下一行/歌曲信息全部开启时
+        // 内容可远超旧固定高度(150/180dp),自适应后不再裁切。
+        assertEquals(200f, previewCardHeightDp(PREVIEW_CARD_MIN_HEIGHT_DP, 200f), 0.001f)
+        assertEquals(400f, previewCardHeightDp(PREVIEW_CARD_MIN_HEIGHT_DP, 400f), 0.001f)
+        // 不足下限保持卡片形(纯主行小内容不至于塌成一条)。
+        assertEquals(PREVIEW_CARD_MIN_HEIGHT_DP, previewCardHeightDp(0f, 60f), 0.001f)
+        // 超过上限封顶,防止极端字号组合把主页/设置页其余内容挤出屏幕。
+        assertEquals(PREVIEW_CARD_MAX_HEIGHT_DP, previewCardHeightDp(0f, 900f), 0.001f)
+    }
+
+    @Test
+    fun previewCardHeightStaysStableWhileContentWrappingFluctuates() {
+        // 同一配置内取已见最大内容高度:演示行循环/逐行播放时折行数在 1~2 行之间变化,
+        // 直接跟随会让卡片高度来回呼吸、推动下方内容上下跳动。
+        var height = previewCardHeightDp(PREVIEW_CARD_MIN_HEIGHT_DP, 180f)
+        assertEquals(180f, height, 0.001f)
+        height = previewCardHeightDp(height, 150f)
+        assertEquals(180f, height, 0.001f)
+        height = previewCardHeightDp(height, 210f)
+        assertEquals(210f, height, 0.001f)
+        // 配置/换歌重置为下限后重新随内容收缩(remember 键变化即重置)。
+        assertEquals(150f, previewCardHeightDp(PREVIEW_CARD_MIN_HEIGHT_DP, 150f), 0.001f)
     }
 }

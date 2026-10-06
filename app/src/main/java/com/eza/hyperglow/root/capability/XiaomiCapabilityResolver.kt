@@ -3,6 +3,8 @@ package com.eza.hyperglow.root.capability
 import android.content.Context
 import android.os.Build
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import java.util.EnumSet
 
 internal enum class XiaomiCapability {
@@ -40,9 +42,22 @@ internal enum class XiaomiSymbolProbe {
 }
 
 internal enum class XiaomiProfileState(val wireValue: String) {
+    /** A usable surface resolved. How much works is the resolved capability count, not this state. */
+    AVAILABLE("available"),
+
+    /** No usable surface resolved, so nothing can run. */
+    UNSUPPORTED_PROFILE("unsupported_profile"),
+
+    /**
+     * No longer produced by the hook. These described a build by how its SystemUI/AOD version pair
+     * compared against the owner's device; the comparison was retired because it tracked nothing
+     * the symbol probes do not establish directly (上游 6216fdc). Kept so reports persisted by an
+     * older build, or sent by a hook process that has not restarted yet, still decode, and so the
+     * app 端实验模式覆写(UNSUPPORTED/EXPERIMENTAL_ELIGIBLE + 用户开关 → EXPERIMENTAL_ACTIVE)
+     * 继续生效。
+     */
     VERIFIED_PROFILE("verified_profile"),
     VERIFIED_PROFILE_MISSING_SYMBOLS("verified_profile_missing_symbols"),
-    UNSUPPORTED_PROFILE("unsupported_profile"),
     EXPERIMENTAL_ELIGIBLE("experimental_eligible"),
     EXPERIMENTAL_ACTIVE("experimental_active");
 
@@ -141,21 +156,18 @@ internal fun resolveXiaomiCapabilities(
     }
 }
 
+/**
+ * Whether anything can run at all. A build with a usable surface is [XiaomiProfileState.AVAILABLE];
+ * how much of it works is the resolved capability count, which the app reports as a ratio rather
+ * than collapsing into a confidence label.
+ */
 internal fun resolveXiaomiProfileState(
-    verifiedRuntimeProfile: Boolean,
     capabilities: Set<XiaomiCapability>
 ): XiaomiProfileState {
-    if (verifiedRuntimeProfile) {
-        return if (VERIFIED_BASELINE_CAPABILITIES.all(capabilities::contains)) {
-            XiaomiProfileState.VERIFIED_PROFILE
-        } else {
-            XiaomiProfileState.VERIFIED_PROFILE_MISSING_SYMBOLS
-        }
-    }
     val surfaceAvailable = XiaomiCapability.AOD_SURFACE in capabilities ||
         XiaomiCapability.LOCKSCREEN_GEOMETRY in capabilities
     return if (surfaceAvailable) {
-        XiaomiProfileState.EXPERIMENTAL_ACTIVE
+        XiaomiProfileState.AVAILABLE
     } else {
         XiaomiProfileState.UNSUPPORTED_PROFILE
     }
@@ -170,19 +182,6 @@ internal fun missingProbeNames(rawProbes: Map<XiaomiSymbolProbe, Boolean>): Stri
     rawProbes.filterValues { !it }.keys
         .joinToString(",") { it.name }
         .ifEmpty { "none" }
-
-private val VERIFIED_BASELINE_CAPABILITIES = setOf(
-    XiaomiCapability.AOD_SURFACE,
-    XiaomiCapability.AOD_POSITION_UPDATES,
-    XiaomiCapability.AOD_LIFETIME_GUARD,
-    XiaomiCapability.AOD_WAKE_BROKER,
-    XiaomiCapability.LOCKSCREEN_HOST,
-    XiaomiCapability.LOCKSCREEN_GEOMETRY,
-    XiaomiCapability.LINKAGE_DIRECTION,
-    XiaomiCapability.LINKAGE_GEOMETRY,
-    XiaomiCapability.RAISE_TO_AOD,
-    XiaomiCapability.LOCKSCREEN_EDITOR_GESTURE
-)
 
 internal data class XiaomiCapabilityReport(
     val protocolVersion: Int = 2,
@@ -199,8 +198,9 @@ internal data class XiaomiCapabilityReport(
     fun summary(): String = buildString {
         append("systemui=").append(systemUiVersion)
         append(" aod=").append(aodVersion)
-        append(" verified=").append(if (verifiedRuntimeProfile) 1 else 0)
         append(" state=").append(profileState.wireValue)
+        append(" available=").append(capabilities.size)
+            .append('/').append(XiaomiCapability.entries.size)
         append(" capabilities=")
         append(
             XiaomiCapability.entries.joinToString(",") { capability ->
@@ -390,22 +390,20 @@ internal object XiaomiCapabilityResolver {
             fullAod = defaultSymbols.fullAod && aodSymbols.fullAod,
             videoDepth = defaultSymbols.videoDepth
         )
-        val verifiedRuntimeProfile = isVerifiedRuntimeProfile(systemUiVersion, aodVersion)
         val capabilities = resolveXiaomiCapabilities(symbols)
-        val profileState = resolveXiaomiProfileState(
-            verifiedRuntimeProfile = verifiedRuntimeProfile,
-            capabilities = capabilities
-        )
+        val profileState = resolveXiaomiProfileState(capabilities)
         return XiaomiCapabilityReport(
             protocolVersion = 2,
             reportedAtUtcMillis = System.currentTimeMillis(),
             systemUiVersion = systemUiVersion,
             aodVersion = aodVersion,
             symbols = symbols,
-            verifiedRuntimeProfile = verifiedRuntimeProfile,
+            // 两个标志都描述已退役的版本比对(上游 6216fdc)。它们保留在 protocol v2 线上,
+            // 让尚未重启的 hook 进程发出的旧报告仍能解码;现在永远为 false。
+            verifiedRuntimeProfile = false,
             capabilities = capabilities,
             profileState = profileState,
-            experimentalModeActive = profileState == XiaomiProfileState.EXPERIMENTAL_ACTIVE,
+            experimentalModeActive = false,
             rawProbes = symbols.rawProbes()
         )
     }
@@ -431,7 +429,7 @@ internal object XiaomiCapabilityResolver {
     }.getOrDefault("missing")
 
     private fun hasClass(classLoader: ClassLoader, className: String): Boolean =
-        runCatching { classLoader.loadClass(className) }.isSuccess
+        SymbolResolver.resolveClass(classLoader, CAPABILITY_FEATURE, className) != null
 
     private fun hasNoArgMethod(
         classLoader: ClassLoader,
@@ -444,22 +442,18 @@ internal object XiaomiCapabilityResolver {
      * on whatever class declares it, and `readHierarchyField` hands out the same walk at the point
      * of use. Stopping at the named class made a field hoisted into a base class by a ROM refactor
      * read as absent, and an absent probe is indistinguishable from a ROM that never had the
-     * feature.
+     * feature. SymbolResolver's bundled field probe performs the same superclass walk.
      */
     internal fun hasField(
         classLoader: ClassLoader,
         className: String,
         fieldName: String,
         expectedTypeName: String? = null
-    ): Boolean {
-        val field = searchHierarchy(classLoader, className) { owner ->
-            runCatching { owner.getDeclaredField(fieldName) }.getOrNull()
-        } ?: return false
-        if (expectedTypeName == null) return true
-        val expectedType = runCatching { classLoader.loadClass(expectedTypeName) }.getOrNull()
-            ?: return false
-        return expectedType.isAssignableFrom(field.type)
-    }
+    ): Boolean = SymbolResolver.resolveField(
+        classLoader,
+        CAPABILITY_FEATURE,
+        SymbolRequest.field(className, fieldName, expectedTypeName)
+    ) != null
 
     /**
      * True when any candidate class declares [fieldName] (optionally assignable to
@@ -480,42 +474,21 @@ internal object XiaomiCapabilityResolver {
      * `AODView.getDeclaredMethod("onAttachedToWindow")` and hooks that Method. Walking would report
      * the probe present via `android.view.View`, where the hook site would then either fail to
      * resolve or — far worse — bind `View.onAttachedToWindow` for every view in SystemUI. The probe
-     * must answer the same question the hook site asks.
+     * must answer the same question the hook site asks. SymbolResolver's bundled method lookup is
+     * also exact-owner (getDeclaredMethod), so the gate mirrors the hook site.
      */
     internal fun hasMethod(
         classLoader: ClassLoader,
         className: String,
         methodName: String,
         vararg parameterTypeNames: String
-    ): Boolean = runCatching {
-        val owner = classLoader.loadClass(className)
-        val parameterTypes = parameterTypeNames.map { typeName ->
-            primitiveClass(typeName) ?: classLoader.loadClass(typeName)
-        }.toTypedArray()
-        owner.getDeclaredMethod(methodName, *parameterTypes)
-    }.isSuccess
+    ): Boolean = SymbolResolver.resolveMethod(
+        classLoader,
+        CAPABILITY_FEATURE,
+        SymbolRequest.method(className, methodName, *parameterTypeNames)
+    ) != null
 
-    private fun <T : Any> searchHierarchy(
-        classLoader: ClassLoader,
-        className: String,
-        select: (Class<*>) -> T?
-    ): T? {
-        var type = runCatching { classLoader.loadClass(className) }.getOrNull()
-        while (type != null) {
-            val current = type
-            select(current)?.let { return it }
-            type = current.superclass
-        }
-        return null
-    }
-
-    private fun primitiveClass(name: String): Class<*>? = when (name) {
-        "boolean" -> Boolean::class.javaPrimitiveType
-        "int" -> Int::class.javaPrimitiveType
-        "float" -> Float::class.javaPrimitiveType
-        "long" -> Long::class.javaPrimitiveType
-        else -> null
-    }
+    private const val CAPABILITY_FEATURE = "capability-probe"
 
     private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
     private const val AOD_PACKAGE = "com.miui.aod"
@@ -549,12 +522,4 @@ internal object XiaomiCapabilityResolver {
     private const val POWER_MANAGER = "android.os.PowerManager"
     private const val FULL_AOD_MANAGER = "com.miui.interfaces.keyguard.IMiuiFullAodManager"
     private const val VIDEO_DEPTH_SURFACE_HOLDER = "com.miui.keyguard.VideoDepthSurfaceHolder"
-    private const val VERIFIED_SYSTEM_UI_VERSION_CODE = 202501210L
-    // 已验证的 AOD versionCode 集合。22327001 是原始验证版本;22313001 经符号探测确认
-    // 结构一致(所有 16 个 probe 全部命中),纳入白名单让 verified profile 解锁。
-    private val VERIFIED_AOD_VERSION_CODES = setOf(22327001L, 22313001L)
-
-    internal fun isVerifiedRuntimeProfile(systemUiVersion: String, aodVersion: String): Boolean =
-        systemUiVersion.endsWith("($VERIFIED_SYSTEM_UI_VERSION_CODE)") &&
-            VERIFIED_AOD_VERSION_CODES.any { code -> aodVersion.endsWith("($code)") }
 }

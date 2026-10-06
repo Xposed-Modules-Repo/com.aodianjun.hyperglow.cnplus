@@ -41,6 +41,7 @@ class SceneCompilerTest {
                 alignment = "end",
                 secondaryMode = "Both",
                 metadataVisible = "hide",
+                metadataSizePercent = 135,
                 weight = "Bold",
                 fontFamily = "spotify"
             )
@@ -53,6 +54,7 @@ class SceneCompilerTest {
         assertEquals("end", aod.alignment)
         assertEquals("Both", aod.secondaryMode)
         assertFalse(aod.metadataVisible)
+        assertEquals(135, aod.metadataSizePercent)
         assertEquals("Bold", aod.weight)
         assertEquals("spotify", aod.fontFamily)
     }
@@ -97,10 +99,35 @@ class SceneCompilerTest {
             )
         ).profiles.getValue(SceneCompiler.SURFACE_AOD)
 
-        assertEquals(0.5f, compiled.maxHeightFraction)
+        assertEquals(0.3f, compiled.maxHeightFraction)
         assertTrue(compiled.widgets.size <= SceneCompiler.MAX_AOD_WIDGETS)
         assertFalse(compiled.widgets.any { it.type == "media_progress" })
         assertEquals(600, compiled.transition.durationMs)
+    }
+
+    @Test
+    fun aodHeightFixedToMinimumRegardlessOfStoredValue() {
+        val compiled = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(maxHeightFraction = 0.5f),
+                    SceneCompiler.SURFACE_LOCKSCREEN to SurfaceProfile(
+                        enabled = true,
+                        maxHeightFraction = 0.9f
+                    )
+                )
+            )
+        )
+
+        assertEquals(
+            SceneCompiler.AOD_FIXED_MAX_HEIGHT_FRACTION,
+            compiled.profiles.getValue(SceneCompiler.SURFACE_AOD).maxHeightFraction
+        )
+        // 锁屏卡片保留高度档位(仅收敛到上限)。
+        assertEquals(
+            0.8f,
+            compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).maxHeightFraction
+        )
     }
 
     @Test
@@ -146,6 +173,41 @@ class SceneCompilerTest {
                     )
                 )
             ).profiles.getValue(SceneCompiler.SURFACE_AOD).lyricLineLimit
+        )
+    }
+
+    @Test
+    fun betterLyricsAnimationCompilesValidatesOnBothSurfacesAndFallsBackForUnknown() {
+        val compiled = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(animation = "BetterLyrics"),
+                    SceneCompiler.SURFACE_LOCKSCREEN to SurfaceProfile(
+                        enabled = true,
+                        animation = "BetterLyrics"
+                    )
+                )
+            )
+        )
+
+        // 新档在息屏与锁屏两表面原样通过编译与 SystemUI 二次校验(共用同一画布词表)。
+        val validated = SystemUiCustomizationValidator.validate(compiled)!!
+        listOf(SceneCompiler.SURFACE_AOD, SceneCompiler.SURFACE_LOCKSCREEN).forEach { surface ->
+            assertEquals("BetterLyrics", validated.profiles.getValue(surface).animation)
+        }
+
+        // 词表外值保持历史兜底:回落 Gradient(经 SystemUI 校验仍成立)。
+        val unknown = compiled.copy(
+            profiles = compiled.profiles + (
+                SceneCompiler.SURFACE_AOD to compiled.profiles
+                    .getValue(SceneCompiler.SURFACE_AOD)
+                    .copy(animation = "Spotlight word")
+                )
+        )
+        assertEquals(
+            "Gradient",
+            SystemUiCustomizationValidator.validate(unknown)!!.profiles
+                .getValue(SceneCompiler.SURFACE_AOD).animation
         )
     }
 
@@ -214,6 +276,131 @@ class SceneCompilerTest {
                 )
             )!!.profiles.getValue(SceneCompiler.SURFACE_AOD).lineSyncFillMode
         )
+    }
+
+    @Test
+    fun lineTransitionCompilesAndValidatesWithAutoFallback() {
+        val compiled = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(lineTransition = "Slide left")
+                )
+            )
+        )
+        val validated = SystemUiCustomizationValidator.validate(compiled)!!
+
+        assertEquals(
+            "Slide left",
+            validated.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+        )
+        // "Auto"(跟随源)自身保留
+        assertEquals(
+            LINE_TRANSITION_AUTO,
+            SystemUiCustomizationValidator.validate(
+                compiled.copy(
+                    profiles = compiled.profiles + (
+                        SceneCompiler.SURFACE_AOD to compiled.profiles
+                            .getValue(SceneCompiler.SURFACE_AOD)
+                            .copy(lineTransition = LINE_TRANSITION_AUTO)
+                        )
+                )
+            )!!.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+        )
+        // 未知值兜底 "Auto",与 normalizeLineTransition 一致(不引入非法词进 SystemUI)
+        assertEquals(
+            LINE_TRANSITION_AUTO,
+            SystemUiCustomizationValidator.validate(
+                compiled.copy(
+                    profiles = compiled.profiles + (
+                        SceneCompiler.SURFACE_AOD to compiled.profiles
+                            .getValue(SceneCompiler.SURFACE_AOD)
+                            .copy(lineTransition = "Diagonal")
+                        )
+                )
+            )!!.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+        )
+        // 词表内可选项逐一原样通过(历史档 + HyperLyric 预设 id;"Slide left" 上面已验)
+        for (mode in LINE_TRANSITION_MODES.filter { it != LINE_TRANSITION_AUTO && it != "Slide left" }) {
+            assertEquals(
+                mode,
+                SystemUiCustomizationValidator.validate(
+                    compiled.copy(
+                        profiles = compiled.profiles + (
+                            SceneCompiler.SURFACE_AOD to compiled.profiles
+                                .getValue(SceneCompiler.SURFACE_AOD)
+                                .copy(lineTransition = mode)
+                            )
+                    )
+                )!!.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+            )
+        }
+        // #95 短名档归一到同配方预设 id(compile 与 validate 同规则,wire 不触发重写拒收)
+        for ((alias, canonicalId) in mapOf(
+            "Fade left" to "fade_out_left_fade_in_right",
+            "Landing" to "fade_out_left_landing",
+            "Slide swap" to "slide_out_left_slide_in_right"
+        )) {
+            assertEquals(
+                canonicalId,
+                SystemUiCustomizationValidator.validate(
+                    compiled.copy(
+                        profiles = compiled.profiles + (
+                            SceneCompiler.SURFACE_AOD to compiled.profiles
+                                .getValue(SceneCompiler.SURFACE_AOD)
+                                .copy(lineTransition = alias)
+                            )
+                    )
+                )!!.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+            )
+        }
+        // canonicalize 往返同样必须保住字段(compile -> toSurfaceProfile 逐字段重建)。
+        val canonical = CustomizationRepository.canonicalizeDocument(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(lineTransition = "Slide left")
+                )
+            )
+        )!!
+        assertEquals(
+            "Slide left",
+            canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransition
+        )
+    }
+
+    @Test
+    fun lineTransitionSpeedCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 换行动画速率必须穿过 compile、SystemUI 二次校验与仓库 canonicalize 往返
+        // (compile -> toSurfaceProfile 逐字段重建):任一环节漏字段都会让设置保存后
+        // 弹回 Normal(逐字段重建映射的经典回归面)。
+        val document = CustomizationDocument(
+            profiles = mapOf(
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(lineTransitionSpeed = "Fast")
+            )
+        )
+        val compiled = SceneCompiler.compile(document).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("Fast", compiled.lineTransitionSpeed)
+
+        val validated = SystemUiCustomizationValidator.validate(SceneCompiler.compile(document))!!
+            .profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("Fast", validated.lineTransitionSpeed)
+
+        val canonical = CustomizationRepository.canonicalizeDocument(document)!!
+        assertEquals("Fast", canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransitionSpeed)
+        // 默认文档保持 Normal:不改变既有用户的速率。
+        assertEquals(
+            LINE_TRANSITION_SPEED_NORMAL,
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).lineTransitionSpeed
+        )
+        // 非法值兜底 Normal,与 normalizeLineTransitionSpeed 一致(不引入非法词进 SystemUI)。
+        val dirty = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(lineTransitionSpeed = "warp")
+                )
+            )
+        ).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals(LINE_TRANSITION_SPEED_NORMAL, dirty.lineTransitionSpeed)
     }
 
     @Test
@@ -332,7 +519,7 @@ class SceneCompilerTest {
         )!!.profiles.getValue(SceneCompiler.SURFACE_AOD)
 
         assertEquals(listOf("lyrics"), validated.widgets.map { it.type })
-        assertEquals(0.5f, validated.maxHeightFraction)
+        assertEquals(0.9f, validated.maxHeightFraction)
         assertNotNull(WidgetRendererRegistry.renderer("lyrics"))
         assertNull(WidgetRendererRegistry.renderer("arbitrary_class"))
     }
@@ -453,6 +640,222 @@ class SceneCompilerTest {
     }
 
     @Test
+    fun secondaryNextLineCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 辅助文字显示第二行歌词开关必须穿过 compile、SystemUI 二次校验与仓库
+        // canonicalize 往返(compile -> toSurfaceProfile):任一环节漏字段都会让开关
+        // 保存后弹回关闭(逐字段重建映射的经典回归面)。
+        val compiled = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(secondaryNextLine = true)
+                )
+            )
+        ).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertTrue(compiled.secondaryNextLine)
+
+        val validated = SystemUiCustomizationValidator.validate(
+            SceneCompiler.compile(
+                CustomizationDocument(
+                    profiles = mapOf(
+                        SceneCompiler.SURFACE_AOD to SurfaceProfile(secondaryNextLine = true)
+                    )
+                )
+            )
+        )!!.profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertTrue(validated.secondaryNextLine)
+
+        val canonical = CustomizationRepository.canonicalizeDocument(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(secondaryNextLine = true)
+                )
+            )
+        )!!
+        assertTrue(canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryNextLine)
+        // 默认文档保持关闭:不改变既有用户的呈现。
+        assertFalse(
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryNextLine
+        )
+    }
+
+    @Test
+    fun nextLineAuxCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 「显示第二行辅助文字」开关必须穿过 compile、SystemUI 二次校验与仓库 canonicalize
+        // 往返(compile -> toSurfaceProfile):任一环节漏字段都会让开关保存后弹回关闭。
+        val compiled = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(nextLineAux = true)
+                )
+            )
+        ).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertTrue(compiled.nextLineAux)
+
+        val validated = SystemUiCustomizationValidator.validate(
+            SceneCompiler.compile(
+                CustomizationDocument(
+                    profiles = mapOf(
+                        SceneCompiler.SURFACE_AOD to SurfaceProfile(nextLineAux = true)
+                    )
+                )
+            )
+        )!!.profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertTrue(validated.nextLineAux)
+
+        val canonical = CustomizationRepository.canonicalizeDocument(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(nextLineAux = true)
+                )
+            )
+        )!!
+        assertTrue(canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).nextLineAux)
+        // 默认文档保持关闭:不改变既有用户的呈现。
+        assertFalse(
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).nextLineAux
+        )
+    }
+
+    @Test
+    fun secondaryWordKaraokeCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 辅助文字逐字效果开关必须穿过 compile、SystemUI 二次校验与仓库 canonicalize 往返
+        // (compile -> toSurfaceProfile):任一环节漏字段都会让开关保存后弹回关闭;并且
+        // 它是 per-surface 的——只开一面时另一面必须保持关闭(与 secondaryNextLine 同回归面)。
+        val document = CustomizationDocument(
+            profiles = mapOf(
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(secondaryWordKaraoke = true)
+            )
+        )
+        val compiled = SceneCompiler.compile(document)
+        assertTrue(compiled.profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryWordKaraoke)
+        assertFalse(compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).secondaryWordKaraoke)
+
+        val validated = SystemUiCustomizationValidator.validate(SceneCompiler.compile(document))!!
+        assertTrue(validated.profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryWordKaraoke)
+
+        val canonical = CustomizationRepository.canonicalizeDocument(document)!!
+        assertTrue(canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryWordKaraoke)
+        assertFalse(canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).secondaryWordKaraoke)
+        // 默认文档保持关闭:不改变既有用户的辅助文字呈现。
+        assertFalse(
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).secondaryWordKaraoke
+        )
+    }
+
+    @Test
+    fun rowAlignmentsCompileValidateAndSurviveCanonicalizeRoundTrip() {
+        // 歌曲信息/第二行歌词独立对齐必须穿过 compile、SystemUI 二次校验与仓库
+        // canonicalize 往返(compile -> toSurfaceProfile):任一环节漏字段都会让设置
+        // 保存后弹回 auto(逐字段重建映射的经典回归面)。
+        val document = CustomizationDocument(
+            profiles = mapOf(
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(
+                    metadataAlignment = "center",
+                    nextLineAlignment = "end"
+                )
+            )
+        )
+        val compiled = SceneCompiler.compile(document).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("center", compiled.metadataAlignment)
+        assertEquals("end", compiled.nextLineAlignment)
+
+        val validated = SystemUiCustomizationValidator.validate(SceneCompiler.compile(document))!!
+            .profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("center", validated.metadataAlignment)
+        assertEquals("end", validated.nextLineAlignment)
+
+        val canonical = CustomizationRepository.canonicalizeDocument(document)!!
+        assertEquals("center", canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).metadataAlignment)
+        assertEquals("end", canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).nextLineAlignment)
+        // 默认文档保持 auto:不改变既有用户的呈现。
+        val safe = SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+            .profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("auto", safe.metadataAlignment)
+        assertEquals("auto", safe.nextLineAlignment)
+        // 非法值回落 auto(与主对齐 ALIGNMENTS 白名单同规则)。
+        val dirty = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(
+                        metadataAlignment = "bogus",
+                        nextLineAlignment = "diagonal"
+                    )
+                )
+            )
+        ).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        assertEquals("auto", dirty.metadataAlignment)
+        assertEquals("auto", dirty.nextLineAlignment)
+    }
+
+    @Test
+    fun duetAlignmentCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 对唱分侧开关必须穿过 compile、SystemUI 二次校验与仓库 canonicalize 往返
+        // (compile -> toSurfaceProfile):关闭状态是「与默认不同」的值,漏字段会被
+        // 逐字段重建映射静默弹回默认(开启),这正是 secondaryNextLine 的经典回归面。
+        val off = CustomizationDocument(
+            profiles = mapOf(
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(duetAlignment = false)
+            )
+        )
+        assertFalse(SceneCompiler.compile(off).profiles.getValue(SceneCompiler.SURFACE_AOD).duetAlignment)
+        assertFalse(
+            SystemUiCustomizationValidator.validate(SceneCompiler.compile(off))!!
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetAlignment
+        )
+        assertFalse(
+            CustomizationRepository.canonicalizeDocument(off)!!
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetAlignment
+        )
+        // 默认文档保持开启:对唱分侧是既有 alignedRight 渲染语义的默认延续。
+        assertTrue(
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetAlignment
+        )
+    }
+
+    @Test
+    fun duetMarkersCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 「识别对唱标记」是文档级全局开关:关闭状态是「与默认不同」的值,必须穿过
+        // compile、SystemUI 二次校验与仓库 canonicalize 逐字段重建往返,漏字段会被
+        // 静默弹回默认(开启)。
+        val off = CustomizationDocument(duetMarkers = false)
+        assertFalse(SceneCompiler.compile(off).duetMarkers)
+        assertFalse(SystemUiCustomizationValidator.validate(SceneCompiler.compile(off))!!.duetMarkers)
+        assertFalse(CustomizationRepository.canonicalizeDocument(off)!!.duetMarkers)
+        // 默认文档保持开启(标记识别即对唱特性在真实内容上的输入形态)。
+        assertTrue(SceneCompiler.compile(SceneCompiler.safeDefaultDocument()).duetMarkers)
+    }
+
+    @Test
+    fun lyricTimeOffsetCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 「歌词时间偏移」是文档级全局数值:非零值必须穿过 compile、SystemUI 二次校验与
+        // 仓库 canonicalize 逐字段重建往返,漏字段会被静默弹回默认(0)。
+        val custom = CustomizationDocument(lyricTimeOffsetMs = 250)
+        assertEquals(250, SceneCompiler.compile(custom).lyricTimeOffsetMs)
+        assertEquals(
+            250,
+            SystemUiCustomizationValidator.validate(SceneCompiler.compile(custom))!!.lyricTimeOffsetMs
+        )
+        assertEquals(250, CustomizationRepository.canonicalizeDocument(custom)!!.lyricTimeOffsetMs)
+        // fail-closed 归一:越界钳制到 ±5s、按 50ms 档四舍五入;默认文档恒为 0。
+        assertEquals(
+            LyricTimeOffset.MAX_OFFSET_MS,
+            SceneCompiler.compile(CustomizationDocument(lyricTimeOffsetMs = 9_999)).lyricTimeOffsetMs
+        )
+        assertEquals(
+            100,
+            SceneCompiler.compile(CustomizationDocument(lyricTimeOffsetMs = 77)).lyricTimeOffsetMs
+        )
+        assertEquals(
+            0,
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument()).lyricTimeOffsetMs
+        )
+    }
+
+    @Test
     fun systemUiValidatorResetsInvalidCardColorToDefault() {
         val compiled = SceneCompiler.compile(
             CustomizationDocument(
@@ -482,7 +885,7 @@ class SceneCompilerTest {
 
         val tamperedAod = compiled.profiles.getValue(SceneCompiler.SURFACE_AOD).copy(
             anchor = "screen_center",
-            palette = mapOf("primaryText" to "dimmed")
+            palette = mapOf("sungText" to "dimmed")
         )
         val validated = SystemUiCustomizationValidator.validate(
             compiled.copy(profiles = compiled.profiles + (SceneCompiler.SURFACE_AOD to tamperedAod))
@@ -494,7 +897,7 @@ class SceneCompilerTest {
         )
         assertEquals(
             "dimmed",
-            validated.profiles.getValue(SceneCompiler.SURFACE_AOD).palette["primaryText"]
+            validated.profiles.getValue(SceneCompiler.SURFACE_AOD).palette["sungText"]
         )
         assertNotEquals(compiled.hash, validated.hash)
     }
@@ -562,4 +965,236 @@ class SceneCompilerTest {
         assertEquals(150f, resolved.contentRect?.height)
         assertEquals(listOf("lyrics"), resolved.visibleWidgets.map { it.type })
     }
+
+    @Test
+    fun metadataPartsAndSeparatorCompileThroughAndNormalize() {
+        val document = SceneCompiler.safeDefaultDocument().copy(
+            metadataParts = "album,title,bogus",
+            metadataSeparators = "dot"
+        )
+        val compiled = SceneCompiler.compile(document)
+        // 顺序保留(album→title),两个部分一个槽位。
+        assertEquals("album,title", compiled.metadataParts)
+        assertEquals("dot", compiled.metadataSeparators)
+
+        val invalid = SceneCompiler.compile(
+            document.copy(metadataParts = "bogus", metadataSeparators = "unknown")
+        )
+        assertEquals(METADATA_PARTS_DEFAULT, invalid.metadataParts)
+        assertEquals(METADATA_SEPARATOR_NEWLINE, invalid.metadataSeparators)
+
+        // SystemUI 侧校验同样收敛新字段,防止越界配置经 wire 落地。
+        val validated = SystemUiCustomizationValidator.validate(compiled)
+        assertNotNull(validated)
+        assertEquals("album,title", validated?.metadataParts)
+        assertEquals("dot", validated?.metadataSeparators)
+    }
+
+    @Test
+    fun metadataSeparatorsResizeToGapCountThroughCompile() {
+        val document = SceneCompiler.safeDefaultDocument().copy(
+            metadataParts = "artist,title,album",
+            metadataSeparators = "dot"
+        )
+        val compiled = SceneCompiler.compile(document)
+        assertEquals("artist,title,album", compiled.metadataParts)
+        // 三个部分两个槽位:缺项补默认换行。
+        assertEquals("dot,newline", compiled.metadataSeparators)
+        assertEquals("dot,newline", CustomizationRepository.canonicalizeDocument(document)!!.metadataSeparators)
+    }
+
+    @Test
+    fun contentSettingsArePerSurfaceAcrossCompileValidateAndCanonicalize() {
+        // 「歌曲信息内容」与「识别对唱标记」per-surface:息屏显式设置、锁屏未设置时继承文档级,
+        // 编译后两面各自解析、互不联动,并穿过 SystemUI 校验与仓库 canonicalize 往返。
+        val document = SceneCompiler.safeDefaultDocument().copy(
+            metadataParts = "title,artist",
+            metadataSeparators = "dot",
+            duetMarkers = true,
+            hideAlbumWhenSameAsTitle = true,
+            profiles = linkedMapOf(
+                SceneCompiler.SURFACE_LOCKSCREEN to SurfaceProfile(),
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(
+                    metadataParts = "album,title",
+                    metadataSeparators = "newline",
+                    duetMarkers = false,
+                    hideAlbumWhenSameAsTitle = false
+                )
+            )
+        )
+        val compiled = SceneCompiler.compile(document)
+        val lockscreen = compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN)
+        val aod = compiled.profiles.getValue(SceneCompiler.SURFACE_AOD)
+
+        // 息屏按本面设置;锁屏未显式设置时继承文档级默认值。
+        assertEquals("album,title", aod.metadataParts)
+        assertEquals("newline", aod.metadataSeparators)
+        assertFalse(aod.duetMarkers)
+        assertFalse(aod.hideAlbumWhenSameAsTitle)
+        assertEquals("title,artist", lockscreen.metadataParts)
+        assertEquals("dot", lockscreen.metadataSeparators)
+        assertTrue(lockscreen.duetMarkers)
+        assertTrue(lockscreen.hideAlbumWhenSameAsTitle)
+
+        // 校验器与编译同源归一(不改写),否则 wire 的 validate_rewrote_fields 会拒收。
+        assertEquals(compiled, SystemUiCustomizationValidator.validate(compiled))
+
+        // canonicalize 往返后按面独立性保持(锁屏继承值落为显式值,但两面仍各不相同)。
+        val canonical = CustomizationRepository.canonicalizeDocument(document)!!
+        val canonicalAod = canonical.profiles.getValue(SceneCompiler.SURFACE_AOD)
+        val canonicalLockscreen = canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN)
+        assertEquals("album,title", canonicalAod.metadataParts)
+        assertEquals(false, canonicalAod.duetMarkers)
+        assertEquals(false, canonicalAod.hideAlbumWhenSameAsTitle)
+        assertEquals("title,artist", canonicalLockscreen.metadataParts)
+        assertEquals(true, canonicalLockscreen.duetMarkers)
+        assertEquals(true, canonicalLockscreen.hideAlbumWhenSameAsTitle)
+    }
+
+    @Test
+    fun legacySingleSeparatorSeedsEveryGapOnce() {
+        // 旧文档只带单一分隔符:迁移时按当时槽位重复展开,并清空载体(只播种一次)。
+        val legacy = SceneCompiler.safeDefaultDocument().copy(
+            metadataParts = "title,artist,album",
+            metadataSeparator = "dot"
+        )
+        val migrated = CustomizationRepository.migrateDocument(legacy)!!
+        assertEquals("dot,dot", migrated.metadataSeparators)
+        assertNull(migrated.metadataSeparator)
+
+        // 已迁移文档二次迁移不变(载体已清空),用户后续逐槽选择不被覆盖。
+        val diverged = migrated.copy(metadataSeparators = "dot,newline")
+        val reloaded = CustomizationRepository.migrateDocument(diverged)!!
+        assertEquals("dot,newline", reloaded.metadataSeparators)
+    }
+
+    @Test
+    fun artworkSettingsArePerSurfaceAcrossCompileValidateAndCanonicalize() {
+        val document = SceneCompiler.safeDefaultDocument().copy(
+            profiles = linkedMapOf(
+                SceneCompiler.SURFACE_LOCKSCREEN to SurfaceProfile(
+                    artworkVisible = true,
+                    artworkShape = ARTWORK_SHAPE_CIRCLE,
+                    artworkSpin = true,
+                    artworkSpinWhenPaused = true,
+                    artworkAdaptiveScale = false,
+                    artworkSizeDp = 48
+                ),
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(artworkVisible = false)
+            )
+        )
+        val compiled = SceneCompiler.compile(document)
+        val lockscreen = compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN)
+        val aod = compiled.profiles.getValue(SceneCompiler.SURFACE_AOD)
+
+        // per-surface:锁屏开(圆形旋转)、息屏关,互不联动。
+        assertEquals(true, lockscreen.artworkVisible)
+        assertEquals(ARTWORK_SHAPE_CIRCLE, lockscreen.artworkShape)
+        assertEquals(true, lockscreen.artworkSpin)
+        assertEquals(true, lockscreen.artworkSpinWhenPaused)
+        assertEquals(false, lockscreen.artworkAdaptiveScale)
+        assertEquals(48, lockscreen.artworkSizeDp)
+        assertEquals(false, aod.artworkVisible)
+        assertEquals(false, aod.artworkSpinWhenPaused)
+        assertEquals(ARTWORK_SHAPE_SQUARE, aod.artworkShape)
+        assertEquals(false, aod.artworkSpin)
+        assertEquals(true, aod.artworkAdaptiveScale)
+        assertEquals(ARTWORK_SIZE_DEFAULT_DP, aod.artworkSizeDp)
+
+        // 校验器与编译同源归一(不改写),否则 wire 的 validate_rewrote_fields 会拒收。
+        assertEquals(compiled, SystemUiCustomizationValidator.validate(compiled))
+
+        // 回写文档(defaults→canonical)后两面仍各自独立,文档级迁移载体保持清空。
+        val canonical = CustomizationRepository.canonicalizeDocument(document)!!
+        assertEquals(
+            true,
+            canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).artworkVisible
+        )
+        assertEquals(
+            true,
+            canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).artworkSpinWhenPaused
+        )
+        assertEquals(
+            false,
+            canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).artworkAdaptiveScale
+        )
+        assertEquals(
+            48,
+            canonical.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).artworkSizeDp
+        )
+        assertEquals(
+            false,
+            canonical.profiles.getValue(SceneCompiler.SURFACE_AOD).artworkVisible
+        )
+        assertNull(canonical.artworkVisible)
+        assertNull(canonical.artworkShape)
+        assertNull(canonical.artworkSpin)
+    }
+
+    @Test
+    fun legacyDocumentLevelArtworkSeedsBothSurfacesOnce() {
+        // 旧版(文档级)三项全局设置:首次读取播种到两个曲面,载体清空后不再播种。
+        val legacy = SceneCompiler.safeDefaultDocument().copy(
+            artworkVisible = true,
+            artworkShape = ARTWORK_SHAPE_CIRCLE,
+            artworkSpin = true
+        )
+        val migrated = CustomizationRepository.migrateDocument(legacy)!!
+        listOf(SceneCompiler.SURFACE_LOCKSCREEN, SceneCompiler.SURFACE_AOD).forEach { surface ->
+            val profile = migrated.profiles.getValue(surface)
+            assertEquals(true, profile.artworkVisible)
+            assertEquals(ARTWORK_SHAPE_CIRCLE, profile.artworkShape)
+            assertEquals(true, profile.artworkSpin)
+        }
+        assertNull(migrated.artworkVisible)
+        assertNull(migrated.artworkShape)
+        assertNull(migrated.artworkSpin)
+
+        // 已播种文档(载体为空)二次迁移原样通过,不覆盖用户后续的 per-surface 选择。
+        val diverged = migrated.copy(
+            profiles = migrated.profiles + (
+                SceneCompiler.SURFACE_AOD to migrated.profiles
+                    .getValue(SceneCompiler.SURFACE_AOD)
+                    .copy(artworkVisible = false)
+                )
+        )
+        val reloaded = CustomizationRepository.migrateDocument(diverged)!!
+        assertEquals(
+            false,
+            reloaded.profiles.getValue(SceneCompiler.SURFACE_AOD).artworkVisible
+        )
+        assertEquals(
+            true,
+            reloaded.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN).artworkVisible
+        )
+    }
+
+    @Test
+    fun duetConcurrentCompilesValidatesAndSurvivesCanonicalizeRoundTrip() {
+        // 对唱并发行开关必须穿过 compile、SystemUI 二次校验与仓库 canonicalize 往返:
+        // 关闭状态是「与默认不同」的值,漏字段会被逐字段重建映射静默弹回默认(开启),
+        // 这正是 secondaryNextLine/duetAlignment 的经典回归面。
+        val off = CustomizationDocument(
+            profiles = mapOf(
+                SceneCompiler.SURFACE_AOD to SurfaceProfile(duetConcurrent = false)
+            )
+        )
+        assertFalse(
+            SceneCompiler.compile(off).profiles.getValue(SceneCompiler.SURFACE_AOD).duetConcurrent
+        )
+        assertFalse(
+            SystemUiCustomizationValidator.validate(SceneCompiler.compile(off))!!
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetConcurrent
+        )
+        assertFalse(
+            CustomizationRepository.canonicalizeDocument(off)!!
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetConcurrent
+        )
+        // 默认文档保持开启(上游 duetEnabled 同值)。
+        assertTrue(
+            SceneCompiler.compile(SceneCompiler.safeDefaultDocument())
+                .profiles.getValue(SceneCompiler.SURFACE_AOD).duetConcurrent
+        )
+    }
+
 }

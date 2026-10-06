@@ -8,6 +8,7 @@ import com.eza.hyperglow.bridge.SpicyBridgeDocumentStore
 import com.eza.hyperglow.bridge.SpicyBridgeState
 import com.eza.hyperglow.bridge.SpicyBridgeStore
 import com.eza.hyperglow.bridge.SpicyBridgeWord
+import com.eza.hyperglow.customization.LyricTimeOffset
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -56,6 +57,11 @@ class SpicyLyricProducer : LyricProducer {
     override val connection: StateFlow<ProducerConnection> = mutableConnection.asStateFlow()
     private var connectionJob: Job? = null
 
+    internal var contextRef: Context? = null
+
+    /** 文档级「歌词时间偏移」(毫秒)缓存;正数延后、负数提前(见 LyricTimeOffsetPolicy)。 */
+    @Volatile internal var lyricTimeOffsetMs: Int = 0
+
     override val state: StateFlow<LyricProducerState?> =
         combine(SpicyBridgeStore.state, SpicyBridgeDocumentStore.state) { spicy, document ->
             spicy?.let { toProducerState(it, document) }
@@ -85,6 +91,8 @@ class SpicyLyricProducer : LyricProducer {
         // against whether it is actually feeding live data.
         if (connectionJob != null) return
         AppLog.i("SpicyLyricProducer", "start")
+        contextRef = context.applicationContext
+        lyricTimeOffsetMs = loadLyricTimeOffsetMs(contextRef)
         connectionJob = scope.launch {
             while (scope.isActive) {
                 val connected = isSpicyConnected()
@@ -109,6 +117,11 @@ class SpicyLyricProducer : LyricProducer {
         connectionJob = null
         mutableConnection.value = ProducerConnection.DISCONNECTED
         AppLog.i("SpicyLyricProducer", "stop")
+    }
+
+    /** 外部设置变更(文档保存/导入/重置)时刷新「歌词时间偏移」缓存。 */
+    override fun onCustomizationChanged() {
+        lyricTimeOffsetMs = loadLyricTimeOffsetMs(contextRef)
     }
 
     /**
@@ -140,24 +153,31 @@ class SpicyLyricProducer : LyricProducer {
         spicy: SpicyBridgeState,
         document: SpicyBridgeDocument?
     ): LyricProducerState {
-        val position = spicy.positionMs
+        // 「歌词时间偏移」:主行选行与发射坐标走显示时间轴(采样位置 − 偏移);序列去重/
+        // keepalive 等机制层保持原始坐标。nextLine 的选取比较保持原始坐标(见 rawPosition),
+        // 仅发射值换算到显示时间轴。
+        val rawPosition = spicy.positionMs
+        val position = LyricTimeOffset.displayPositionMs(spicy.positionMs, lyricTimeOffsetMs)
         val matchedDocument = document?.takeIf { it.matches(spicy) }
         val timedDocument = matchedDocument?.takeIf { isTimedDocumentType(it.type) }
         val noLyrics = spicy.status == "no_lyrics"
-        val unsynced = matchedDocument != null && timedDocument == null
         val hasTimedLyrics = !noLyrics && timedDocument?.let(::hasActualLyricTiming) == true
         // Active row at the sampled position (null during interludes or when there is no timed
-        // document). Suppressed entirely under no_lyrics so projection falls back to "♪".
+        // document). Suppressed entirely under no_lyrics so projection falls back to "🎶".
         val row = timedDocument?.primaryRowAt(position)?.takeUnless { noLyrics }
-        val lineIndex = row?.let { r -> timedDocument!!.rows.indexOfFirst { it === r } } ?: -1
+        val lineIndex = if (timedDocument != null && row != null) {
+            timedDocument.rows.indexOfFirst { it === row }
+        } else {
+            -1
+        }
 
         // lyricKind: NONE covers both "no lyrics" and "no document" (the latter lets projection
         // use the producer's `line` field as an untimed fallback one-liner). UNSYNCED is a
         // non-timed document. LINE/SYLLABLE come from the timed document's type.
         val lyricKind = when {
             noLyrics || matchedDocument == null -> LyricKind.NONE
-            unsynced -> LyricKind.UNSYNCED
-            isLineLevelDocumentType(timedDocument!!.type) -> LyricKind.LINE
+            timedDocument == null -> LyricKind.UNSYNCED
+            isLineLevelDocumentType(timedDocument.type) -> LyricKind.LINE
             else -> LyricKind.SYLLABLE
         }
 
@@ -175,19 +195,56 @@ class SpicyLyricProducer : LyricProducer {
         val words = if (timedDocument != null && row != null &&
             !isLineLevelDocumentType(timedDocument.type)
         ) {
-            row.words.map(::toProducerWord)
+            row.words.map(::toProducerWord).shiftedByOffset(lyricTimeOffsetMs)
         } else {
             null
         }
 
         val nextLineStartMs = timedDocument?.rows?.asSequence()
             ?.map { it.startMs }
-            ?.filter { it > position }
+            ?.filter { it > rawPosition }
             ?.minOrNull()
-        val nextLineText = timedDocument?.rows?.asSequence()
-            ?.firstOrNull { it.startMs > position }
-            ?.text
-            .orEmpty()
+            ?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) }
+        val nextRow = timedDocument?.rows?.asSequence()
+            ?.firstOrNull { it.startMs > rawPosition }
+        val nextLineText = nextRow?.text.orEmpty()
+        val nextLineRomanized = nextRow?.romanized.orEmpty()
+        val nextLineTranslated = nextRow?.translated.orEmpty()
+
+        // 对唱并发行候选(上游 99ba119d4 同语义):与主行播放窗口重叠 ≥1s 的另一唱词行,
+        // 纯时间轴判定(见 [selectDuetLineIndex]);间奏行(INTERLUDE)不参与。显示与否由
+        // 息屏「显示并发歌词(对唱)」开关在投影层决定(契约:投影不选行,生产者只出候选)。
+        val duetLine = timedDocument?.let { document ->
+            val primaryIndex = if (row == null) -1 else document.rows.indexOfFirst { it === row }
+            val companionIndex = if (primaryIndex < 0) {
+                -1
+            } else {
+                selectDuetLineIndex(
+                    document.rows.map {
+                        DuetLineWindow(it.startMs, it.endMs, it.role == "INTERLUDE")
+                    },
+                    primaryIndex,
+                    position
+                )
+            }
+            document.rows.getOrNull(companionIndex)?.let { second ->
+                LyricDuetLine(
+                    text = second.text,
+                    romanized = second.romanized,
+                    translated = second.translated,
+                    alignedRight = second.alignedRight,
+                    alignedRightMarkers = second.alignedRight,
+                    lineStartMs = LyricTimeOffset.displayMs(second.startMs, lyricTimeOffsetMs),
+                    // 与主行同一渲染钳制:fillEndMs 可越行尾,行级扫光窗口不得越过行尾。
+                    lineEndMs = LyricTimeOffset.displayMs(minOf(second.fillEndMs, second.endMs), lyricTimeOffsetMs),
+                    words = if (isLineLevelDocumentType(document.type)) {
+                        emptyList()
+                    } else {
+                        second.words.map(::toProducerWord).shiftedByOffset(lyricTimeOffsetMs)
+                    }
+                )
+            }
+        }
 
         return LyricProducerState(
             producerId = spicy.producerId,
@@ -203,7 +260,7 @@ class SpicyLyricProducer : LyricProducer {
             romanizedLine = romanizedLine,
             translatedLine = translatedLine,
             lineIndex = lineIndex,
-            positionMs = spicy.positionMs,
+            positionMs = position,
             durationMs = spicy.durationMs,
             sampledAtElapsedMs = spicy.sampledAtElapsedMs,
             speed = spicy.speed,
@@ -223,16 +280,25 @@ class SpicyLyricProducer : LyricProducer {
                 font = spicy.lyricsFont
             ),
             lyricKind = lyricKind,
+            // 源显式分侧:Spicy 不用行首标记作身份输入,两套取值一致。
             alignedRight = row?.alignedRight == true,
-            lineStartMs = row?.startMs ?: 0L,
-            lineEndMs = row?.fillEndMs ?: 0L,
+            alignedRightMarkers = row?.alignedRight == true,
+            lineStartMs = row?.startMs?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) } ?: 0L,
+            // 渲染钳制(上游 8422d78):fillEndMs 可能越过本行 endMs(数据源把跨行的填充
+            // 计算进去),行级扫光的行窗口不得越过行尾。
+            lineEndMs = row?.let { minOf(it.fillEndMs, it.endMs) }
+                ?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) } ?: 0L,
             ruby = row?.ruby?.map { LyricRuby(it.start, it.end, it.reading) } ?: emptyList(),
             layoutGroups = row?.layoutGroups?.map {
                 LyricLayoutGroup(it.start, it.end, it.kind, it.keepTogether, it.confidence)
             } ?: emptyList(),
             hasTimedLyrics = hasTimedLyrics,
             nextLineStartMs = nextLineStartMs,
-            nextLine = nextLineText
+            nextLine = nextLineText,
+            nextLineRomanized = nextLineRomanized,
+            nextLineTranslated = nextLineTranslated,
+            duetLine = duetLine,
+            language = matchedDocument?.language.orEmpty()
         )
     }
 
@@ -247,13 +313,17 @@ class SpicyLyricProducer : LyricProducer {
     )
 
     private fun isTimedDocumentType(type: String): Boolean =
-        type.equals("Line", ignoreCase = true) || type.equals("Syllable", ignoreCase = true)
+        type.equals("Line", ignoreCase = true) || type.equals("Word", ignoreCase = true) ||
+            type.equals("Syllable", ignoreCase = true)
 
     private fun isLineLevelDocumentType(type: String): Boolean =
         type.equals("Line", ignoreCase = true)
 
     private fun hasActualLyricTiming(document: SpicyBridgeDocument): Boolean =
-        isTimedDocumentType(document.type) && document.rows.any { it.endMs > it.startMs }
+        // 间奏行带时间窗但不是唱词:只有间奏的文档不计「有计时」(上游 99ba119)。
+        isTimedDocumentType(document.type) && document.rows.any {
+            it.role != "INTERLUDE" && it.endMs > it.startMs
+        }
 
     companion object {
         /** How often the connection sweep re-checks SpicyBridgeStore freshness. */

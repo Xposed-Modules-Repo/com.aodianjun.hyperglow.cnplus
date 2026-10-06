@@ -4,6 +4,7 @@ import com.eza.hyperglow.aod.AodProjectionEngine
 import com.eza.hyperglow.aod.ProjectionSessionIdentity
 import com.eza.hyperglow.producer.LyricProducerState
 import com.eza.hyperglow.producer.ProducerRenderModes
+import com.eza.hyperglow.root.projection.LYRIC_SNAPSHOT_FRESH_MS
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -66,10 +67,14 @@ class SpicyBridgeDocumentTest {
     }
 
     @Test
-    fun keepAliveUsesBoundedFourSecondCadence() {
+    fun keepAliveBeatsSeveralTimesInsideTheConsumerFreshnessWindow() {
+        val interval = AodProjectionEngine.keepAliveIntervalMs()
+
         assertEquals(true, AodProjectionEngine.keepAliveDue(0, 1_000))
-        assertEquals(false, AodProjectionEngine.keepAliveDue(10_000, 13_999))
-        assertEquals(true, AodProjectionEngine.keepAliveDue(10_000, 14_000))
+        assertEquals(false, AodProjectionEngine.keepAliveDue(10_000, 10_000 + interval - 1))
+        assertEquals(true, AodProjectionEngine.keepAliveDue(10_000, 10_000 + interval))
+        // 单拍迟到不得让消费端持有的投影过期(上游 cc1f62f)。
+        assertTrue(interval * 3 <= LYRIC_SNAPSHOT_FRESH_MS)
     }
 
     @Test
@@ -78,7 +83,7 @@ class SpicyBridgeDocumentTest {
         assertEquals(true, AodProjectionEngine.shouldShowPlaybackFallback("no_lyrics", true))
         assertEquals(false, AodProjectionEngine.shouldShowPlaybackFallback("loading", false))
         assertEquals(false, AodProjectionEngine.shouldShowPlaybackFallback("ready", true))
-        assertEquals("♪", AodProjectionEngine.staticPlaybackPlaceholder("no_lyrics"))
+        assertEquals("🎶", AodProjectionEngine.staticPlaybackPlaceholder("no_lyrics"))
         assertEquals(null, AodProjectionEngine.staticPlaybackPlaceholder("loading"))
     }
 
@@ -103,7 +108,10 @@ class SpicyBridgeDocumentTest {
         val ending = playing.copy(playing = false)
         val pending = ProjectionSessionIdentity.from(ending)
 
-        assertTrue(AodProjectionEngine.pauseConfirmWindowMs() >= 1_500L)
+        // 09:53 切歌故障链:确认窗口必须覆盖网易云 0.96s 间隙 + 歌词加载 + 迟到 onStop。
+        // 1.5s 窗口曾让旧 session 在新歌 loading 期间提交 visible=false,systemui guard
+        // 释放后系统关闭 AOD surface,前奏快照无处可画。
+        assertTrue(AodProjectionEngine.pauseConfirmWindowMs() >= 5_000L)
         assertTrue(
             AodProjectionEngine.shouldCommitPauseRetention(pending, ending, currentActive = true)
         )
@@ -173,14 +181,18 @@ class SpicyBridgeDocumentTest {
     }
 
     @Test
-    fun onlyLineAndSyllableDocumentsAreTimed() {
+    fun onlyLineWordAndSyllableDocumentsAreTimed() {
         assertEquals(true, AodProjectionEngine.isTimedDocumentType("Line"))
+        assertEquals(true, AodProjectionEngine.isTimedDocumentType("Word"))
         assertEquals(true, AodProjectionEngine.isTimedDocumentType("Syllable"))
         assertEquals(false, AodProjectionEngine.isTimedDocumentType("Static"))
         assertEquals(false, AodProjectionEngine.isTimedDocumentType("Unknown"))
         assertEquals(true, AodProjectionEngine.isLineLevelDocumentType("Line"))
+        assertEquals(false, AodProjectionEngine.isLineLevelDocumentType("Word"))
         assertEquals(false, AodProjectionEngine.isLineLevelDocumentType("Syllable"))
         assertEquals(true, AodProjectionEngine.isEffectiveLineLevelSync("Line", 4))
+        assertEquals(false, AodProjectionEngine.isEffectiveLineLevelSync("Word", 4))
+        assertEquals(true, AodProjectionEngine.isEffectiveLineLevelSync("Word", 0))
         assertEquals(false, AodProjectionEngine.isEffectiveLineLevelSync("Syllable", 4))
         assertEquals(true, AodProjectionEngine.isEffectiveLineLevelSync("Syllable", 0))
         assertEquals(false, AodProjectionEngine.isEffectiveLineLevelSync("Unknown", 0))
@@ -222,8 +234,10 @@ class SpicyBridgeDocumentTest {
 
     @Test
     fun malformedIntervalsFailClosed() {
+        // fillEndMs 越过本行 endMs 但未超歌长是合法数据(上游 8422d78),
+        // 真正畸形的是 fillEndMs 早于行起点。
         assertFalse(isValidSpicyBridgeDocumentTiming(
-            document(listOf(row("LEAD", 1_000, 2_800, "line").copy(fillEndMs = 2_900))),
+            document(listOf(row("LEAD", 1_000, 2_800, "line").copy(fillEndMs = 900))),
             acceptedDurationMs = 3_000
         ))
         assertFalse(isValidSpicyBridgeDocumentTiming(
@@ -235,12 +249,65 @@ class SpicyBridgeDocumentTest {
     }
 
     @Test
+    fun fillEndMayExtendPastRowEndWithinSongDuration() {
+        // 上游 8422d78:数据源把跨行填充算进 fillEndMs 是合法数据,
+        // 渲染端另行钳制行窗口,校验不得因此拒收整份文档。
+        val document = document(listOf(
+            row("LEAD", 1_000, 2_800, "line").copy(fillEndMs = 2_900)
+        ))
+
+        assertTrue(isValidSpicyBridgeDocumentTiming(document, acceptedDurationMs = 3_000))
+    }
+
+    @Test
     fun fillEndMayPrecedeActiveWindowEnd() {
         val document = document(listOf(
             row("LEAD", 1_000, 3_000, "line").copy(fillEndMs = 2_500)
         ))
 
         assertTrue(isValidSpicyBridgeDocumentTiming(document, acceptedDurationMs = 3_000))
+    }
+
+    @Test
+    fun timingFaultNamesTheFieldThatDiverged() {
+        val document = document(listOf(row("LEAD", 1_000, 3_000, "line")), durationMs = 3_000)
+
+        assertNull(spicyBridgeDocumentTimingFault(document, acceptedDurationMs = 3_000))
+        assertEquals(
+            "duration document=3000 state=3001",
+            spicyBridgeDocumentTimingFault(document, acceptedDurationMs = 3_001)
+        )
+        assertEquals(
+            "row[0] start=1000 end=3001 duration=3000",
+            spicyBridgeDocumentTimingFault(
+                document(listOf(row("LEAD", 1_000, 3_001, "line")), durationMs = 3_000),
+                acceptedDurationMs = 3_000
+            )
+        )
+        assertEquals(
+            "state-duration=0",
+            spicyBridgeDocumentTimingFault(document, acceptedDurationMs = 0)
+        )
+    }
+
+    @Test
+    fun timingFaultNamesFillEndAndWordOutliers() {
+        assertEquals(
+            "row[0] fillEnd=3001 window=1000..3000",
+            spicyBridgeDocumentTimingFault(
+                document(listOf(row("LEAD", 1_000, 3_000, "line").copy(fillEndMs = 3_001))),
+                acceptedDurationMs = 3_000
+            )
+        )
+        assertEquals(
+            "row[0].word[0] start=2500 end=3001 duration=3000",
+            spicyBridgeDocumentTimingFault(
+                document(listOf(row("LEAD", 1_000, 3_000, "line").copy(
+                    words = listOf(SpicyBridgeWord("word", "", 2_500, 3_001, false))
+                ))),
+                acceptedDurationMs = 3_000
+            )
+        )
     }
 
     @Test

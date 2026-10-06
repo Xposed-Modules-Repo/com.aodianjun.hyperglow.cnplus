@@ -1,23 +1,27 @@
 package com.eza.hyperglow.producer
 
+import android.content.ComponentName
 import android.content.Context
+import android.media.session.MediaSessionManager
 import android.os.Build
 import android.os.SystemClock
 import com.eza.hyperglow.AppLog
-import com.eza.hyperglow.customization.CustomizationRepository
-import com.eza.hyperglow.customization.CompiledSurfaceProfile
-import com.eza.hyperglow.customization.SceneCompiler
+import com.eza.hyperglow.aod.AodRenderPreferences
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.Song
 import io.github.proify.lyricon.lyric.model.extensions.TimingNavigator
-import io.github.proify.lyricon.subscriber.ActivePlayerListener
-import io.github.proify.lyricon.subscriber.ConnectionListener
 import io.github.proify.lyricon.subscriber.LyriconFactory
 import io.github.proify.lyricon.subscriber.LyriconSubscriber
-import io.github.proify.lyricon.subscriber.ProviderInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * [LyricProducer] backed by the lyricon subscriber SDK.
@@ -36,7 +40,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * sourced from [CustomizationRepository.loadCompiled] (the AOD [CompiledSurfaceProfile]).
  * Snapshot is cached and refreshed on song change — never read at 60 Hz.
  *
- * Contract (see `.archcore/lyricon-integration/lyric-producer-contract.spec.md`):
+ * Contract (see `docs/LYRIC_PRODUCER_CONTRACT.md`):
  * - Requires API >= 27 (O_MR1). Below that, `LyriconFactory.createSubscriber` returns
  *   `EmptyLyriconSubscriber`, so this producer is a no-op (spec: API<27 → no-op).
  * - Requires lyricon's Xposed module active in SystemUI; its absence MUST NOT crash HyperGlow.
@@ -52,52 +56,134 @@ import kotlinx.coroutines.flow.asStateFlow
  *   Injected in unit tests so [emit] can run without Android's [SystemClock].
  */
 class LyriconLyricProducer(
-    private val clock: () -> Long = SystemClock::elapsedRealtime
+    internal val clock: () -> Long = SystemClock::elapsedRealtime
 ) : LyricProducer {
 
     override val id: LyricSource = LyricSource.LYRICON
 
-    private val mutableConnection = MutableStateFlow(ProducerConnection.DISCONNECTED)
+    internal val mutableConnection = MutableStateFlow(ProducerConnection.DISCONNECTED)
     override val connection: StateFlow<ProducerConnection> = mutableConnection.asStateFlow()
 
-    private val mutableState = MutableStateFlow<LyricProducerState?>(null)
+    internal val mutableState = MutableStateFlow<LyricProducerState?>(null)
     override val state: StateFlow<LyricProducerState?> = mutableState.asStateFlow()
 
-    private var subscriber: LyriconSubscriber? = null
-    private var contextRef: Context? = null
+    internal var subscriber: LyriconSubscriber? = null
+    internal var contextRef: Context? = null
     private var started = false
 
+    // --- Position-feed watchdog ---
+    // The 12:26 capture: onPositionChanged stopped firing entirely (the arbiter later logged
+    // stale age=519s) while [connection] stayed CONNECTED — the SDK's callback path can die
+    // silently (binder drop / internal poller stall) without any disconnect event. Before this
+    // watchdog the only recovery was an app restart. The watchdog force-rebuilds the active
+    // player subscription, mirroring SuperLyricLyricProducer's FORCE_RE_REGISTER pattern.
+    @Volatile internal var lastPositionCallbackElapsedMs: Long = -1L
+    @Volatile internal var lastForcedResubscribeElapsedMs: Long = 0L
+    /**
+     * MediaSession 观测到的播放态(null=未知)。回调链死亡时 onPlaybackStateChanged 不再来,
+     * isPlayingState 会冻结在 false —— 看门狗以本观测兜底(见 [watchdogPlaying])。
+     */
+    @Volatile internal var sessionPlayingObserved: Boolean? = null
+    private val watchdogScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // --- Song-feed watchdog (issue #64) ---
+    // 位置通道活跃(回调持续、值在推进)但歌曲通道已丢(onSongChanged 不再到达,
+    // currentSong 长期为空)的「半死」状态:位置静默看门狗覆盖不到(它只看回调是否
+    // 完全停发),故障时只能靠重启恢复。这里跟踪歌曲缺席起点、provider 切换后等歌
+    // 宽限起点、位置值推进时刻,供 maybeResubscribeOnSongFeed 判定强制重建订阅;
+    // 重建后 SDK 会对当前在播歌曲补发 onSongChanged(与重启等效的恢复路径,见 #56)。
+    @Volatile internal var songAbsentSinceMs: Long = -1L
+    @Volatile internal var providerSyncPendingSinceMs: Long = -1L
+    @Volatile internal var lastPositionFeedValueMs: Long = -1L
+    @Volatile internal var lastAdvancingPositionClockMs: Long = -1L
+    // 去重日志:每个「无歌」纪元只输出一次 position-dropped 告警,加载歌曲后复位。
+    @Volatile internal var noSongDropLogged: Boolean = false
+
+    // --- MediaSession stop detection (issue #27) ---
+    // Lyricon 的 `onPlaybackStateChanged(false)` 对「会话仍 active 但已停止」的播放器(如
+    // 网易云:active=true 且保留 metadata,仅 state 变 null)不会触发,导致 producer 一直
+    // 当作在播,AOD / 概览长期显示旧曲目。这里周期性检查活动播放器对应 MediaSession 的真实
+    // 播放状态:STATE_NONE / STATE_STOPPED / null 判定为「已停止」,按 onSongChanged(null)
+    // 清空曲目;STATE_PAUSED 判定为「暂停」保留(现有暂停驻留链路负责后续超时清除)。
+    @Volatile internal var activeProviderPackage: String? = null
+    /**
+     * 活动**播放器**应用包名(`ProviderInfo.playerPackageName`)。与 [activeProviderPackage]
+     * (歌词提供端插件包名)不同,这是「谁在播」的答案,「当前音频源是不是音乐」的判定输入
+     * (见 [activeSourceEligible])。
+     */
+    @Volatile internal var activePlayerPackage: String? = null
+    @Volatile private var stopConverged = false
+    @Volatile private var stoppedStreak = 0
+    private var mediaSessionManager: MediaSessionManager? = null
+    private var notificationListenerComponent: ComponentName? = null
+
     // --- Ingress state, updated by playerListener; read by emit(). @Volatile for cross-thread. ---
-    @Volatile private var currentSong: Song? = null
-    @Volatile private var navigator: TimingNavigator<RichLyricLine>? = null
-    @Volatile private var currentPositionMs: Long = 0L
-    @Volatile private var isPlayingState: Boolean = false
-    @Volatile private var currentLineIndex: Int = -1
-    @Volatile private var cachedWords: List<LyricWord>? = null
-    @Volatile private var renderModesSnapshot: ProducerRenderModes = defaultRenderModes()
+    @Volatile internal var currentSong: Song? = null
+    @Volatile internal var navigator: TimingNavigator<RichLyricLine>? = null
+    @Volatile internal var currentPositionMs: Long = 0L
+    @Volatile internal var isPlayingState: Boolean = false
+    @Volatile internal var currentLineIndex: Int = -1
+    @Volatile internal var cachedWords: List<LyricWord>? = null
+    @Volatile internal var renderModesSnapshot: ProducerRenderModes = defaultRenderModes()
+
+    // --- 对唱左右分侧快照(切歌时重算,见 refreshDuetAlignment) ---
+    /**
+     * 按演唱者身份解析后的逐行右对齐(源显式值优先,见 [resolveDuetAlignment])。
+     * 是否生效由渲染侧的「对唱分侧」开关决定(见 root/aod/duetAlignedRight)。
+     */
+    @Volatile internal var duetResolvedAlignedRight: BooleanArray? = null
+
+    /**
+     * 标记识别版分侧快照(元数据身份缺失时以行首「（男）/（女）/（合）」演唱者文本标记兜底,
+     * 「（副歌）」等段落标记不产出身份),与 [duetResolvedAlignedRight] 同时机重算;
+     * [activeAlignedRight] 按 [duetMarkersEnabled] 在两套之间选用。
+     */
+    @Volatile internal var duetMarkerResolvedAlignedRight: BooleanArray? = null
+
+    // --- 对唱并发行候选缓存(见 duetLineCandidate):时间窗按行表引用缓存、词级按行下标
+    // 缓存,60Hz emit 不重扫不重排;行表引用变化(切歌)即自然失效,resetToIdle 兜底清理。
+    @Volatile internal var duetWindowsCache: List<DuetLineWindow>? = null
+    @Volatile internal var duetWindowsCacheSource: Array<RichLyricLine>? = null
+    @Volatile internal var duetWordsCache: List<LyricWord>? = null
+    @Volatile internal var duetWordsCacheIndex: Int = -1
+
+    /** 文档级「识别对唱标记」开关缓存(见 refreshDuetMarkerPolicy);默认开启。 */
+    @Volatile internal var duetMarkersEnabled: Boolean = true
+
+    /** 文档级「歌词时间偏移」(毫秒)缓存(见 LyricTimeOffsetPolicy);正数延后、负数提前。 */
+    @Volatile internal var lyricTimeOffsetMs: Int = 0
 
     // --- Position extrapolation state ---
     // When the player process is frozen by MIUI screen-off, the shared-memory position stops
     // updating but onPositionChanged keeps firing at ~60 Hz with the same stalled value. To keep
     // lyrics advancing, we extrapolate: currentPositionMs = lastRealPosition + elapsed wall-clock.
-    @Volatile private var lastRealPositionMs: Long = 0L
-    @Volatile private var lastRealPositionClockMs: Long = -1L
-    @Volatile private var extrapolating: Boolean = false
+    @Volatile internal var lastRealPositionMs: Long = 0L
+    @Volatile internal var lastRealPositionClockMs: Long = -1L
+    @Volatile internal var extrapolating: Boolean = false
+
+    // --- Extrapolation budget / unknown position ---
+    // When the position source goes silent while playing, extrapolation advances the lyric for at
+    // most MAX_EXTRAPOLATION_MS. Past that the writer is treated as dead (not merely screen-off
+    // frozen): position is marked unknown and the active line is cleared so we never extrapolate
+    // all the way to the song end over a long stall (the 19:33 capture extrapolated ~3m39s past
+    // the real paused position and landed on the last line).
+    @Volatile internal var positionUnknown: Boolean = false
 
     // --- Stale detection ---
     // If no real position update arrives for STALE_THRESHOLD_MS, the shared-memory writer
     // may be completely dead (not just stalled). Log a warning so the arbiter can consider
     // falling back to another producer.
-    @Volatile private var lastRealPositionUpdateMs: Long = -1L
+    @Volatile internal var lastRealPositionUpdateMs: Long = -1L
 
     // --- Residual position rejection (song change) ---
-    // After onSongChanged, the shared memory may still hold the previous song's position for
-    // ~30s until the player writes the new song's progress. Without filtering, the first
+    // After onSongChanged, the shared memory may still hold the previous song's position for a
+    // long time until the player writes the new song's progress. Without filtering, the first
     // onPositionChanged with the stale value overwrites our reset (stale != 0 → "resumed" branch).
-    // We reject any position that exactly matches the previous song's last position, within a
-    // time window after song change. Once a different (real) position arrives, filtering stops.
-    @Volatile private var previousSongLastPositionMs: Long = -1L
-    @Volatile private var songChangeClockMs: Long = 0L
+    // We reject any position that exactly matches the previous song's last position until a
+    // different (real) position arrives — there is no fixed window, because NetEase's outro +
+    // intro can leave the position source silent past any window, and the first value on resume
+    // is still the old song's position.
+    @Volatile internal var previousSongLastPositionMs: Long = -1L
 
     // --- Seek residual position rejection ---
     // After onSeekTo, the shared memory may still return the pre-seek position for a short
@@ -106,310 +192,60 @@ class LyriconLyricProducer(
     // so the active line snaps back to the old position. We reject any position that exactly
     // matches the pre-seek position within a window after the seek. Once a different (real)
     // position arrives, filtering stops.
-    @Volatile private var seekRejectPositionMs: Long = -1L
-    @Volatile private var seekClockMs: Long = 0L
+    @Volatile internal var seekRejectPositionMs: Long = -1L
+    @Volatile internal var seekClockMs: Long = 0L
+
+    // --- Pause-stale residual rejection (issue #10) ---
+    // 播放在位置源已 stalled(AOD Doze 冻结)时暂停:共享内存仍持有暂停前的陈旧值(实测
+    // 陈旧 16665ms,而媒体真实暂停点已达 23435ms)。暂停时我们把基准 re-base 到展示
+    // (外推)位置 —— 即媒体真实暂停点;写入端若仍冻结,会以 ~60Hz 持续回传该陈旧值,
+    // 它 != re-base 后的新基准,会被误当成暂停后的真实更新,把歌词行拉回更早的行。
+    // 因此记录该陈旧值并拒绝,直到出现不同的(真实)位置。
+    @Volatile internal var pauseStaleRejectMs: Long = -1L
+
+    // --- Post-song-change position plausibility gate (issue #11) ---
+    // 切歌后共享内存写入端的 base 元组可能仍是旧歌时间线(Doze 冻结了 base 更新,位置按
+    // "base + 墙钟 × 速度" 公式续算):残留值 ≈ 切歌时旧歌时间线位置(≈旧歌时长),此后与
+    // 真实位置同速推进、恒定偏移。旧歌比新歌长 → 残留越界(实测 487520ms > 188718ms,
+    // 钳到歌尾清行导致整首无歌词);旧歌比新歌短 → 残留落在新歌时长内,被当真实值接受
+    // 会让歌词整段错位。门控:切歌后首个真实位置必须 ≤ 切歌后墙钟 × 观测速率 + 容差
+    // —— 新歌从切歌时刻起播,位置不可能更多;残留因恒定偏移(≈旧歌时长,远大于容差)
+    // 被持续拒绝,期间从基准 0 外推(新歌正确推进,歌尾仍按 issue #9 钳制收尾)。首个
+    // 可信值或 onSeekTo 后开门,恢复正常信任(wrap-around/seek/loop 均走既有逻辑)。
+    @Volatile internal var songStartGateOpen = true
+    @Volatile internal var songStartClockMs = 0L
+    // 残留的推进速率(累计 Δpos/Δwall):残留与真实位置同速推进,其增量给出真实倍速,
+    // 用于上界防止 1.25x~3x 倍速用户的真实位置在容差耗尽后被 1x 上界误拒。冻结残留
+    // (Δpos=0,暂停型)不更新速率。
+    @Volatile internal var gateRateX = 1.0
+    @Volatile internal var gateRateAnchorPosMs = -1L
+    @Volatile internal var gateRateAnchorClockMs = 0L
+    // 首个被门控拒绝的残留值:冻结型残留会以 ~60Hz 重复回传同一值,即使上界随墙钟
+    // 增长追上该值后也必须继续拒绝(暂停状态跳歌的场景)。
+    @Volatile internal var gateFrozenRejectMs = -1L
+
+    // issue #56:(重)连接后 SDK 会对「当前正在播放的歌」补发一次 onSongChanged。只有本次
+    // 连接会话内已经见过歌时,后续 onSongChanged 才按「切歌」处理(归零 + 关闸);首次补发
+    // 按「重同步」处理 —— 否则歌中途的真实位置会被合理性门控当残留拒绝,歌词从第 1 句
+    // 重新开始,整条时间轴平移「已播时长」。
+    // 判定窗口的武装点是「订阅动作」:start()/强制重建订阅/断连/连接超时 —— 不在连接回调里
+    // 复位。真机实测 SDK 会先投递补发的 onSongChanged、12ms 后才回调 connected(2026-09-29
+    // 《淑女的品格》整首无歌词):连接回调复位会把已被补发消费的窗口重新打开,下一首真·切歌
+    // 被误判为重同步,旧歌冻结残留被当真实位置接受、跳歌尾钳制清行。
+    @Volatile internal var songSeenSinceSubscribe = false
+
+    // issue #56 建议四:门控拒绝路径留一条去重日志(position/bound/sinceStart/duration/歌名),
+    // 便于现场直接判定「旧时间线残留」还是「中途订阅被误拒」。
+    @Volatile internal var gateRejectLogged = false
 
     // Session/sequence for arbiter dedup (producerId:generation:sequence).
-    @Volatile private var generation: Int = 0
-    @Volatile private var sequence: Long = 0L
 
-    internal val connectionListener = object : ConnectionListener {
-        override fun onConnected(s: LyriconSubscriber) {
-            AppLog.i("LyriconLyricProducer", "connected")
-            mutableConnection.value = ProducerConnection.CONNECTED
-        }
+    @Volatile internal var generation: Int = 0
+    @Volatile internal var sequence: Long = 0L
 
-        override fun onReconnected(s: LyriconSubscriber) {
-            AppLog.i("LyriconLyricProducer", "reconnected")
-            mutableConnection.value = ProducerConnection.RECONNECTED
-        }
+    internal val connectionListener = createConnectionListener()
 
-        override fun onDisconnected(s: LyriconSubscriber) {
-            AppLog.i("LyriconLyricProducer", "disconnected")
-            mutableConnection.value = ProducerConnection.DISCONNECTED
-            mutableState.value = null
-        }
-
-        override fun onConnectTimeout(s: LyriconSubscriber) {
-            AppLog.w("LyriconLyricProducer", "connect timeout")
-            mutableConnection.value = ProducerConnection.CONNECT_TIMEOUT
-            mutableState.value = null
-        }
-    }
-
-    internal val playerListener = object : ActivePlayerListener {
-        override fun onActiveProviderChanged(providerInfo: ProviderInfo?) {
-            AppLog.i("LyriconLyricProducer", "provider=${providerInfo?.providerPackageName}")
-            if (providerInfo == null) {
-                // No active player: clear state, let arbiter fall back / go idle.
-                currentSong = null
-                navigator = null
-                currentLineIndex = -1
-                cachedWords = null
-                currentPositionMs = 0L
-                lastRealPositionMs = 0L
-                lastRealPositionClockMs = clock()
-                lastRealPositionUpdateMs = -1L
-                extrapolating = false
-                previousSongLastPositionMs = -1L
-                songChangeClockMs = 0L
-                seekRejectPositionMs = -1L
-                seekClockMs = 0L
-                mutableState.value = null
-            }
-        }
-
-        override fun onSongChanged(song: Song?) {
-            if (song == null) {
-                AppLog.i("LyriconLyricProducer", "onSongChanged: null (cleared)")
-                currentSong = null
-                navigator = null
-                currentLineIndex = -1
-                cachedWords = null
-                currentPositionMs = 0L
-                lastRealPositionMs = 0L
-                lastRealPositionClockMs = clock()
-                lastRealPositionUpdateMs = -1L
-                extrapolating = false
-                previousSongLastPositionMs = -1L
-                songChangeClockMs = 0L
-                seekRejectPositionMs = -1L
-                seekClockMs = 0L
-                mutableState.value = null
-                return
-            }
-            AppLog.i(
-                "LyriconLyricProducer",
-                "onSongChanged: id=${song.id} name=${song.name} artist=${song.artist} " +
-                    "duration=${song.duration}ms lines=${song.lyrics?.size ?: 0}"
-            )
-            // normalize() deep-copies and sorts lyrics by begin (asc, required by TimingNavigator),
-            // dropping invalid lines. Safe to call on the SDK's instance (it doesn't mutate it).
-            val normalized = song.normalize()
-            currentSong = normalized
-            generation++
-            val lyrics = normalized.lyrics
-            navigator = if (!lyrics.isNullOrEmpty()) {
-                TimingNavigator(lyrics.toTypedArray())
-            } else {
-                null
-            }
-            currentLineIndex = -1
-            cachedWords = null
-            // Reset position tracking for the new song. The shared memory may still hold the
-            // previous song's position until the player writes the new one, which caused the
-            // active line to jump to a stale index (e.g. idx=64 on song change).
-            //
-            // Capture the previous song's last position so onPositionChanged can reject the
-            // residual value (it will keep arriving at ~60 Hz until the player writes new progress).
-            // Enable extrapolation from 0 so lyrics advance during the write gap if playing.
-            previousSongLastPositionMs = lastRealPositionMs
-            songChangeClockMs = clock()
-            currentPositionMs = 0L
-            lastRealPositionMs = 0L
-            lastRealPositionClockMs = clock()
-            extrapolating = false
-            refreshRenderModes()
-            emit()
-        }
-
-        override fun onReceiveText(text: String?) {
-            // Plain-text lyrics (no timestamps). Out of scope for karaoke AOD; ignore.
-            AppLog.i("LyriconLyricProducer", "onReceiveText: len=${text?.length} (ignored)")
-        }
-
-        override fun onPlaybackStateChanged(isPlaying: Boolean) {
-            AppLog.i("LyriconLyricProducer", "onPlaybackStateChanged: playing=$isPlaying")
-            isPlayingState = isPlaying
-            // When resuming playback after a pause, reset the extrapolation clock so we don't
-            // jump forward by the entire pause duration on the next stalled position callback.
-            if (isPlaying && lastRealPositionClockMs >= 0L) {
-                lastRealPositionClockMs = clock()
-            }
-            // Re-emit so the engine sees the new playing/speed without waiting for next position.
-            emit()
-        }
-
-        override fun onPositionChanged(position: Long) {
-            // High-frequency (~60 Hz) callback on Dispatchers.Default. This IS the SharedMemory
-            // position, delivered by the SDK's internal poller. Compute the active line and emit.
-            val now = clock()
-            // Reject residual values from the previous song: after onSongChanged, the shared
-            // memory may keep returning the old position until the player writes new progress.
-            // The residual matches the previous song's last position exactly (same bytes in memory).
-            val isResidual = previousSongLastPositionMs >= 0L &&
-                (now - songChangeClockMs) < RESIDUAL_REJECTION_WINDOW_MS &&
-                position == previousSongLastPositionMs
-            if (isResidual) {
-                // Ignore the stale value; extrapolate from the last real position regardless of
-                // isPlayingState. The playing flag is unreliable (MediaSession jitter between
-                // PLAYING↔BUFFERING can leave it stuck at false), and the real position clock
-                // is the only trustworthy signal. When the player is truly paused the shared
-                // memory position is frozen and the extrapolated position drifts harmlessly
-                // (the line stays the same within a typical pause), corrected on resume.
-                if (lastRealPositionClockMs >= 0L) {
-                    val elapsed = now - lastRealPositionClockMs
-                    currentPositionMs = lastRealPositionMs + elapsed
-                    if (!extrapolating) {
-                        extrapolating = true
-                        AppLog.i(
-                            "LyriconLyricProducer",
-                            "residual position rejected ($position ms matches previous song); " +
-                                "extrapolating from ${lastRealPositionMs}ms -> ${currentPositionMs}ms"
-                        )
-                    }
-                }
-                recomputeAndEmit()
-                return
-            }
-            // Reject the pre-seek stale value that lingers right after a seek. The old value
-            // (still in shared memory) != the seek target, so without this it would be accepted
-            // by the "resumed" branch below and snap the active line back to the old position.
-            val isSeekResidual = seekRejectPositionMs >= 0L &&
-                (now - seekClockMs) < SEEK_RESIDUAL_REJECTION_WINDOW_MS &&
-                position == seekRejectPositionMs
-            if (isSeekResidual) {
-                if (lastRealPositionClockMs >= 0L) {
-                    val elapsed = now - lastRealPositionClockMs
-                    currentPositionMs = lastRealPositionMs + elapsed
-                    if (!extrapolating) {
-                        extrapolating = true
-                        AppLog.i(
-                            "LyriconLyricProducer",
-                            "seek residual rejected ($position ms matches pre-seek); " +
-                                "extrapolating from ${lastRealPositionMs}ms -> ${currentPositionMs}ms"
-                        )
-                    }
-                }
-                recomputeAndEmit()
-                return
-            }
-            if (position != lastRealPositionMs) {
-                // Real position update from shared memory.
-                // Accept wrap-around: when the song loops (single-track repeat), the shared
-                // memory position resets to 0 while our extrapolated position may be at/beyond
-                // duration. Treat a significantly lower position as a wrap-around rather than
-                // rejecting it.
-                val wasExtrapolating = extrapolating
-                // When the player's position stream resumes after a stall it can briefly report a
-                // value slightly *below* the position we extrapolated to (shared-memory latency /
-                // stall-to-resume race). NetEase's ~60 Hz feed stalls and resumes constantly, so
-                // snapping backward on every such resume rewinds the active line and makes it
-                // flicker back and forth across a boundary. Within a small tolerance we keep the
-                // monotonic extrapolated value (re-basing the extrapolation clock on it) so the
-                // line advances smoothly; only a materially-lower real position (seek, song
-                // wrap-around, or a genuine pause) is honored as a rewind.
-                val realBehindMs = currentPositionMs - position
-                val monotonicResume = wasExtrapolating &&
-                    realBehindMs in 1..EXTRAPOLATION_RESUME_TOLERANCE_MS
-                if (monotonicResume) {
-                    lastRealPositionMs = currentPositionMs
-                    lastRealPositionClockMs = now
-                    lastRealPositionUpdateMs = now
-                } else {
-                    lastRealPositionMs = position
-                    lastRealPositionClockMs = now
-                    lastRealPositionUpdateMs = now
-                    currentPositionMs = position
-                }
-                // A different value means the player has started writing the new song's progress.
-                // Disable residual filtering — subsequent positions are from the new song.
-                previousSongLastPositionMs = -1L
-                // A real (different) position means the player has written the post-seek value;
-                // stop rejecting the pre-seek position.
-                seekRejectPositionMs = -1L
-                if (wasExtrapolating && !monotonicResume) {
-                    extrapolating = false
-                    AppLog.i(
-                        "LyriconLyricProducer",
-                        "position resumed: pos=${position}ms (extrapolation stopped)"
-                    )
-                }
-            } else if (lastRealPositionClockMs >= 0L) {
-                // Position stalled (shared-memory writer frozen by MIUI screen-off). Extrapolate
-                // from the last real position using wall-clock elapsed time. This keeps lyrics
-                // advancing during AOD when the player process is frozen.
-                //
-                // Un-gated from isPlayingState: MediaSession jitter between PLAYING↔BUFFERING
-                // can leave the flag stuck at false while the song is actually playing, causing
-                // the lyrics to freeze permanently. The real position clock is the authoritative
-                // signal. When the player is truly paused, the shared memory position is frozen
-                // and the extrapolated drift is corrected on resume.
-                //
-                // Un-capped from duration: when a song loops (single-track repeat), the shared
-                // memory position resets to 0 but our extrapolation would be capped at duration,
-                // freezing the line at the end. Letting it exceed allows the real position to
-                // correct it when the loop restarts.
-                val elapsed = now - lastRealPositionClockMs
-                currentPositionMs = lastRealPositionMs + elapsed
-                val duration = currentSong?.duration ?: 0L
-                // Stale detection: if we haven't seen a real position update for too long, the
-                // shared-memory writer may be completely dead (not just screen-off frozen).
-                // Log a warning so the arbiter can consider falling back to another producer.
-                if (lastRealPositionUpdateMs >= 0L &&
-                    now - lastRealPositionUpdateMs > STALE_POSITION_THRESHOLD_MS
-                ) {
-                    if (lastRealPositionUpdateMs != Long.MAX_VALUE) {
-                        lastRealPositionUpdateMs = Long.MAX_VALUE // one-shot log
-                        val staleSec = (now - lastRealPositionClockMs) / 1000
-                        AppLog.w(
-                            "LyriconLyricProducer",
-                            "position stale for ${staleSec}s (last real=${lastRealPositionMs}ms " +
-                                "extrapolated=${currentPositionMs}ms duration=${duration}ms)" +
-                                if (duration > 0L && currentPositionMs > duration) {
-                                    " — song may have looped"
-                                } else {
-                                    " — shared-memory writer may be dead"
-                                }
-                        )
-                    }
-                }
-                if (!extrapolating) {
-                    extrapolating = true
-                    AppLog.i(
-                        "LyriconLyricProducer",
-                        "position stalled, extrapolating: base=${lastRealPositionMs}ms " +
-                            "elapsed=${elapsed}ms -> ${currentPositionMs}ms"
-                    )
-                }
-            }
-            recomputeAndEmit()
-        }
-
-        override fun onSeekTo(position: Long) {
-            AppLog.i("LyriconLyricProducer", "onSeekTo: pos=${position}ms old=${lastRealPositionMs}ms")
-            val now = clock()
-            // Record the pre-seek position so onPositionChanged can reject the stale shared-memory
-            // value that lingers right after the seek (old != seek target would otherwise be
-            // accepted as a "real" update and snap the active line back to the old position).
-            seekRejectPositionMs = lastRealPositionMs
-            seekClockMs = now
-            lastRealPositionMs = position
-            lastRealPositionClockMs = now
-            lastRealPositionUpdateMs = now
-            currentPositionMs = position
-            extrapolating = false
-            // A seek is a deliberate position change — clear residual filtering so the new
-            // position is accepted even if it coincidentally matches the previous song's last.
-            previousSongLastPositionMs = -1L
-            // Seek invalidates the navigator's sequential cache (playback jumped).
-            navigator?.resetCache()
-            currentLineIndex = -1
-            cachedWords = null
-            recomputeAndEmit()
-        }
-
-        override fun onDisplayTranslationChanged(isDisplayTranslation: Boolean) {
-            // HyperGlow controls translation display via its own CustomizationRepository; ignore
-            // the lyricon-side toggle to avoid double-toggling.
-            AppLog.i("LyriconLyricProducer", "onDisplayTranslationChanged: $isDisplayTranslation (ignored, owned by HyperGlow)")
-        }
-
-        override fun onDisplayRomaChanged(isDisplayRoma: Boolean) {
-            // Same as above: romanization display is owned by HyperGlow's render modes.
-            AppLog.i("LyriconLyricProducer", "onDisplayRomaChanged: $isDisplayRoma (ignored, owned by HyperGlow)")
-        }
-    }
+    internal val playerListener = createPlayerListener()
 
     override fun start(context: Context) {
         if (started) {
@@ -418,6 +254,15 @@ class LyriconLyricProducer(
         }
         started = true
         contextRef = context.applicationContext
+        // issue #64:复位歌曲侧看门狗状态 —— 上一次运行遗留的缺席纪元/等歌宽限不应
+        // 影响本次会话(新订阅建立后 SDK 会重新补发 onSongChanged,见 #56)。
+        songAbsentSinceMs = -1L
+        providerSyncPendingSinceMs = -1L
+        lastPositionFeedValueMs = -1L
+        lastAdvancingPositionClockMs = -1L
+        noSongDropLogged = false
+        // issue #56:新订阅会触发补发 —— 在订阅动作处武装重同步判定窗口(见字段注释)。
+        songSeenSinceSubscribe = false
         AppLog.i("LyriconLyricProducer", "start: api=${Build.VERSION.SDK_INT}")
 
         // API < 27: LyriconFactory returns EmptyLyriconSubscriber (no-op). Per spec, this
@@ -427,15 +272,27 @@ class LyriconLyricProducer(
             return
         }
 
+        // Issue #27: cross-app MediaSession query needs notification access (granted → the
+        // LyricInfoNotificationListener is bound). Best-effort: without it detection is skipped.
+        mediaSessionManager = contextRef?.getSystemService(MediaSessionManager::class.java)
+        notificationListenerComponent = contextRef?.let { ComponentName(it, LyricInfoNotificationListener::class.java) }
+
         AppLog.i("LyriconLyricProducer", "start: creating subscriber")
         val sub = LyriconFactory.createSubscriber(context.applicationContext)
         subscriber = sub
         sub.addConnectionListener(connectionListener)
         val subscribed = sub.subscribeActivePlayer(playerListener)
         AppLog.i("LyriconLyricProducer", "start: subscribeActivePlayer=$subscribed")
+        // 位置静默看门狗的基线:即使从未收到过 onPositionChanged,静默时长也从订阅时刻
+        // 起算(0.3.120 真机:订阅后回调链全聋,基线停在 -1 使看门狗短路,永不重建)。
+        lastPositionCallbackElapsedMs = clock()
         refreshRenderModes()
         sub.register()
         AppLog.i("LyriconLyricProducer", "start: registered with central service")
+        // Position-silence watchdog: recover the callback path if it dies mid-playback.
+        watchdogScope.launch { positionWatchdogLoop() }
+        // MediaSession stop detector: clear tracks whose session reports stopped (issue #27).
+        watchdogScope.launch { stopDetectionLoop() }
     }
 
     override fun stop() {
@@ -445,6 +302,7 @@ class LyriconLyricProducer(
         }
         started = false
         AppLog.i("LyriconLyricProducer", "stop: unregistering")
+        watchdogScope.cancel()
         subscriber?.let { sub ->
             runCatching {
                 sub.unsubscribeActivePlayer(playerListener)
@@ -459,207 +317,396 @@ class LyriconLyricProducer(
         AppLog.i("LyriconLyricProducer", "stop: done")
     }
 
-    /**
-     * Find the active line for [currentPositionMs] via [TimingNavigator], rebuild the per-word
-     * cache only when the line changes, then emit a fresh [LyricProducerState].
-     *
-     * Called at ~60 Hz from [onPositionChanged]; the word-list allocation is amortized by
-     * caching across position-only updates within the same line.
-     */
-    private fun recomputeAndEmit() {
-        val nav = navigator ?: return emit() // no lyrics yet; emit metadata-only state
-        val song = currentSong ?: return
-        val pos = currentPositionMs
-
-        // 歌曲边界处理:息屏后数据源(如网易云)停止写位置,外推会越过歌曲时长继续累加。
-        //
-        // 旧实现用模运算把位置回绕到时长内(pos % duration),但这会让位置在 [0, duration) 间
-        // 反复循环累加:每次回绕到 ~0ms 时 findTargetIndex 选不到行、活动行被清空,而投影层
-        // 因 sampledAtElapsedMs==now 又把回绕后的低位置判为「回到开头」的有效位置
-        // (extrapolationReliable 判定可信),于是行被反复选中/清空 → AOD '♪' 占位闪烁 +
-        // SystemUI 对相同占位 state 无去重的重建风暴(错误清单 #2/#3/#4)。
-        //
-        // 正确语义:外推一旦越过歌曲时长,说明当前这首歌已播完,之后不再有更多行。此时应
-        // 清空活动行并结束外推,让投影层稳定显示占位;同时保持位置不变以触发状态去重,
-        // 避免 60Hz 重复投递。等数据源写回真实位置(重播/切歌)或 onSongChanged 到来时再校正。
-        val duration = song.duration
-        if (extrapolating && duration > 0L && pos >= duration) {
-            currentPositionMs = duration
-            extrapolating = false
-            if (currentLineIndex != -1) {
-                currentLineIndex = -1
-                cachedWords = null
-            }
-            AppLog.i(
-                "LyriconLyricProducer",
-                "extrapolation reached song end: pos=${pos}ms capped=${duration}ms " +
-                    "(duration=${duration}ms); holding stable placeholder"
-            )
-            emit()
-            return
-        }
-
-        val idx = nav.findTargetIndex(currentPositionMs)
-        if (idx < 0) {
-            // Before the first line: no current line yet.
-            if (currentLineIndex != -1) {
-                currentLineIndex = -1
-                cachedWords = null
-            }
-            emit()
-            return
-        }
-        if (idx != currentLineIndex) {
-            currentLineIndex = idx
-            val line = nav.source[idx]
-            cachedWords = line.toLyricWords()
-            AppLog.i(
-                "LyriconLyricProducer",
-                "line changed: idx=$idx begin=${line.begin} end=${line.end} text=${line.text?.take(24)}"
-            )
-        }
-        emit()
+    /** 跨源 seek 转发入口(见 LyricProducer.onExternalSeek):与 onSeekTo 同一处理。 */
+    override fun onExternalSeek(positionMs: Long) {
+        applySeek(positionMs)
     }
 
     /**
-     * Build and emit a [LyricProducerState] from the current ingress fields. Cheap: reuses
-     * [cachedWords] (only rebuilt on line change) and [renderModesSnapshot] (only rebuilt on
-     * song change). Safe to call at 60 Hz.
+     * 「重启歌词源」:重建活动播放器订阅,SDK 会对当前在播歌曲补发 onSongChanged,
+     * 恢复卡死的回调路径(与重启应用等效,见 [forceResubscribeActivePlayer])。
      */
-    private fun emit() {
-        val song = currentSong ?: run { mutableState.value = null; return }
+    override fun restart() {
+        if (subscriber == null) {
+            AppLog.i("LyriconLyricProducer", "restart: no subscriber (no-op)")
+            return
+        }
+        AppLog.i("LyriconLyricProducer", "restart: rebuilding active player subscription")
+        watchdogScope.launch { forceResubscribeActivePlayer("user restart") }
+    }
+
+    /**
+     * 外部设置变更(文档保存/导入/重置)时的重算入口:「歌词时间偏移」、标记开关与渲染模式
+     * 即刻刷新,分侧快照按当前歌重算(无歌时仅刷新缓存)。
+     */
+    @Synchronized
+    override fun onCustomizationChanged() {
+        lyricTimeOffsetMs = loadLyricTimeOffsetMs(contextRef)
+        val lyrics = currentSong?.lyrics
+        if (lyrics.isNullOrEmpty()) {
+            refreshDuetMarkerPolicy()
+        } else {
+            refreshDuetAlignment(lyrics)
+        }
+        refreshRenderModes()
+    }
+
+    /** Issue #27: a brand-new provider/song re-arms the stop detector. */
+    internal fun resetStopDetection() {
+        stopConverged = false
+        stoppedStreak = 0
+    }
+
+    /**
+     * 当前活动音频源是否为音乐(见 [MediaSourcePolicy]):输入是 Lyricon 上报的**播放器**
+     * 包名([ProviderInfo.playerPackageName]),不是歌词提供端插件包名 —— 真机日志里
+     * `provider=io.github.proify.lyricon.cmprovider` 是提供端(网易云插件),对识别
+     * 「谁在播」无用。播放器包名缺失/未知时 fail-open 放行。
+     *
+     * 视频应用播放期间本生产者整体静默(不发射状态、看门狗不重建订阅),让仲裁器回退到
+     * 其他源或进入空闲;关闭「视频/非音乐音频不显示歌词」开关即恢复历史行为。
+     */
+    internal fun activeSourceEligible(): Boolean = MediaSourcePolicy.isLyricEligible(
+        packageName = activePlayerPackage,
+        contentType = null,
+        filterEnabled = contextRef?.let { AodRenderPreferences.read(it).filterNonMusicSources } ?: true
+    )
+
+    /**
+     * Clear all song/lyrics/position ingress and emit a null state — the same idempotent teardown
+     * used by `onSongChanged(null)` / `onActiveProviderChanged(null)`. Backs the MediaSession stop
+     * detector (issue #27) so a stale-active-but-stopped player is fully released.
+     */
+    internal fun resetToIdle(reason: String) {
+        lastRealPositionClockMs = clock()
+        resetStopDetection()
+        currentSong = null
+        navigator = null
+        currentLineIndex = -1
+        cachedWords = null
+        duetResolvedAlignedRight = null
+        duetMarkerResolvedAlignedRight = null
+        duetWindowsCache = null
+        duetWindowsCacheSource = null
+        duetWordsCache = null
+        duetWordsCacheIndex = -1
+        currentPositionMs = 0L
+        lastRealPositionMs = 0L
+        lastRealPositionUpdateMs = -1L
+        extrapolating = false
+        positionUnknown = false
+        previousSongLastPositionMs = -1L
+        seekRejectPositionMs = -1L
+        seekClockMs = 0L
+        pauseStaleRejectMs = -1L
+        songStartGateOpen = true
+        gateRateAnchorPosMs = -1L
+        gateRateX = 1.0
+        gateFrozenRejectMs = -1L
+        // issue #64:进入无歌纪元 —— 起点只在首次缺席时记录,重复的清空(幂等路径)
+        // 不推迟看门狗;provider 等歌宽限视为已被本次 SDK 回调应答,一并清除。
+        if (songAbsentSinceMs < 0L) songAbsentSinceMs = lastRealPositionClockMs
+        providerSyncPendingSinceMs = -1L
+        mutableState.value = null
+        AppLog.i("LyriconLyricProducer", "resetToIdle: $reason")
+    }
+
+    /**
+     * Issue #27 watchdog loop: periodically check the active player's real MediaSession playback
+     * state. Lyricon's `onPlaybackStateChanged(false)` never fires for a session that stays
+     * "active" while stopped (NetEase quirk: active=true, metadata retained, state=null), so the
+     * producer would otherwise keep reporting a stale playing track forever. Once the matched
+     * session reports a definitively-stopped state for [STOP_CONFIRMATIONS] consecutive samples,
+     * release the track like `onSongChanged(null)`.
+     */
+    private suspend fun stopDetectionLoop() {
+        while (watchdogScope.isActive) {
+            delay(STOP_DETECT_INTERVAL_MS)
+            maybeClearOnStoppedPlayer()
+        }
+    }
+
+    private fun maybeClearOnStoppedPlayer() {
+        if (stopConverged) return
+        val pkg = activeProviderPackage ?: return
+        val song = currentSong ?: return
+        // Safety: never clear a track that some session is genuinely still playing (e.g. the SDK
+        // delivered a new app's song while `activeProviderPackage` still points at the stopped
+        // old app). If any actively-playing session carries this song's title, it's live.
+        if (anySessionActiveFor(song.name)) {
+            stoppedStreak = 0
+            return
+        }
+        val state = readActivePlayerPlaybackState(pkg) ?: return
+        if (classifyActivePlayerPlayback(state) == ActivePlayerPlayback.STOPPED) {
+            if (++stoppedStreak >= STOP_CONFIRMATIONS) {
+                stopConverged = true
+                AppLog.i(
+                    "LyriconLyricProducer",
+                    "active player $pkg session stopped (state=$state); clearing stale track"
+                )
+                isPlayingState = false
+                resetToIdle("media-session-stopped (pkg=$pkg, state=$state)")
+            }
+        } else {
+            stoppedStreak = 0
+        }
+    }
+
+    /** True when some active MediaSession is playing and its metadata title matches [title]. */
+    private fun anySessionActiveFor(title: String?): Boolean {
+        val manager = mediaSessionManager ?: return false
+        val component = notificationListenerComponent ?: return false
+        if (title.isNullOrBlank()) return false
+        return runCatching {
+            manager.getActiveSessions(component).any { controller ->
+                classifyActivePlayerPlayback(controller.playbackState?.state) ==
+                    ActivePlayerPlayback.PLAYING &&
+                    controller.metadata?.description?.title == title
+            }
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Read the active player's MediaSession [android.media.session.PlaybackState.getState].
+     * Requires notification access so [MediaSessionManager.getActiveSessions] can see cross-app
+     * sessions; returns null when unavailable (no match / no permission / query error) so the
+     * detector safely no-ops rather than guessing.
+     */
+    private fun readActivePlayerPlaybackState(packageName: String): Int? {
+        val manager = mediaSessionManager ?: return null
+        val component = notificationListenerComponent ?: return null
+        return runCatching {
+            manager.getActiveSessions(component)
+                .firstOrNull { it.packageName == packageName }
+                ?.playbackState
+                ?.state
+        }.getOrNull()
+    }
+
+    /**
+     * 刷新 MediaSession 播放态观测(看门狗兜底依据,见 [watchdogPlaying])。优先读活动
+     * provider 的会话;provider 未知/会话查不到时,仅在已有曲目时退化为「任意活跃会话
+     * 在播」,避免无歌时因其他应用在播而误触发重建。
+     */
+    private fun refreshSessionPlaying() {
+        val pkg = activeProviderPackage
+        val state = if (pkg != null) readActivePlayerPlaybackState(pkg) else null
+        sessionPlayingObserved = when {
+            state != null -> classifyActivePlayerPlayback(state) == ActivePlayerPlayback.PLAYING
+            currentSong != null -> anySessionPlaying()
+            else -> null
+        }
+    }
+
+    /** True when any active MediaSession is playing (bounded fallback for [refreshSessionPlaying]). */
+    private fun anySessionPlaying(): Boolean {
+        val manager = mediaSessionManager ?: return false
+        val component = notificationListenerComponent ?: return false
+        return runCatching {
+            manager.getActiveSessions(component).any {
+                classifyActivePlayerPlayback(it.playbackState?.state) == ActivePlayerPlayback.PLAYING
+            }
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Watchdog loop: rebuild the active-player subscription when the ~60 Hz position feed goes
+     * silent while playing. See [shouldForceResubscribePositionFeed] for the decision rule and
+     * [maybeResubscribeOnPositionSilence] for the recovery action.
+     */
+    private suspend fun positionWatchdogLoop() {
+        while (watchdogScope.isActive) {
+            delay(POSITION_WATCHDOG_POLL_MS)
+            // 非音乐源(视频等)期间看门狗静默:此时「位置在推、歌曲缺失」是预期状态,
+            // 重建订阅只会拿到同一首被忽略的「歌」,白耗 IPC。
+            if (!activeSourceEligible()) continue
+            refreshSessionPlaying()
+            maybeResubscribeOnPositionSilence()
+            maybeResubscribeOnSongFeed()
+        }
+    }
+
+    /**
+     * Recovery action for a silent position feed: unsubscribe + re-subscribe the active player
+     * listener, which re-arms the SDK's internal poller/callback registration. Idempotent-safe
+     * via the cooldown in the decision function; failures are logged and retried after cooldown.
+     */
+    internal fun maybeResubscribeOnPositionSilence() {
+        if (subscriber == null) return
+        val last = lastPositionCallbackElapsedMs
+        if (last < 0L) return // never saw a position callback: nothing to compare yet
         val now = clock()
-        val lyrics = song.lyrics
-        val line = currentLineIndex.let { idx ->
-            if (idx < 0) null else navigator?.source?.getOrNull(idx)
+        val silenceMs = now - last
+        if (!shouldForceResubscribePositionFeed(
+                silenceMs = silenceMs,
+                playing = watchdogPlaying(isPlayingState, sessionPlayingObserved),
+                sinceLastAttemptMs = now - lastForcedResubscribeElapsedMs
+            )
+        ) {
+            return
         }
-        // Active-row fields (spec clause 6: producer computes the active line before emitting).
-        // lyricKind is per-active-line when a line is active; otherwise song-level, so the engine
-        // can still tell "timed lyrics exist, between lines" (INTERLUDE) from "no lyrics" (NONE).
-        val hasTimedLyrics = !lyrics.isNullOrEmpty() &&
-            lyrics.any { it.end > it.begin }
-        val lyricKind = when {
-            lyrics.isNullOrEmpty() -> LyricKind.NONE
-            line != null -> if (!line.words.isNullOrEmpty()) LyricKind.SYLLABLE else LyricKind.LINE
-            else -> if (lyrics.any { !it.words.isNullOrEmpty() }) LyricKind.SYLLABLE
-                else LyricKind.LINE
+        // Re-anchor the heartbeat so the same silence doesn't re-trigger before the next poll.
+        lastPositionCallbackElapsedMs = now
+        forceResubscribeActivePlayer("position feed silent for ${silenceMs}ms while playing")
+    }
+
+    /**
+     * issue #64:「位置在推、歌曲缺失」半死状态的恢复动作。触发条件(全部成立,见
+     * [shouldForceResubscribeSongFeed]):播放中 + 位置值仍在推进(证明播放器真在播、
+     * SDK 位置通道活着)+ 歌曲缺席超阈值(或 provider 切换后等歌超宽限)+ 冷却期外。
+     * 强制重建订阅后 SDK 会对当前在播歌曲补发 onSongChanged,与重启等效(见 #56)。
+     */
+    internal fun maybeResubscribeOnSongFeed() {
+        if (subscriber == null) return
+        val now = clock()
+        val songAbsentMs = songAbsentSinceMs.let { if (it < 0L) -1L else now - it }
+        val providerPendingMs = providerSyncPendingSinceMs.let { if (it < 0L) -1L else now - it }
+        val positionAdvancing = lastAdvancingPositionClockMs >= 0L &&
+            now - lastAdvancingPositionClockMs < SONG_FEED_POSITION_FRESH_MS
+        if (!shouldForceResubscribeSongFeed(
+                playing = watchdogPlaying(isPlayingState, sessionPlayingObserved),
+                songAbsentMs = songAbsentMs,
+                providerSyncPendingMs = providerPendingMs,
+                positionAdvancing = positionAdvancing,
+                sinceLastAttemptMs = now - lastForcedResubscribeElapsedMs
+            )
+        ) {
+            return
         }
-        val nextLineStartMs = lyrics
-            ?.asSequence()
-            ?.map { it.begin }
-            ?.filter { it > currentPositionMs }
-            ?.minOrNull()
-        val nextLineText = lyrics
-            ?.asSequence()
-            ?.firstOrNull { it.begin > currentPositionMs }
-            ?.text
-            .orEmpty()
-        sequence++
-        mutableState.value = LyricProducerState(
-            producerId = PRODUCER_ID,
-            generation = generation,
-            sequence = sequence,
-            status = "ready",
-            trackUri = "lyricon:${song.id ?: song.name}",
-            title = song.name.orEmpty(),
-            artist = song.artist.orEmpty(),
-            album = "",
-            imageId = "",
-            line = line?.text.orEmpty(),
-            romanizedLine = line?.roma.orEmpty(),
-            translatedLine = line?.translation.orEmpty(),
-            lineIndex = currentLineIndex,
-            positionMs = currentPositionMs,
-            durationMs = song.duration,
-            sampledAtElapsedMs = now,
-            speed = if (isPlayingState) 1f else 0f,
-            playing = isPlayingState,
-            receivedAtElapsedMs = now,
-            words = cachedWords,
-            renderModes = renderModesSnapshot,
-            lyricKind = lyricKind,
-            // Lyricon carries no alignment / ruby / layout-group concepts; defaults are correct.
-            alignedRight = false,
-            lineStartMs = line?.begin ?: 0L,
-            lineEndMs = line?.end ?: 0L,
-            ruby = emptyList(),
-            layoutGroups = emptyList(),
-            hasTimedLyrics = hasTimedLyrics,
-            nextLineStartMs = nextLineStartMs,
-            nextLine = nextLineText
+        // 重锚缺席/宽限起点:一次失败的重建不会在冷却后按同一纪元反复重试刷屏;
+        // 若歌曲通道真的恢复,onSongChanged 会把它们清成 -1(见 issue #64)。
+        if (songAbsentSinceMs >= 0L) songAbsentSinceMs = now
+        if (providerSyncPendingSinceMs >= 0L) providerSyncPendingSinceMs = now
+        forceResubscribeActivePlayer(
+            "song feed missing while position advancing " +
+                "(absent=${songAbsentMs}ms providerPending=${providerPendingMs}ms)"
         )
     }
 
     /**
-     * Refresh [renderModesSnapshot] from the AOD [CompiledSurfaceProfile]. Called on start and
-     * song change — NOT at 60 Hz (compile is non-trivial). Per spec clause 5, the lyricon `Song`
-     * carries no render modes, so they are sourced from HyperGlow's own customization.
+     * Shared forced-resubscribe action: rebuild the active-player subscription so the SDK
+     * re-arms its poller and re-delivers the current song/state. Applies the shared attempt
+     * timestamp so every watchdog respects the same cooldown window.
      */
-    @Synchronized
-    private fun refreshRenderModes() {
-        val ctx = contextRef ?: run {
-            renderModesSnapshot = defaultRenderModes()
-            return
-        }
-        renderModesSnapshot = runCatching {
-            val compiled = CustomizationRepository.loadCompiled(ctx)
-            val profile = compiled.profiles[SceneCompiler.SURFACE_AOD]
-            profile?.toProducerRenderModes() ?: defaultRenderModes()
-        }.onFailure {
-            AppLog.w("LyriconLyricProducer", "refreshRenderModes failed, using defaults", it)
-        }.getOrDefault(defaultRenderModes())
+    private fun forceResubscribeActivePlayer(reason: String) {
+        val sub = subscriber ?: return
+        lastForcedResubscribeElapsedMs = clock()
+        AppLog.w("LyriconLyricProducer", "$reason; rebuilding subscription")
+        // issue #56:重建订阅后 SDK 会对当前在播歌曲补发 onSongChanged,与重启等效 —— 在
+        // 订阅动作处武装重同步判定窗口,补发按重同步处理(不归零、门控保持敞开)。
+        songSeenSinceSubscribe = false
+        runCatching {
+            sub.unsubscribeActivePlayer(playerListener)
+            sub.subscribeActivePlayer(playerListener)
+        }.onFailure { AppLog.w("LyriconLyricProducer", "forced resubscribe failed", it) }
+        // 重建后静默基线从本次订阅起算(与 start 一致)。
+        lastPositionCallbackElapsedMs = clock()
     }
 
-    private fun CompiledSurfaceProfile.toProducerRenderModes() = ProducerRenderModes(
-        weight = weight,
-        textSize = textSize,
-        textSizeCustom = textSizeCustom,
-        secondary = secondaryMode,
-        animation = animation,
-        glow = glow,
-        lineSyncFill = lineSyncFillMode,
-        overflow = overflow,
-        transition = transition.id,
-        font = fontFamily
-    )
-
-    private fun RichLyricLine.toLyricWords(): List<LyricWord>? = words?.map { w ->
-        // io.github.proify.lyricon.lyric.model.LyricWord has begin/end/text.
-        // boundaryAfter is a Spicy-specific concept; default false (the engine treats word
-        // boundaries from begin/end timing). roma is line-level (RichLyricLine.ruma), not per-word.
-        LyricWord(
-            text = w.text.orEmpty(),
-            romanized = "",
-            startMs = w.begin,
-            endMs = w.end,
-            boundaryAfter = false
+    /**
+     * 整首歌快照：直接取内存里的排序行数组（与 TimingNavigator 同源，onSongChanged 时
+     * 已按 begin 排序），行自带真实 begin/end 与可选 translation/roma/words。trackUri 与
+     * emit() 的构造保持同一表达式，保证会话三元组校验成立。实现是纯读 + 一次映射，
+     * 管线只在新会话首次进入插件链时调用。
+     */
+    override fun fullSongSnapshot(): LyricSongSnapshot? {
+        val song = currentSong ?: return null
+        val lines = navigator?.source ?: return null
+        if (lines.isEmpty()) return null
+        return LyricSongSnapshot(
+            producerId = PRODUCER_ID,
+            generation = generation,
+            trackUri = "lyricon:${song.id ?: song.name}",
+            durationMs = song.duration,
+            rows = LyricTimelineSanitizer.sanitizeSnapshotRows(
+                lines.mapIndexed { index, line ->
+                    LyricSongRow(
+                        startMs = line.begin,
+                        endMs = line.end,
+                        text = line.text.orEmpty(),
+                        // 翻译冗余对随行过桥:文本兜底取文(effectiveTranslation)+词表原样携带,
+                        // 只带 translationWords 的源在插件链输入侧不丢译文。
+                        translation = line.effectiveTranslation(),
+                        translationWords = line.toTranslationWords(),
+                        roma = line.roma.orEmpty(),
+                        words = line.toLyricWords()?.takeIf { it.isNotEmpty() },
+                        // 对唱分侧随行进入插件链(取元数据身份版,与状态里 alignedRight 同源)。
+                        alignedRight = identityAlignedRight(index)
+                    )
+                }
+            )
         )
     }
 
     companion object {
-        private const val PRODUCER_ID = "lyricon"
-
-        /**
-         * Window after [onSongChanged] during which incoming positions that exactly match the
-         * previous song's last position are rejected as residual shared-memory values. Observed
-         * gap on NetEase can reach ~36s, so 60s gives ample margin while ensuring real seeks to
-         * the same position are eventually honored.
-         */
-        private const val RESIDUAL_REJECTION_WINDOW_MS = 60_000L
+        internal const val PRODUCER_ID = "lyricon"
 
         /**
          * Window after [onSeekTo] during which incoming positions that exactly match the pre-seek
          * position are rejected as lingering shared-memory values. Short (the player writes the
          * post-seek position within a second or two); generous enough to cover the write gap.
          */
-        private const val SEEK_RESIDUAL_REJECTION_WINDOW_MS = 3_000L
+        internal const val SEEK_RESIDUAL_REJECTION_WINDOW_MS = 3_000L
 
         /**
          * If no real position update arrives from shared memory for this duration, the writer
          * is considered completely dead (not just screen-off frozen). A one-shot warning is
          * logged so the arbiter can consider falling back to another producer.
          */
-        private const val STALE_POSITION_THRESHOLD_MS = 15_000L
+        internal const val STALE_POSITION_THRESHOLD_MS = 15_000L
+
+        /**
+         * Wall-clock budget after which a silent position source is treated with suspicion while
+         * playing. Past this: extrapolation CONTINUES while it stays within the song duration
+         * (Doze freezes the shared-memory writer for the whole song while playback continues —
+         * the canonical AOD scenario, see issue #3); only once the extrapolation passes the song
+         * end (or the duration is unknown) is the writer declared dead and [positionUnknown] set
+         * (the active line is cleared) instead of fabricating progress past the song.
+         */
+        internal const val MAX_EXTRAPOLATION_MS = 45_000L
+
+        /** Poll interval for the position-silence watchdog. */
+        private const val POSITION_WATCHDOG_POLL_MS = 5_000L
+
+        /**
+         * issue #27: poll interval for the MediaSession stop detector. Multiple matched samples
+         * are required before clearing (see [STOP_CONFIRMATIONS]) so a transient state blink on a
+         * song change (the transport-gap non-playing edge) doesn't wipe the track.
+         */
+        internal const val STOP_DETECT_INTERVAL_MS = 4_000L
+
+        /** issue #27: consecutive stopped samples before the track is cleared as stale. */
+        internal const val STOP_CONFIRMATIONS = 3
+
+        /**
+         * No `onPositionChanged` at all for this long while playing → the SDK's callback path is
+         * dead (not merely a frozen shared-memory writer, which still fires callbacks with the
+         * stalled value at ~60 Hz). See [shouldForceResubscribePositionFeed].
+         */
+        internal const val POSITION_SILENCE_RESUBSCRIBE_MS = 20_000L
+
+        /** Minimum gap between two forced resubscribes, so a persistent failure doesn't hammer IPC. */
+        internal const val RESUBSCRIBE_COOLDOWN_MS = 30_000L
+
+        /**
+         * issue #64:位置通道活跃但歌曲数据长期缺席(半死)时,强制重建订阅前的缺席阈值。
+         * 正常切歌/(重)连补发的 onSongChanged 在数秒内到达;播放中 30s 无歌且位置值仍在
+         * 推进即异常。必须明显大于正常切歌间隙,并大于 [PROVIDER_SYNC_GRACE_MS]。
+         */
+        internal const val SONG_ABSENCE_RESUBSCRIBE_MS = 30_000L
+
+        /**
+         * issue #64:provider 切换后等待 SDK 补发 onSongChanged 的宽限期;超过仍未到(且
+         * 位置在推进、播放中)判定歌曲通道半死,由歌曲侧看门狗强制重建订阅。
+         */
+        internal const val PROVIDER_SYNC_GRACE_MS = 10_000L
+
+        /**
+         * issue #64:判定「位置仍在推进」的新鲜度窗口 —— 窗口内有变化的位置值才证明播放器
+         * 真在播。已停止/被冻结的播放器只会重复同一值,不应期待新歌,看门狗不得触发。
+         */
+        internal const val SONG_FEED_POSITION_FRESH_MS = 10_000L
 
         /**
          * When the player's position stream resumes after a stall, how far below our extrapolated
@@ -669,15 +716,54 @@ class LyriconLyricProducer(
          * rewind the active line. Any drop beyond this (a genuine seek or the song resetting to
          * 0 on wrap-around) is honored as a rewind.
          */
-        private const val EXTRAPOLATION_RESUME_TOLERANCE_MS = 300L
+        internal const val EXTRAPOLATION_RESUME_TOLERANCE_MS = 300L
+
+        /**
+         * Minimum silence from the last REAL position update before a repeated
+         * (same-value) position callback counts as a writer stall and extrapolation
+         * engages. The SDK re-delivers the last written value between writer updates
+         * (on-device 2026-09-28: writes every ~40 ms, a duplicate ~20 ms after each);
+         * without this floor every duplicate tripped stall->extrapolate->resume within
+         * a single frame - two Info logs and two state emissions per real update
+         * (~45 log lines/s rotating diagnostic-trace.log away within minutes).
+         * Genuine stalls (Doze writer freeze) persist for seconds, far above this
+         * floor, so stall recovery is unchanged.
+         */
+        internal const val STALL_EXTRAPOLATION_MIN_MS = 500L
+
+        /**
+         * issue #11: tolerance for the post-song-change plausibility bound — covers song-change
+         * detection lag (SDK poll interval) and position base timestamp skew. Must stay well
+         * below the typical old-timeline residual offset (≈ the previous song's duration) so
+         * residuals are rejected, and well above the detection lag so genuine positions pass.
+         */
+        internal const val SONG_START_PLAUSIBILITY_TOLERANCE_MS = 10_000L
+
+        /**
+         * issue #11: a real position may slightly exceed the metadata duration near the song's
+         * true end (metadata underestimates the audio); within this tolerance it is capped to
+         * the duration, beyond it the writer is deemed untrustworthy (stale timeline) and the
+         * value is treated as stalled (extrapolate from the last good base).
+         */
+        internal const val BEYOND_DURATION_TOLERANCE_MS = 2_000L
+
+        /** issue #11: clamp for the residual-advance rate estimate (NetEase speed range). */
+        internal const val GATE_RATE_MIN_X = 0.5
+        internal const val GATE_RATE_MAX_X = 3.0
+
+        /** issue #11: minimum wall-time span before a rate sample is trusted (div-noise guard). */
+        internal const val GATE_RATE_MIN_DELTA_MS = 500L
 
         /** Default render modes when customization is unavailable; matches SpicyBridgeState defaults. */
-        private fun defaultRenderModes() = ProducerRenderModes(
+        internal fun defaultRenderModes() = ProducerRenderModes(
             weight = "Medium",
             textSize = "normal",
             textSizeCustom = 100,
             secondary = "Main only",
-            animation = "Karaoke fill",
+            // 兜底值必须过得了 aod/AodRenderPreferences.normalizeAodAnimation（只放行
+            // Minimal / BetterLyrics，其余回落 Gradient）：历史遗留的 "Karaoke fill" 会被
+            // 静默改写成 Gradient，是个纯误导的默认值。
+            animation = "Gradient",
             glow = "Off",
             lineSyncFill = "Top to bottom",
             overflow = "Wrap",

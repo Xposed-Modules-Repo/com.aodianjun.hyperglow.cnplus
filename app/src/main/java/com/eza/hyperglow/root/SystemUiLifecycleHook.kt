@@ -5,32 +5,40 @@ import android.os.Handler
 import android.os.Looper
 import com.eza.hyperglow.root.capability.XiaomiCapabilityResolver
 import com.eza.hyperglow.root.aod.AodPowerCoordinator
+import com.eza.hyperglow.root.aod.AodWakeBroker
 import com.eza.hyperglow.root.projection.SystemUiLyricProjectionRuntime
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
 
 internal object SystemUiLifecycleHook {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private const val FEATURE_ID = "systemui-lifecycle"
     fun install(module: XposedModule, classLoader: ClassLoader) {
         try {
-            val applicationClass = classLoader.loadClass(SYSTEM_UI_APPLICATION)
-            val onCreate = applicationClass.getDeclaredMethod("onCreate")
-            module.deoptimize(onCreate)
-            module.hook(onCreate).intercept(ApplicationCreateHooker)
+            val applicationClass = SymbolResolver.resolveClass(
+                classLoader, FEATURE_ID, SYSTEM_UI_APPLICATION
+            ) ?: throw ClassNotFoundException(SYSTEM_UI_APPLICATION)
+            val onCreate = SymbolResolver.resolveMethod(
+                classLoader,
+                FEATURE_ID,
+                SymbolRequest.method(SYSTEM_UI_APPLICATION, "onCreate")
+            ) ?: throw NoSuchMethodException("onCreate")
+            HookRegistry.hook(module, FEATURE_ID, onCreate, ApplicationCreateHooker)
             HookLogger.bootstrap(TAG, "systemui_application_hook_installed")
         } catch (error: Exception) {
             HookLogger.bootstrap(TAG, "systemui_application_hook_failed")
             throw error
         }
         try {
-            val userTrackerClass = classLoader.loadClass(USER_TRACKER_IMPL)
-            val setUserId = userTrackerClass.getDeclaredMethod(
-                "setUserIdInternal",
-                Int::class.javaPrimitiveType
-            )
-            module.deoptimize(setUserId)
-            module.hook(setUserId).intercept(UserChangedHooker)
+            val setUserId = SymbolResolver.resolveMethod(
+                classLoader,
+                FEATURE_ID,
+                SymbolRequest.method(USER_TRACKER_IMPL, "setUserIdInternal", "int")
+            ) ?: throw NoSuchMethodException("setUserIdInternal")
+            HookRegistry.hook(module, FEATURE_ID, setUserId, UserChangedHooker)
             HookLogger.bootstrap(TAG, "systemui_user_tracker_hook_installed")
         } catch (error: Exception) {
             HookLogger.bootstrap(TAG, "systemui_user_tracker_hook_failed")
@@ -39,16 +47,25 @@ internal object SystemUiLifecycleHook {
         HookLogger.i(TAG, "SystemUI bootstrap/user hooks installed")
     }
 
+    /** Re-runs the application-create bootstrap for a re-derived host, e.g. after hot reload. */
+    fun bootstrap(application: Application) {
+        XiaomiCapabilityResolver.observeContext(application)
+        SymbolResolver.observeContext(application)
+        // 唤醒 broker 的电源管理器在此播种:交互性判断不再依赖观测到 DozeTriggers 实例,
+        // Lyricon 看门狗在从未见到该实例的进程里也能工作(上游 99ba119)。
+        AodWakeBroker.observeContext(application)
+        SystemUiLyricProjectionRuntime.projection.bootstrap(application)
+        HookLogger.bootstrap(TAG, "systemui_projection_bootstrapped")
+        SystemUiLyricProjectionRuntime.projection.attach(AodPowerCoordinator, application)
+        HookLogger.bootstrap(TAG, "systemui_power_subscriber_attached")
+    }
+
     private object ApplicationCreateHooker : Hooker {
         override fun intercept(chain: Chain): Any? {
             HookLogger.bootstrap(TAG, "systemui_application_oncreate_entered")
             val result = chain.proceed()
             val application = chain.thisObject as? Application ?: return result
-            XiaomiCapabilityResolver.observeContext(application)
-            SystemUiLyricProjectionRuntime.projection.bootstrap(application)
-            HookLogger.bootstrap(TAG, "systemui_projection_bootstrapped")
-            SystemUiLyricProjectionRuntime.projection.attach(AodPowerCoordinator, application)
-            HookLogger.bootstrap(TAG, "systemui_power_subscriber_attached")
+            bootstrap(application)
             return result
         }
     }

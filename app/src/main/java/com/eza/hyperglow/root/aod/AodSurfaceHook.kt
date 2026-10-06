@@ -1,7 +1,11 @@
 package com.eza.hyperglow.root.aod
 
+import android.view.View
 import android.view.ViewGroup
 import com.eza.hyperglow.root.HookLogger
+import com.eza.hyperglow.root.HookRegistry
+import com.eza.hyperglow.root.symbols.SymbolRequest
+import com.eza.hyperglow.root.symbols.SymbolResolver
 import io.github.libxposed.api.XposedInterface.Chain
 import io.github.libxposed.api.XposedInterface.Hooker
 import io.github.libxposed.api.XposedModule
@@ -10,20 +14,60 @@ import java.util.WeakHashMap
 
 object AodSurfaceHook {
     private const val AOD_VIEW_CLASS = "com.miui.aod.AODView"
+    private const val FEATURE_ID = "aod-surface"
     private val hookedClassLoaders = Collections.synchronizedSet(
         Collections.newSetFromMap(WeakHashMap<ClassLoader, Boolean>())
     )
 
+    /**
+     * suppressStockAodContent 的运行时闸门:开启时强制 GONE 并拦截宿主可见性请求;
+     * 关闭时按 [restoreTargets] 把受抑制视图恢复到宿主信念态。
+     * 由 AodSurfaceController 依据快照的 suppressStockAodContent 翻转。
+     */
+    @Volatile
+    private var suppressionGateActive = false
+
+    /** 受抑制的容器子树根(如 mTableModeContainer / burnInContainer)。 */
+    private val suppressedRoots = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
+    /** 显式登记的受抑制目标(时钟/天气等系统组件束)。 */
+    private val suppressedTargets = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
+
+    /**
+     * 关闸恢复台账:受抑制视图 → 宿主信念态(可见性值)。forceGone 前以 putIfAbsent
+     * 捕获抑制前可见性(首见为准);抑制期间宿主发出的非 GONE 请求本会被改写为 GONE,
+     * 改写前以其覆盖台账(宿主最新意图为准)。关闸时必须按台账恢复:闸门开启期间宿主
+     * 发出的 VISIBLE 已被改写,宿主认为视图仍可见而不会重发,不主动恢复则视图永久停在 GONE。
+     */
+    private val restoreTargets = WeakHashMap<View, Int>()
+
     fun install(module: XposedModule, classLoader: ClassLoader) {
-        val aodViewClass = runCatching { classLoader.loadClass(AOD_VIEW_CLASS) }.getOrNull() ?: return
+        val aodViewClass = SymbolResolver.resolveClass(
+            classLoader, FEATURE_ID, AOD_VIEW_CLASS
+        ) ?: return
         if (!hookedClassLoaders.add(classLoader)) return
-        val attached = aodViewClass.getDeclaredMethod("onAttachedToWindow")
-        val detached = aodViewClass.getDeclaredMethod("onDetachedFromWindow")
-        module.deoptimize(attached)
-        module.deoptimize(detached)
-        module.hook(attached).intercept(AttachedHooker())
-        module.hook(detached).intercept(DetachedHooker())
+        val attached = SymbolResolver.resolveMethod(
+            classLoader, FEATURE_ID, SymbolRequest.method(AOD_VIEW_CLASS, "onAttachedToWindow")
+        ) ?: return
+        val detached = SymbolResolver.resolveMethod(
+            classLoader, FEATURE_ID, SymbolRequest.method(AOD_VIEW_CLASS, "onDetachedFromWindow")
+        ) ?: return
+        HookRegistry.hook(module, FEATURE_ID, attached, AttachedHooker())
+        HookRegistry.hook(module, FEATURE_ID, detached, DetachedHooker())
+        installStockVisibilitySeam(module)
         HookLogger.i(TAG, "Direct AOD hooks installed")
+    }
+
+    /**
+     * 安装闸门:framework View.setVisibility 的强制 GONE 接缝。这里的“闸门”有两层——
+     * ① View 无法安置(无 setVisibility)则整段不安装;② 真正的开关由
+     * [setSuppressionGate] 在运行时控制,关闭时 Hooker 走直通路径,几乎零开销。
+     */
+    private fun installStockVisibilitySeam(module: XposedModule) {
+        val setVisibility = runCatching {
+            View::class.java.getMethod("setVisibility", Int::class.javaPrimitiveType)
+        }.getOrNull() ?: return
+        HookRegistry.hook(module, FEATURE_ID, setVisibility, StockVisibilityHooker)
+        HookLogger.i(TAG, "Stock visibility enforcement seam installed")
     }
 
     class AttachedHooker : Hooker {
@@ -48,6 +92,96 @@ object AodSurfaceHook {
             }
             return result
         }
+    }
+
+    fun setSuppressionGate(active: Boolean) {
+        if (suppressionGateActive == active) return
+        suppressionGateActive = active
+        HookLogger.i(TAG, "Stock suppression gate=$active targets=${suppressedTargets.size}")
+        if (active) enforceSuppressed() else releaseSuppressedViews()
+    }
+
+    @Synchronized
+    fun registerSuppressedRoot(view: View) {
+        suppressedRoots.add(view)
+        if (suppressionGateActive) forceGone(view)
+    }
+
+    @Synchronized
+    fun registerSuppressedTarget(view: View) {
+        suppressedTargets.add(view)
+        if (suppressionGateActive) forceGone(view)
+    }
+
+    @Synchronized
+    fun clearSuppressedState() {
+        // detach 路径同样关闸:闸门若跨 detach/attach 泄漏为 true,重开闸会被
+        // setSuppressionGate 的等值早退跳过,遗留改写会命中新一代 AODView。
+        suppressionGateActive = false
+        releaseSuppressedViews()
+        suppressedRoots.clear()
+        suppressedTargets.clear()
+    }
+
+    @Synchronized
+    private fun enforceSuppressed() {
+        for (root in suppressedRoots) if (root != null) forceGone(root)
+        for (target in suppressedTargets) if (target != null) forceGone(target)
+    }
+
+    @Synchronized
+    private fun forceGone(view: View) {
+        runCatching {
+            if (view.visibility != View.GONE) {
+                restoreTargets.putIfAbsent(view, view.visibility)
+                view.visibility = View.GONE
+            }
+        }
+    }
+
+    /** 关闸恢复:按台账把受抑制视图放回宿主信念态。调用前闸门须已翻 false,恢复才可直通。 */
+    @Synchronized
+    private fun releaseSuppressedViews() {
+        if (restoreTargets.isEmpty()) return
+        var restored = 0
+        for ((view, visibility) in restoreTargets) {
+            runCatching {
+                if (view.visibility != visibility) {
+                    view.visibility = visibility
+                    restored++
+                }
+            }
+        }
+        restoreTargets.clear()
+        HookLogger.i(TAG, "Suppressed views released restored=$restored")
+    }
+
+    fun isSuppressionActive(): Boolean = suppressionGateActive
+
+    private object StockVisibilityHooker : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            if (!suppressionGateActive) return chain.proceed()
+            val requested = (chain.args.getOrNull(0) as? Number)?.toInt() ?: return chain.proceed()
+            if (requested == View.GONE) return chain.proceed()
+            val view = chain.thisObject as? View ?: return chain.proceed()
+            if (!isSuppressed(view)) return chain.proceed()
+            // 强制接缝:受抑制容器/目标上任何非 GONE 请求一律改回 GONE。
+            // 请求值以其覆盖台账首见捕获:关闸时按宿主最新意图恢复(信念态)。
+            synchronized(this@AodSurfaceHook) { restoreTargets[view] = requested }
+            return chain.proceed(arrayOf<Any>(View.GONE))
+        }
+    }
+
+    private fun isSuppressed(view: View): Boolean = synchronized(this) {
+        if (suppressedTargets.contains(view)) return@synchronized true
+        if (suppressedRoots.contains(view)) return@synchronized true
+        // 受抑制子树根之下任意后代同样被抑制。
+        var parent = view.parent as? View
+        while (parent != null) {
+            if (suppressedRoots.contains(parent)) return@synchronized true
+            parent = parent.parent as? View
+        }
+        false
     }
 
     private const val TAG = "AodSurfaceHook"

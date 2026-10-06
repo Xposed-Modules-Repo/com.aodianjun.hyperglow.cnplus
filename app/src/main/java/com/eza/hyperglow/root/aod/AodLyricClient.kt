@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.os.UserHandle
 import com.eza.hyperglow.BuildConfig
 import com.eza.hyperglow.aod.AodStateWireBundleCodec
+import com.eza.hyperglow.aod.AodStateWireCodec
 import com.eza.hyperglow.aod.AodStateWireMessage
 import com.eza.hyperglow.aod.IAodLyricBridge
 import com.eza.hyperglow.aod.IAodLyricCallback
@@ -26,6 +27,62 @@ import com.eza.hyperglow.root.projection.LyricProjectionClient
 private const val RETRY_DELAY_BASE_MS = 1_000L
 private const val RETRY_DELAY_CAP_MS = 30_000L
 
+/**
+ * 到达的状态消息是否可以替换尚未投递的消息。
+ *
+ * 邮箱只保留最新一条,这对两条快照是正确的:新快照取代旧快照。但 KeepAlive 不是快照的替
+ * 代品——它只续期消费端已持有的快照,携带的 revision 以"快照已送达"为前提。放任它覆盖
+ * 未投递的快照会让投影落后一个 revision,之后所有心跳都被拒绝,5 秒后过期——lifetime
+ * guard 撤回,Xiaomi 的 hide 重放,歌词在歌曲中途掉到屏幕底部(上游 cc1f62f)。
+ */
+internal fun shouldReplacePendingState(
+    pending: AodStateWireMessage?,
+    incoming: AodStateWireMessage
+): Boolean = pending == null ||
+    incoming !is AodStateWireMessage.KeepAlive ||
+    pending is AodStateWireMessage.KeepAlive
+
+/**
+ * 心跳 keepAlive 的播放宽限(issue #22):心跳的 keepAlive=false 不具备租约过期权威——
+ * 切歌 BUFFERING 窗口里它会与 playbackActive=true 同时到达,直接采信会提前关闭 draw-wake
+ * 续期。playbackActive=true 时宽限视为续期;租约过期权威仍只属于全量快照。
+ */
+internal fun heartbeatKeepAliveWithGrace(keepAlive: Boolean, playbackActive: Boolean): Boolean =
+    keepAlive || playbackActive
+
+/**
+ * Preserve a pending state while applying a newer same-revision heartbeat to its scalar fields. A
+ * heartbeat cannot carry the lyric body, but dropping it here lets a stale `keepAlive=false` expire
+ * the AOD lease before the next full snapshot arrives.
+ */
+internal fun mergePendingKeepAlive(
+    pending: AodStateWireMessage?,
+    incoming: AodStateWireMessage.KeepAlive
+): AodStateWireMessage? {
+    if (pending == null ||
+        pending.revision != incoming.revision ||
+        pending.userId != incoming.userId ||
+        incoming.updatedAtElapsedMs <= pending.updatedAtElapsedMs
+    ) return null
+    return when (pending) {
+        is AodStateWireMessage.Snapshot -> pending.copy(
+            updatedAtElapsedMs = incoming.updatedAtElapsedMs,
+            keepAlive = heartbeatKeepAliveWithGrace(incoming.keepAlive, incoming.playbackActive),
+            wakeSignal = incoming.wakeSignal,
+            playbackActive = incoming.playbackActive,
+            pauseRetentionEligible = incoming.pauseRetentionEligible
+        )
+        is AodStateWireMessage.Hidden -> pending.copy(
+            updatedAtElapsedMs = incoming.updatedAtElapsedMs,
+            keepAlive = heartbeatKeepAliveWithGrace(incoming.keepAlive, incoming.playbackActive),
+            wakeSignal = incoming.wakeSignal,
+            playbackActive = incoming.playbackActive,
+            pauseRetentionEligible = incoming.pauseRetentionEligible
+        )
+        is AodStateWireMessage.KeepAlive -> null
+    }
+}
+
 internal class GenerationBoundLatest<T> {
     private var generation = -1L
     private var value: T? = null
@@ -36,6 +93,8 @@ internal class GenerationBoundLatest<T> {
         this.value = value
         return true
     }
+
+    fun peek(currentGeneration: Long): T? = value.takeIf { generation == currentGeneration }
 
     fun take(currentGeneration: Long): T? {
         val result = value.takeIf { generation == currentGeneration }
@@ -107,7 +166,16 @@ internal class AodLyricClient(
         override fun onConfiguration(configuration: Bundle?) {
             if (configuration == null) return
             synchronized(this@AodLyricClient) {
-                if (stopped || generation != bindingGeneration) return
+                if (stopped || generation != bindingGeneration) {
+                    // 「预览有效果实机没有」类反馈的关键判别点:配置在投递前就被代次门控丢掉
+                    // 时此处是唯一的可见痕迹,此前三个 return 全部静默,整条链路等于黑盒。
+                    HookLogger.w(
+                        TAG,
+                        "Configuration dropped before delivery stopped=$stopped " +
+                            "gen=$generation binding=$bindingGeneration"
+                    )
+                    return
+                }
             }
             // This callback is one-way Binder. Never retain its Bundle past this method.
             val ownedPayload = try {
@@ -126,8 +194,20 @@ internal class AodLyricClient(
                         currentGeneration = bindingGeneration,
                         value = ownedPayload
                     )
-                ) return
+                ) {
+                    HookLogger.w(
+                        TAG,
+                        "Configuration dropped at mailbox stopped=$stopped " +
+                            "gen=$generation binding=$bindingGeneration"
+                    )
+                    return
+                }
             }
+            HookLogger.w(
+                TAG,
+                "Configuration queued rev=${ownedPayload.revision} " +
+                    "hash=${ownedPayload.hash.take(8)} gen=$generation"
+            )
             mainHandler.removeCallbacks(deliverConfiguration)
             mainHandler.post(deliverConfiguration)
         }
@@ -138,18 +218,46 @@ internal class AodLyricClient(
                 if (stopped || generation != bindingGeneration) return
             }
             // Decode while Binder owns the Bundle; only the immutable message crosses callback return.
-            val ownedMessage = try {
-                AodStateWireBundleCodec.snapshotFromBundle(state)
+            val ownedEnvelope = try {
+                AodStateWireBundleCodec.envelopeFromBundle(state)
             } catch (error: Exception) {
                 HookLogger.w(TAG, "Rejected malformed state payload", error)
                 return
             }
+            val ownedMessage = AodStateWireCodec.decode(ownedEnvelope)
             if (ownedMessage == null) {
-                HookLogger.w(TAG, "Rejected invalid state payload")
+                HookLogger.w(
+                    TAG,
+                    "Rejected invalid state payload reason=" +
+                        AodStateWireCodec.decodeRejectReason(ownedEnvelope)
+                )
                 return
             }
             synchronized(this@AodLyricClient) {
-                if (stopped || !pendingState.offer(
+                if (stopped) return
+                val pending = pendingState.peek(bindingGeneration)
+                val merged = if (ownedMessage is AodStateWireMessage.KeepAlive) {
+                    mergePendingKeepAlive(pending, ownedMessage)
+                } else null
+                if (merged != null) {
+                    if (!pendingState.offer(
+                            generation = generation,
+                            currentGeneration = bindingGeneration,
+                            value = merged
+                        )
+                    ) return
+                    HookLogger.i(
+                        TAG,
+                        "Keepalive merged into pending state revision=${merged.revision}"
+                    )
+                } else if (!shouldReplacePendingState(pending, ownedMessage)) {
+                    HookLogger.i(
+                        TAG,
+                        "Keepalive coalesced behind snapshot revision=${ownedMessage.revision}"
+                    )
+                    return
+                }
+                if (merged == null && !pendingState.offer(
                         generation = generation,
                         currentGeneration = bindingGeneration,
                         value = ownedMessage

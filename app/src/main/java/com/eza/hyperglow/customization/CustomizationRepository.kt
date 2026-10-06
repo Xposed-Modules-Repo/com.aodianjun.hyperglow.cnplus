@@ -13,6 +13,22 @@ object CustomizationRepository {
     private const val KEY_PREVIOUS_DOCUMENT = "previous_document_json"
     private const val KEY_MIGRATION_VERSION = "migration_version"
 
+    // Projection ticks run at 10 Hz while a song is playing. Keep the compiled scene in memory
+    // and only decode/canonicalize when the persisted inputs change; parsing and compiling the
+    // JSON document on every tick otherwise burns CPU and allocates a full profile graph.
+    private var compiledCacheInitialized = false
+    private var cachedCurrentRaw: String? = null
+    private var cachedPreviousRaw: String? = null
+    private var cachedLegacyConfig: AodRenderConfig? = null
+    private var cachedCompiled: CompiledCustomization? = null
+
+    /**
+     * 文档保存/导入/重置成功后的回调(生产者侧派生缓存刷新,见 LyricProducers.onCustomizationChanged)。
+     * 只读挂点:由生产者侧注册,避免 customization → producer 的包依赖。
+     */
+    @Volatile
+    var onChange: (() -> Unit)? = null
+
     @Synchronized
     fun loadDocument(context: Context): CustomizationDocument {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -47,8 +63,32 @@ object CustomizationRepository {
     }
 
     @Synchronized
-    fun loadCompiled(context: Context): CompiledCustomization =
-        SceneCompiler.compile(loadDocument(context))
+    fun loadCompiled(context: Context): CompiledCustomization {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val currentRaw = prefs.getString(KEY_DOCUMENT, null)
+        val previousRaw = prefs.getString(KEY_PREVIOUS_DOCUMENT, null)
+        // Legacy values matter only while no canonical document exists. AodRenderPreferences is
+        // itself cached, so this comparison is inexpensive and still notices first-run edits.
+        val legacy = if (currentRaw == null && previousRaw == null) {
+            AodRenderPreferences.read(context)
+        } else {
+            null
+        }
+        if (compiledCacheInitialized &&
+            currentRaw == cachedCurrentRaw &&
+            previousRaw == cachedPreviousRaw &&
+            legacy == cachedLegacyConfig
+        ) {
+            return requireNotNull(cachedCompiled)
+        }
+        val compiled = SceneCompiler.compile(loadDocument(context))
+        compiledCacheInitialized = true
+        cachedCurrentRaw = prefs.getString(KEY_DOCUMENT, null)
+        cachedPreviousRaw = prefs.getString(KEY_PREVIOUS_DOCUMENT, null)
+        cachedLegacyConfig = legacy
+        cachedCompiled = compiled
+        return compiled
+    }
 
     @Synchronized
     fun saveDocument(context: Context, document: CustomizationDocument): Boolean {
@@ -62,7 +102,9 @@ object CustomizationRepository {
             .putString(KEY_DOCUMENT, encoded)
             .putInt(KEY_MIGRATION_VERSION, CURRENT_CUSTOMIZATION_VERSION)
         if (previous != null) editor.putString(KEY_PREVIOUS_DOCUMENT, previous)
-        return editor.commit()
+        val saved = editor.commit()
+        if (saved) runCatching { onChange?.invoke() }
+        return saved
     }
 
     @Synchronized
@@ -93,6 +135,7 @@ object CustomizationRepository {
             secondaryMode = config.secondaryMode,
             metadataVisible = config.metadataVisible != "hide",
             metadataAnchor = config.metadataAnchor,
+            metadataSizePercent = config.metadataSizePercent,
             weight = config.weight,
             textSize = config.textSize,
             textSizeCustom = config.textSizeCustom,
@@ -111,7 +154,10 @@ object CustomizationRepository {
                     enabled = config.lockscreenEnabled,
                     maxHeightFraction = 0.46f
                 ),
-                SceneCompiler.SURFACE_AOD to common.copy(enabled = config.aodEnabled)
+                SceneCompiler.SURFACE_AOD to common.copy(
+                    enabled = config.aodEnabled,
+                    aodClockFollow = config.aodClockFollow
+                )
             )
         )
     }
@@ -125,7 +171,45 @@ object CustomizationRepository {
                 else -> return null
             }
         }
-        return migrated
+        return seedMetadataLegacyCarrier(seedArtworkLegacyCarriers(migrated))
+    }
+
+    /**
+     * 旧版单一分隔符迁移为逐槽分隔符序列:旧值对当时所有槽位生效,故按槽位重复展开;
+     * 载体清空后回写文档不再携带,保证只播种一次。新文档载体为 null,原样返回。
+     */
+    private fun seedMetadataLegacyCarrier(document: CustomizationDocument): CustomizationDocument {
+        val legacy = document.metadataSeparator ?: return document
+        val gaps = metadataGapCount(document.metadataParts)
+        val token = normalizeMetadataSeparator(legacy)
+        return document.copy(
+            metadataSeparators = List(gaps) { token }.joinToString(","),
+            metadataSeparator = null
+        )
+    }
+
+    /**
+     * 歌曲图片三项从文档级下沉到 per-surface(锁屏/息屏各自独立)的一次性播种:
+     * 旧文档里文档级载体非空时,把旧值复制进两个曲面 profile,并清空载体
+     * (回写文档时不再携带,保证只播种一次)。新文档载体为 null,原样返回。
+     */
+    private fun seedArtworkLegacyCarriers(document: CustomizationDocument): CustomizationDocument {
+        val legacyVisible = document.artworkVisible
+        val legacyShape = document.artworkShape
+        val legacySpin = document.artworkSpin
+        if (legacyVisible == null && legacyShape == null && legacySpin == null) return document
+        return document.copy(
+            artworkVisible = null,
+            artworkShape = null,
+            artworkSpin = null,
+            profiles = document.profiles.mapValues { (_, profile) ->
+                profile.copy(
+                    artworkVisible = legacyVisible ?: profile.artworkVisible,
+                    artworkShape = legacyShape ?: profile.artworkShape,
+                    artworkSpin = legacySpin ?: profile.artworkSpin
+                )
+            }
+        )
     }
 
     internal fun canonicalizeDocument(document: CustomizationDocument): CustomizationDocument? {
@@ -137,6 +221,11 @@ object CustomizationRepository {
             id = compiled.sourceId,
             name = migrated.name.trim().take(100).ifBlank { "Customization" },
             linkSurfaces = compiled.linkSurfaces,
+            metadataParts = compiled.metadataParts,
+            metadataSeparators = compiled.metadataSeparators,
+            hideAlbumWhenSameAsTitle = compiled.hideAlbumWhenSameAsTitle,
+            duetMarkers = compiled.duetMarkers,
+            lyricTimeOffsetMs = compiled.lyricTimeOffsetMs,
             profiles = linkedMapOf(
                 SceneCompiler.SURFACE_LOCKSCREEN to compiled.profiles
                     .getValue(SceneCompiler.SURFACE_LOCKSCREEN)
@@ -173,11 +262,29 @@ object CustomizationRepository {
         alignment = alignment,
         secondaryMode = secondaryMode,
         secondaryTextBright = secondaryTextBright,
+        secondaryWordKaraoke = secondaryWordKaraoke,
         lyricLineLimit = lyricLineLimit,
         showNextLine = showNextLine,
+        secondaryNextLine = secondaryNextLine,
+        nextLineAux = nextLineAux,
         metadataVisible = metadataVisible,
         metadataAnchor = metadataAnchor,
         metadataSizePercent = metadataSizePercent,
+        metadataAlignment = metadataAlignment,
+        nextLineAlignment = nextLineAlignment,
+        artworkVisible = artworkVisible,
+        artworkShape = artworkShape,
+        artworkSpin = artworkSpin,
+        artworkSpinWhenPaused = artworkSpinWhenPaused,
+        artworkAdaptiveScale = artworkAdaptiveScale,
+        artworkSizeDp = artworkSizeDp,
+        duetAlignment = duetAlignment,
+        duetConcurrent = duetConcurrent,
+        // per-surface 内容项:携带本面已解析值,canonicalize 往返不丢失按面独立性。
+        metadataParts = metadataParts,
+        metadataSeparators = metadataSeparators,
+        hideAlbumWhenSameAsTitle = hideAlbumWhenSameAsTitle,
+        duetMarkers = duetMarkers,
         rubyVisible = rubyVisible,
         weight = weight,
         textSize = textSize,
@@ -187,6 +294,8 @@ object CustomizationRepository {
         glow = glow,
         lineSyncFillMode = lineSyncFillMode,
         overflow = overflow,
+        lineTransition = lineTransition,
+        lineTransitionSpeed = lineTransitionSpeed,
         adaptiveSectioning = adaptiveSectioning,
         palette = palette,
         backgroundStyle = backgroundStyle,

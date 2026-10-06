@@ -1,0 +1,169 @@
+package com.eza.hyperglow.plugin
+
+import com.eza.hyperglow.producer.LyricTimelineNormalizer
+import com.lidesheng.hyperlyric.plugin.api.PluginLyricField
+import com.lidesheng.hyperlyric.plugin.api.PluginLyricsUpdateMode
+import com.lidesheng.hyperlyric.plugin.api.PluginSong
+import com.lidesheng.hyperlyric.plugin.api.PluginSongField
+import com.lidesheng.hyperlyric.plugin.api.PluginSongResult
+
+/**
+ * 处理器结果的宿主侧校验与合并（纯函数，HyperLyric 合并语义）。
+ *
+ * 规则要点：
+ * - `changedFields`/`changedLyricFields` 是权威声明，宿主绝不做 DTO 对比推断；
+ * - PATCH 必须保持行数与行索引不变，只覆盖声明过的行字段（含显式置 null 清空）；
+ * - REPLACE 整表替换，行时间轴必须单调合法（begin>=0, end>=begin）；
+ * - 任何结构违规返回 null：宿主丢弃该结果、保留当前快照、继续后续处理器；
+ * - 合并结果的收尾归一见 [normalizeMergedTimeline]（插件声明 WORDS 时行窗与插件词窗自洽）。
+ */
+object PluginChainMerger {
+
+    /**
+     * 合并结果：成功时 [song] 非空且 [reason] 为 null；被拒时 [song] 为 null、
+     * [reason] 给出具体违例规则（供宿主日志定位是插件结果非法还是快照不匹配）。
+     */
+    internal data class MergeOutcome(val song: PluginSong?, val reason: String?)
+
+    fun merge(current: PluginSong, result: PluginSongResult): PluginSong? =
+        mergeWithReason(current, result).song
+
+    /** [merge] 的带原因版本。宿主用它把「结果为何被丢弃」写进日志，而不是只记一句失败。 */
+    internal fun mergeWithReason(current: PluginSong, result: PluginSongResult): MergeOutcome {
+        if (PluginSongField.LYRICS !in result.changedFields) {
+            return MergeOutcome(copyTopLevel(current, result), null)
+        }
+        val candidateRows = result.song.lyrics
+            ?: return MergeOutcome(null, "changedFields declares LYRICS but result.song.lyrics is null")
+        val mergedRows = when (result.lyricsUpdateMode) {
+            PluginLyricsUpdateMode.PATCH -> {
+                val currentRows = current.lyrics
+                    ?: return MergeOutcome(null, "PATCH mode but current snapshot has no lyrics")
+                if (candidateRows.size != currentRows.size) {
+                    return MergeOutcome(
+                        null,
+                        "PATCH row count mismatch: candidate=${candidateRows.size} " +
+                            "current=${currentRows.size}"
+                    )
+                }
+                candidateRows.mapIndexed { index, candidate ->
+                    patchRow(currentRows[index], candidate, result.changedLyricFields)
+                }
+            }
+            PluginLyricsUpdateMode.REPLACE -> {
+                if (candidateRows.isEmpty()) {
+                    return MergeOutcome(null, "REPLACE mode with empty rows")
+                }
+                candidateRows.forEachIndexed { index, row ->
+                    if (row.begin < 0L || row.end < row.begin) {
+                        return MergeOutcome(
+                            null,
+                            "REPLACE row $index has invalid timeline: " +
+                                "begin=${row.begin} end=${row.end}"
+                        )
+                    }
+                }
+                candidateRows.map { patchRow(it, it, result.changedLyricFields) }
+            }
+        }
+        return MergeOutcome(copyTopLevel(current, result).copy(lyrics = mergedRows), null)
+    }
+
+    /**
+     * 合并结果的收尾归一（纯函数）：插件声明 WORDS 时其词表（文本 + 时间戳）整份生效、
+     * 词窗即最终值，合并文档的行窗必须与它自洽——逐行走 ingest 同一套共享纯函数
+     * [LyricTimelineNormalizer.normalizeLineWindow]（全仓单一副本）：
+     * ① 词窗超出行窗 → 行窗扩到并集；② 行窗远超文本可唱估时且词级跨距可信 → 向词对齐；
+     * ③ 其余（含正常拖尾）逐值不动。无词窗的行没有数据可归一，原样返回。
+     *
+     * [pluginDeclaredWords] 为本链是否有被接受的处理器结果声明了 [PluginLyricField.WORDS]。
+     * 未声明时宿主词表已在生产者 ingest 归一一遍，这里直接返回原实例——不重复归一宿主词窗，
+     * 宿主也不做 DTO 对比推断。全部行都未动时同样返回原实例（保持调用方的引用相等语义）。
+     */
+    internal fun normalizeMergedTimeline(
+        song: PluginSong,
+        pluginDeclaredWords: Boolean
+    ): PluginSong {
+        if (!pluginDeclaredWords) return song
+        val rows = song.lyrics ?: return song
+        var changed = false
+        val normalizedRows = rows.map { row ->
+            val words = row.words
+            val window = LyricTimelineNormalizer.normalizeLineWindow(
+                beginMs = row.begin,
+                endMs = row.end,
+                wordBeginMs = words?.minOfOrNull { it.begin },
+                wordEndMs = words?.maxOfOrNull { it.end },
+                estimatedSingMs = LyricTimelineNormalizer.estimatedSingMs(row.text)
+            )
+            if (window.beginMs == row.begin && window.endMs == row.end) {
+                row
+            } else {
+                changed = true
+                row.copy(begin = window.beginMs, end = window.endMs)
+            }
+        }
+        return if (changed) song.copy(lyrics = normalizedRows) else song
+    }
+
+    /** 按 changedFields 拷贝顶层字段（含 metadata 整体替换）；未声明字段保留 current。 */
+    private fun copyTopLevel(current: PluginSong, result: PluginSongResult): PluginSong {
+        val candidate = result.song
+        return current.copy(
+            id = if (PluginSongField.ID in result.changedFields) candidate.id else current.id,
+            name = if (PluginSongField.NAME in result.changedFields) candidate.name else current.name,
+            artist = if (PluginSongField.ARTIST in result.changedFields) candidate.artist else current.artist,
+            album = if (PluginSongField.ALBUM in result.changedFields) candidate.album else current.album,
+            duration = if (PluginSongField.DURATION in result.changedFields) {
+                candidate.duration
+            } else {
+                current.duration
+            },
+            metadata = if (PluginSongField.METADATA in result.changedFields) {
+                candidate.metadata
+            } else {
+                current.metadata
+            },
+            lyrics = if (PluginSongField.LYRICS in result.changedFields) {
+                candidate.lyrics
+            } else {
+                current.lyrics
+            }
+        )
+    }
+
+    private fun patchRow(
+        base: com.lidesheng.hyperlyric.plugin.api.PluginLyricLine,
+        candidate: com.lidesheng.hyperlyric.plugin.api.PluginLyricLine,
+        changed: Set<PluginLyricField>
+    ): com.lidesheng.hyperlyric.plugin.api.PluginLyricLine = base.copy(
+        begin = if (PluginLyricField.BEGIN in changed) candidate.begin else base.begin,
+        end = if (PluginLyricField.END in changed) candidate.end else base.end,
+        duration = if (PluginLyricField.DURATION in changed) candidate.duration else base.duration,
+        isAlignedRight = if (PluginLyricField.IS_ALIGNED_RIGHT in changed) {
+            candidate.isAlignedRight
+        } else {
+            base.isAlignedRight
+        },
+        metadata = if (PluginLyricField.METADATA in changed) candidate.metadata else base.metadata,
+        text = if (PluginLyricField.TEXT in changed) candidate.text else base.text,
+        words = if (PluginLyricField.WORDS in changed) candidate.words else base.words,
+        secondary = if (PluginLyricField.SECONDARY in changed) candidate.secondary else base.secondary,
+        secondaryWords = if (PluginLyricField.SECONDARY_WORDS in changed) {
+            candidate.secondaryWords
+        } else {
+            base.secondaryWords
+        },
+        translation = if (PluginLyricField.TRANSLATION in changed) {
+            candidate.translation
+        } else {
+            base.translation
+        },
+        translationWords = if (PluginLyricField.TRANSLATION_WORDS in changed) {
+            candidate.translationWords
+        } else {
+            base.translationWords
+        },
+        roma = if (PluginLyricField.ROMA in changed) candidate.roma else base.roma
+    )
+}

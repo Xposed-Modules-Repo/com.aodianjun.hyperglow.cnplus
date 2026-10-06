@@ -5,6 +5,33 @@
 Animated lock screen and always-on display lyrics for HyperOS 3, with support for Chinese music apps.
 HyperOS 3 的锁屏与息屏（AOD）歌词动画，支持国内音乐软件。
 
+<p>
+  <a href="https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg" alt="License GPL-3.0"/></a>
+  <a href="https://android.com"><img src="https://img.shields.io/badge/Android-13.0%20--%2016-3DDC84.svg" alt="Android Support"/></a>
+  <a href="https://github.com/compose-miuix-ui/miuix"><img src="https://img.shields.io/badge/UI--Framework-Miuix--Compose-0084FF.svg" alt="Miuix UI"/></a>
+  <a href="https://github.com/libxposed/api"><img src="https://img.shields.io/badge/Hook--Framework-libxposed%20102-purple.svg" alt="libxposed"/></a>
+  <a href="https://modules.lsposed.org/module/com.aodianjun.hyperglow.cnplus"><img src="https://img.shields.io/github/downloads/Xposed-Modules-Repo/com.aodianjun.hyperglow.cnplus/total?style=flat&color=orange" alt="Downloads"/></a>
+</p>
+
+<p>
+  <a href="https://qm.qq.com/q/qZN8paJoFq"><img src="https://img.shields.io/badge/QQ%20%E4%BA%A4%E6%B5%81%E7%BE%A4-0084FF?style=flat&logo=qq&logoColor=white" alt="QQ Group"/></a>
+</p>
+
+<p>
+  <b>蝴蝶 · 洛天依 Official</b> —— 锁屏 / 息屏 AOD / 横屏 AOD<br/>
+  <img src="docs/demos/butterfly-lockscreen.gif" width="230" alt="蝴蝶 · 锁屏逐字歌词"/>
+  <img src="docs/demos/butterfly-aod.gif" width="230" alt="蝴蝶 · 息屏 AOD 逐字歌词"/>
+  <img src="docs/demos/butterfly-landscape.gif" width="230" alt="蝴蝶 · 横屏 AOD 全屏化居中"/>
+</p>
+
+<p>
+  <b>Take Me Hand · DAISHI DANCE</b> —— 锁屏 / 息屏 AOD / 横屏 AOD<br/>
+  <img src="docs/demos/take-me-hand-lockscreen.gif" width="230" alt="Take Me Hand · 锁屏逐字歌词"/>
+  <img src="docs/demos/take-me-hand-aod.gif" width="230" alt="Take Me Hand · 息屏 AOD 逐字歌词"/>
+  <img src="docs/demos/take-me-hand-landscape.gif" width="230" alt="Take Me Hand · 横屏 AOD 全屏化居中"/>
+</p>
+
+
 Requires root, LSPosed and a lyrics source ([Spicy EX](https://github.com/amarinne/spicy-ex), [Lyricon](https://github.com/tomakino/lyricon), [SuperLyric](https://github.com/HChenX/SuperLyric) or [LyricInfo](https://github.com/limczhh/LyricInfo)).
 需要 root、LSPosed 以及一个歌词源（[Spicy EX](https://github.com/amarinne/spicy-ex)、[Lyricon](https://github.com/tomakino/lyricon)、[SuperLyric](https://github.com/HChenX/SuperLyric) 或 [LyricInfo](https://github.com/limczhh/LyricInfo)）。
 
@@ -22,38 +49,43 @@ Requires root, LSPosed and a lyrics source ([Spicy EX](https://github.com/amarin
   - **SuperLyric** (active-line push via Binder, works with many music apps).
   - **LyricInfo** (injects elrc/lrc lyrics into the media session metadata of supported apps).
 - Line-, word- and syllable-synchronized karaoke, including the **BetterLyrics** word animation
-  preset (long syllables light up and scale up with a glow; unplayed syllables sink and rise as
+  preset (long syllables light up and scale up with a glow, unplayed syllables sink and rise as
   they are sung) and per-word karaoke for the auxiliary line.
-- Transliteration, translation and romaji where the source provides them (Spicy EX Full,
-  Lyricon, LyricInfo translation/romaji lanes).
-- Duet lyrics: a second singing line that overlaps the main one is drawn side by side, each with
-  its own word-by-word sweep — with optional (男)/(女)/(合) side detection and section-marker
+- Duet lyrics: when a second singing line overlaps the main one, both are drawn side by side, each
+  with its own word-by-word sweep — with optional (男)/(女)/(合) side detection and section-marker
   stripping.
 - Auxiliary text: an optional second lyric line rendered as auxiliary text (a four-row layout),
   toggled independently for the lock screen and AOD.
 - Song info and artwork: choose and order title/artist/album, set a per-slot separator, and show
   the current track's album art (square, or circular with rotation).
-- Configurable line-transition animations (30 built-in exit/enter presets plus an Auto mode that
-  follows the lyric source), with Slowest/Slow/Normal/Fast/Fastest speed tiers.
-- Per-document lyric time offset (±5 s in 50 ms steps).
+- Per-document lyric time offset (±5 s in 50 ms steps), applied to line selection and the
+  word-by-word sweep alike.
+- Transliteration, translation and romaji where the source provides them (Spicy EX Full,
+  Lyricon, LyricInfo translation/romaji lanes).
+- Configurable line-transition animations: 30 built-in exit/enter presets (fade, slide, zoom,
+  flip, rotate, etc.) plus an Auto mode that follows the lyric source, with Slowest/Slow/Normal/Fast/Fastest
+  speed tiers.
 - HyperLyric-compatible plugins, with an in-app lyric-enhancement section (plugin settings) and
-  plugin cache management; the plugin chain covers every lyrics source. Four official plugins ship
-  as separate ZIPs from the
+  plugin cache management; the plugin chain covers every lyrics source, full-song and
+  line-by-line alike. Four official plugins ship as separate ZIPs from the
   [`plugins` release](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins):
   **lyricfetch** (online lyrics: NetEase word-level, QQ, LRCLIB), **scriptconvert**
   (Simplified ⇄ Traditional), **amll-ttml** (AMLL TTML word-level lyrics with duet, harmony and
   translation) and **ai-translation** (any OpenAI-compatible endpoint).
 
 - AOD clock placement, anchored clock positioning and burn-in movement.
-- AOD lyrics rotate with the device (landscape/reverse), optionally hiding the stock AOD content
-  in landscape and going full-screen, centred with a configurable safe-area inset.
-- Keep AOD active while lyrics are visible.
+- AOD lyrics rotate with the device (landscape/reverse), optionally hiding the stock AOD
+  content in landscape.
+- Landscape full-screen lyrics, centred on the display with a configurable safe-area inset.
+- Appearance settings: theme colour (default/dynamic/custom), background image with dimming and
+  blur, glass (translucent) top bar, cards and navigation, text colour and font.
+- AOD brightness boost, a render frame-rate cap, and a power-saving frame-reduction toggle for
+  hot or low-battery states.
+- Keep AOD active while lyrics are visible (configurable duration, up to indefinite).
 - Keep the lock screen awake while music is playing.
 - Raise to show AOD instead of the full lock screen.
-- Appearance settings: theme colour (default/dynamic/custom), background image with dimming and
-  blur, glass (translucent) top bar/cards/navigation, text colour and font.
-- Built-in diagnostics (guided capture, locally generated report ready for a GitHub issue) and
-  settings backup/restore.
+- Built-in diagnostics (guided capture, locally generated report ready for a GitHub issue)
+  and settings backup/restore.
 
 ## Requirements
 
@@ -92,11 +124,8 @@ APK from [Releases](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/
 > Will eat battery.
 > `Raise to show AOD` requires the system **Raise to wake** option enabled.
 
-## Known issues
-
-- Only tested on Redmi K80 Pro; other Xiaomi models or SystemUI versions may behave differently — submit a compatibility report from the app.
-- The LSPosed module repository syncs on release edits; if a new version does not appear, edit the release body (not just the assets) to retrigger the bot.
-- Experimental mode on unsupported SystemUI versions may cause rendering glitches — disable it if lyrics look wrong.
+> [!TIP]
+> If lyrics, the capability report or AOD behavior look wrong, check [FAQ.md](FAQ.md) first.
 
 ## Build
 
@@ -132,6 +161,34 @@ before opening a pull request:
 - Large or architectural changes are worth discussing in an issue first, so the design can be
   checked against the specs before you build it.
 
+## Acknowledgements
+
+- [amarinne/hyperglow](https://github.com/amarinne/hyperglow) — the upstream project this
+  repackaged CN+ fork is based on.
+- [limczhh/HyperLyric](https://github.com/limczhh/HyperLyric) — the referenced project HyperGlow
+  adapts code from, which this fork inherits.
+- [Andrea-lyz/ColorOS-Live-Lyrics-Bridge](https://github.com/Andrea-lyz/ColorOS-Live-Lyrics-Bridge) —
+  several hardening pieces in the lyric ingestion path (translation lane alignment, word-timing
+  repair, text sanitization, opening-metadata cleanup) are adapted from its implementation.
+- [amll-dev/applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) — the
+  lyric timeline-normalization pass (word-timing alignment, overlap arbitration) follows ideas
+  and thresholds published by AMLL; ideas and thresholds only, no code from its AGPL codebase
+  is used.
+- [jayfunc/BetterLyrics](https://github.com/jayfunc/BetterLyrics) — the word-by-word playback
+  effects of the `BetterLyrics` word-animation preset (long-syllable scale and glow, the sink and
+  rise float rhythm of unplayed vs. sung syllables, per-word-block highlight timing) follow its
+  LyricsAnimator / LyricsEffectSettings thresholds and feel; ideas and parameters only, no code
+  from its GPL-3.0 C#/Win2D codebase is used.
+- [LuckyPray/DexKit](https://github.com/LuckyPray/DexKit) — runtime Dex symbol resolution behind
+  the capability probes.
+- [miuix](https://github.com/compose-miuix-ui/miuix) — the Compose UI library the entire settings
+  interface is built with.
+- The lyrics sources that make this possible:
+  [Spicy EX](https://github.com/amarinne/spicy-ex), [Lyricon](https://github.com/tomakino/lyricon),
+  [SuperLyric](https://github.com/HChenX/SuperLyric), and
+  [LyricInfo](https://github.com/limczhh/LyricInfo).
+- [LSPosed](https://github.com/LSPosed/LSPosed) and libxposed for the Xposed runtime.
+
 ## License
 
 [GPL-3.0](LICENSE). See [NOTICE](NOTICE).
@@ -148,20 +205,22 @@ before opening a pull request:
   - **SuperLyric**（通过 Binder 实时推送当前歌词行，支持众多音乐软件）。
   - **LyricInfo**（向受支持应用的媒体会话元数据注入 elrc/lrc 歌词）。
 - 支持逐行、逐词、逐音节同步的卡拉OK，含 **BetterLyrics** 逐字动画档（长音节整块亮起并放大、带辉光；未唱字下沉、唱到后上浮）与辅助行的逐字效果。
-- 音译、翻译与罗马音随歌词源提供（Spicy EX Full、Lyricon、LyricInfo 的翻译/罗马音 lane）。
 - 对唱歌词：与主行重叠的第二条唱词行并排显示、各画各的逐字扫光，可选自动识别（男）/（女）/（合）并剥离段落标记。
 - 辅助文字：可选的第二行歌词以辅助文字形态绘制（四行呈现），锁屏与息屏各自独立开关。
 - 歌曲信息与歌曲图片：歌名/歌手/专辑可选可排序、分隔符逐槽设置，并可显示当前曲目的专辑图（方形，或可旋转的圆形）。
-- 可配置的换行动画（内置 30 种退场/进场预设，另有跟随歌词源的 Auto 档），速率支持 Slowest/Slow/Normal/Fast/Fastest 五档。
-- 文档级歌词时间偏移（±5 秒、50ms 档）。
-- HyperLyric 兼容插件，应用内提供「歌词增强」（插件设置）板块与插件缓存管理；插件链覆盖全部歌词源。四个官方插件以独立 ZIP 从 [`plugins` 发行](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins) 下载：**lyricfetch**（在线取词：网易云逐字 / QQ / LRCLIB）、**scriptconvert**（简 ⇄ 繁）、**amll-ttml**（AMLL TTML 逐字歌词，含对唱/和声/翻译）、**ai-translation**（任意 OpenAI 兼容接口）。
+- 文档级歌词时间偏移（±5 秒、50ms 档），选行与逐字扫光一并生效。
+- 音译、翻译与罗马音随歌词源提供（Spicy EX Full、Lyricon、LyricInfo 的翻译/罗马音 lane）。
+- 可配置的换行动画：内置 30 种退场/进场预设（淡入淡出、滑动、缩放、翻转、旋转等），另有跟随歌词源的 Auto 档，速率支持 Slowest/Slow/Normal/Fast/Fastest 五档。
+- HyperLyric 兼容插件，应用内提供「歌词增强」（插件设置）板块与插件缓存管理；插件链覆盖全部歌词源（整首与逐行皆可）。四个官方插件以独立 ZIP 从 [`plugins` 发行](https://github.com/aodianjun/com.aodianjun.hyperglow.cnplus/releases/tag/plugins) 下载：**lyricfetch**（在线取词：网易云逐字 / QQ / LRCLIB）、**scriptconvert**（简 ⇄ 繁）、**amll-ttml**（AMLL TTML 逐字歌词，含对唱/和声/翻译）、**ai-translation**（任意 OpenAI 兼容接口）。
 
 - AOD 时钟位置、锚定式时钟定位与防烧屏位移。
-- AOD 歌词跟随设备横竖屏旋转（横屏/反向横屏），可选隐藏横屏下的系统息屏内容并全屏化居中，安全区内边距可调。
-- 歌词显示时保持 AOD 常亮。
+- AOD 歌词跟随设备横竖屏旋转（横屏/反向横屏），可选隐藏横屏下的系统息屏内容。
+- 横屏全屏歌词：整块在屏幕上居中，并可设置安全区内边距。
+- 外观设置：主题色（默认/动态取色/自定义）、背景图与压暗/模糊、玻璃化（半透明）顶栏/卡片/导航、文字颜色与字体。
+- AOD 亮度增强、渲染刷新率上限，以及发热/低电量时的省电降帧开关。
+- 歌词显示时保持 AOD 常亮（时长可配置，最长不限）。
 - 播放音乐时保持锁屏常亮。
 - 拿起手机显示 AOD 而非完整锁屏。
-- 外观设置：主题色（默认/动态取色/自定义）、背景图与压暗/模糊、玻璃化（半透明）顶栏/卡片/导航、文字颜色与字体。
 - 内置诊断（引导采集、本地生成报告并可一键组装 GitHub issue）与设置备份/恢复。
 
 ## 环境要求
@@ -200,11 +259,8 @@ before opening a pull request:
 > 会比较耗电。
 > `拿起显示 AOD` 需要系统开启 **抬起唤醒** 选项。
 
-## 已知问题
-
-- 仅在 Redmi K80 Pro 上测试过；其他小米机型或 SystemUI 版本可能表现不同 —— 请从应用内提交兼容性报告。
-- LSPosed 模块仓库在编辑 release 时同步；如果新版本未出现，编辑 release 正文（而非仅更新资产）以重新触发 bot。
-- 在不受支持的 SystemUI 版本上开启实验模式可能导致渲染异常 —— 如歌词显示异常请关闭实验模式。
+> [!TIP]
+> 如果歌词、能力报告或 AOD 行为异常，先查阅 [FAQ.md](FAQ.md)。
 
 ## 构建
 
@@ -226,6 +282,20 @@ JAVA_HOME=/path/to/jdk21 ./gradlew :app:testDebugUnitTest :app:assembleDebug
 - `README.md`、`FAQ.md` 和 `.gitignore` 为自动生成，对它们的修改会被丢弃；请改为在 issue 中提出。
 - 每个被接受的改动在发布前都会在维护者的设备上验证。单元测试通过是必要条件而非充分条件 —— 任何涉及 SystemUI 挂钩、AOD 电源或几何布局的改动都需要无法在 CI 中运行的硬件验证。
 - 大型或架构性改动值得先在 issue 中讨论，以便在动手前对照规范检查设计方案。
+
+## 致谢
+
+- [amarinne/hyperglow](https://github.com/amarinne/hyperglow) —— 本 CN+ 重打包版所基于的上游项目。
+- [limczhh/HyperLyric](https://github.com/limczhh/HyperLyric) —— HyperGlow 改编借鉴其代码的参考项目，本 fork 沿用了该代码。
+- [Andrea-lyz/ColorOS-Live-Lyrics-Bridge](https://github.com/Andrea-lyz/ColorOS-Live-Lyrics-Bridge) —— 歌词摄取路径的多项加固（翻译 lane 对齐、词级时间轴修复、文本清洗、开头元数据清理）改编自其实现。
+- [amll-dev/applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) —— 歌词时间轴规整（词级对齐、重叠仲裁）借鉴了 AMLL 公开的思路与阈值；仅借鉴思路与阈值，未使用其（AGPL）代码。
+- [jayfunc/BetterLyrics](https://github.com/jayfunc/BetterLyrics) —— 「BetterLyrics」逐字动画档的播放效果（长音节放大与辉光、未唱音节下沉与唱到上浮的浮动节奏、词块级高亮节奏）参考了其 LyricsAnimator / LyricsEffectSettings 的阈值与观感；仅借鉴思路与参数，未使用其（GPL-3.0）代码。
+- [LuckyPray/DexKit](https://github.com/LuckyPray/DexKit) —— 能力探测背后的运行期 Dex 符号解析。
+- [miuix](https://github.com/compose-miuix-ui/miuix) —— 整个设置界面所基于的 Compose UI 组件库。
+- 让这一切成为可能的歌词源：[Spicy EX](https://github.com/amarinne/spicy-ex)、
+  [Lyricon](https://github.com/tomakino/lyricon)、[SuperLyric](https://github.com/HChenX/SuperLyric)
+  与 [LyricInfo](https://github.com/limczhh/LyricInfo)。
+- [LSPosed](https://github.com/LSPosed/LSPosed) 与 libxposed 提供的 Xposed 运行时。
 
 ## 许可证
 

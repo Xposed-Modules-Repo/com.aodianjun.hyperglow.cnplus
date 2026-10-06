@@ -7,6 +7,8 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.SystemClock
 import com.eza.hyperglow.AppLog
+import com.eza.hyperglow.aod.AodRenderPreferences
+import com.eza.hyperglow.customization.LyricTimeOffset
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,24 +19,36 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlin.math.abs
 
 /**
  * [LyricProducer] that reads lyrics injected by the LyricInfo Xposed module.
  *
- * LyricInfo hooks music apps to write a JSON payload into `MediaMetadata.extras.lyricInfo`
- * (elrc/lrc format). Any app with notification access can read it. This producer:
+ * LyricInfo hooks music apps to write a JSON payload into `MediaMetadata.extras.lyricInfo`.
+ * Any app with notification access can read it. Payloads on this key follow one of three
+ * dialects, all read leniently here: limczhh/LyricInfo (elrc/lrc plus optional
+ * rawLyric/translation/roma lanes), the ColorOS Live Lyrics Bridge Provider v5 contract
+ * (line `lyric` + word-level `rawLyric` + canonical `translationLyric` lane, see the
+ * Providers repo PLAYER_INTEGRATION guide), or player-native Lite output
+ * (QQ 音乐按行复用 songName 字段). This producer:
  * 1. Registers a [MediaSessionManager.OnActiveSessionsChangedListener] scoped to the app's
  *    [LyricInfoNotificationListener], which is how a third-party app reads other apps' sessions.
- * 2. Picks the active session whose `MediaMetadata` carries a `lyricInfo` extra.
- * 3. Parses the elrc/lrc payload via [ElrcParser] and selects the active line by position.
+ * 2. Picks the active session whose `MediaMetadata` carries a `lyricInfo` extra; if none, falls
+ *    back to any active media session so that playback metadata (title/artist/position) is still
+ *    available when the lyric injection module is absent or when another producer (Lyricon) dies.
+ * 3. Parses the payload lanes via [ElrcParser] and selects the active line by position:
+ *    word-timed `rawLyric` wins over line `lyric`; translation resolves the lyricInfo alias
+ *    family (translationLyric → translation → transLyric → Bridge 的 5 个扩展别名);
+ *    translation/roma attach by nearest startMs within 120ms ([matchSupplementalLine]).
  * 4. Polls [MediaController.playbackState] for position and extrapolates while playing.
  *
- * Requires the user to grant notification access (ACTION_NOTIFICATION_LISTENER_SETTINGS) and
- * the LyricInfo module to be active in the music app. Until a session with `lyricInfo` is seen,
- * [connection] stays [ProducerConnection.DISCONNECTED] and [state] stays null, so the arbiter
- * falls back automatically.
+ * Requires the user to grant notification access (ACTION_NOTIFICATION_LISTENER_SETTINGS).
+ * Until a session is seen, [connection] stays [ProducerConnection.DISCONNECTED] and [state] stays
+ * null, so the arbiter falls back automatically.
  *
  * Threading: session callbacks arrive on the main thread; the position poll runs on
  * [Dispatchers.Default]. [MutableStateFlow] is thread-safe.
@@ -63,6 +77,8 @@ class LyricInfoLyricProducer(
     @Volatile private var controller: MediaController? = null
     @Volatile private var timedLines: List<ElrcParser.TimedLine> = emptyList()
     @Volatile private var translationLines: List<ElrcParser.TimedLine> = emptyList()
+    @Volatile private var romaLines: List<ElrcParser.TimedLine> = emptyList()
+    @Volatile private var unsyncedLyrics: String? = null
     @Volatile private var title: String = ""
     @Volatile private var artist: String = ""
     @Volatile private var album: String = ""
@@ -74,6 +90,14 @@ class LyricInfoLyricProducer(
     @Volatile private var lastPlaybackSpeed: Float = 0f
     @Volatile private var isPlayingState: Boolean = false
     @Volatile private var currentPositionMs: Long = 0L
+    /** True while currentPositionMs is being advanced by extrapolation (stale/frozen ps). */
+    @Volatile private var extrapolating: Boolean = false
+
+    /** 文档级「歌词时间偏移」(毫秒)缓存;正数延后、负数提前(见 LyricTimeOffsetPolicy)。 */
+    @Volatile private var lyricTimeOffsetMs: Int = 0
+
+    /** 跳转判定器(issue #68 #19):注入与外推同一时钟;换歌时 reset。 */
+    private val seekDetector = LyricSeekDetector(clock)
 
     // Session/sequence for arbiter dedup (producerId:generation:sequence).
     @Volatile private var generation: Int = 0
@@ -122,6 +146,46 @@ class LyricInfoLyricProducer(
         AppLog.i("LyricInfoLyricProducer", "stop: done")
     }
 
+    /** 外部设置变更(文档保存/导入/重置)时刷新「歌词时间偏移」缓存。 */
+    override fun onCustomizationChanged() {
+        lyricTimeOffsetMs = loadLyricTimeOffsetMs(contextRef)
+    }
+
+    /**
+     * 「视频/非音乐音频不显示歌词」开关(应用级偏好,见 [MediaSourcePolicy])。
+     * 懒读:开关切换立即生效,不必等会话变化;偏好读取本身有缓存(见 AodRenderPreferences.read)。
+     */
+    private fun filterNonMusicSources(): Boolean =
+        contextRef?.let { AodRenderPreferences.read(it).filterNonMusicSources } ?: true
+
+    /**
+     * 「重启歌词源」:重新注册 MediaSession 会话监听,并重新挑选活动会话、重建其回调,
+     * 用于跨应用歌词注入链路(会话回调)卡死时恢复。
+     */
+    override fun restart() {
+        if (!started) {
+            AppLog.i("LyricInfoLyricProducer", "restart: not started (no-op)")
+            return
+        }
+        scope.launch {
+            val ctx = contextRef ?: return@launch
+            // 契约要求 restart() 不向调用方抛异常:会话注册/注销与 MediaController 回调都跨
+            // 系统服务,MediaController 可能随会话销毁而抛 IllegalStateException;整段兜底,
+            // 避免异常逃出协程(Dispatchers.Default 上未捕获即应用进程崩溃)。
+            runCatching {
+                val component = ComponentName(ctx, LyricInfoNotificationListener::class.java)
+                runCatching { manager?.removeOnActiveSessionsChangedListener(sessionListener) }
+                runCatching { manager?.addOnActiveSessionsChangedListener(sessionListener, component) }
+                runCatching { controller?.unregisterCallback(controllerCallback) }
+                controller = null
+                val sessions = runCatching { manager?.getActiveSessions(component) ?: emptyList() }
+                    .getOrDefault(emptyList())
+                AppLog.i("LyricInfoLyricProducer", "restart: re-registered (sessions=${sessions.size})")
+                refreshSessions(sessions)
+            }.onFailure { AppLog.w("LyricInfoLyricProducer", "restart: rebuild failed", it) }
+        }
+    }
+
     /**
      * Called by [LyricInfoNotificationListener] once the user grants notification access and the
      * listener connects. Re-queries active sessions (which are now visible cross-app) and, if a
@@ -138,28 +202,46 @@ class LyricInfoLyricProducer(
     }
 
     private fun refreshSessions(sessions: List<MediaController>) {
-        val picked = sessions.firstOrNull { it.metadata?.getString(LYRIC_INFO_KEY) != null }
+        val filterNonMusic = filterNonMusicSources()
+        val picked = pickMediaSession(sessions, filterNonMusic)
+        if (picked == null && sessions.isNotEmpty() && filterNonMusic) {
+            val dropped = sessions.filterNot { isLyricEligibleSource(it, filterNonMusic) }
+            if (dropped.isNotEmpty()) {
+                // 真机实证:网易云停止后,「任意在播会话」兜底会把抖音/哔哩哔哩的视频会话
+                // 当歌曲上屏。这里留痕,便于现场判定是「无会话」还是「会话被非音乐过滤」。
+                AppLog.i(
+                    "LyricInfoLyricProducer",
+                    "sessions filtered as non-music: " +
+                        dropped.joinToString { it.packageName.orEmpty() }
+                )
+            }
+        }
         if (picked == null) {
             if (controller != null) {
                 controller?.unregisterCallback(controllerCallback)
                 controller = null
                 timedLines = emptyList()
                 translationLines = emptyList()
+                romaLines = emptyList()
                 mutableState.value = null
             }
             if (mutableConnection.value != ProducerConnection.DISCONNECTED) {
-                AppLog.i("LyricInfoLyricProducer", "no session with lyricInfo -> DISCONNECTED")
+                AppLog.i("LyricInfoLyricProducer", "no active media session -> DISCONNECTED")
                 mutableConnection.value = ProducerConnection.DISCONNECTED
             }
             return
         }
+        val hasLyrics = picked.metadata?.getString(LYRIC_INFO_KEY) != null
         if (controller !== picked) {
             controller?.unregisterCallback(controllerCallback)
             controller = picked
             picked.registerCallback(controllerCallback)
         }
         if (mutableConnection.value != ProducerConnection.CONNECTED) {
-            AppLog.i("LyricInfoLyricProducer", "session with lyricInfo -> CONNECTED")
+            AppLog.i(
+                "LyricInfoLyricProducer",
+                "active media session -> CONNECTED (lyrics=${hasLyrics})"
+            )
             mutableConnection.value = ProducerConnection.CONNECTED
         }
         updateFromController(picked)
@@ -167,24 +249,74 @@ class LyricInfoLyricProducer(
 
     private fun updateFromController(c: MediaController) {
         val meta = c.metadata ?: return
-        val lyricInfo = meta.getString(LYRIC_INFO_KEY) ?: return
-        val payload = runCatching { lyricInfoJson.decodeFromString<LyricInfoPayload>(lyricInfo) }
-            .onFailure { AppLog.w("LyricInfoLyricProducer", "decode lyricInfo failed", it) }
-            .getOrNull() ?: return
-        val newTitle = payload.songName.orEmpty()
-        if (newTitle != title || payload.artist != artist) {
+        val lyricInfo = meta.getString(LYRIC_INFO_KEY)
+        val payload = lyricInfo?.let(::parseLyricInfoPayload)
+        // Derive title/artist from lyric payload when available, otherwise read from MediaMetadata
+        // so a session without LyricInfo injection still surfaces track metadata.
+        // 精简版(Lite)原生逐行 payload 例外:songName 携带当前歌词行、artist 是
+        // "歌名 - 歌手"复合串(ColorOS 锁屏岛原生协议按行复用字段),不能当曲目元数据——
+        // 否则歌曲信息带上歌词,且 songName 每行都变会误触发 song changed 重置外推状态。
+        // 检测到该格式时改用系统 MediaMetadata 的干净 title/artist。
+        val metaTitle = meta.getString(android.media.MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+        val metaArtist = meta.getString(android.media.MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
+        val nativePerLine = isNativePerLinePayload(payload, metaTitle)
+        val newTitle = if (nativePerLine && metaTitle.isNotBlank()) metaTitle
+            else payload?.songName?.takeIf { it.isNotBlank() } ?: metaTitle
+        val newArtist = if (nativePerLine && metaArtist.isNotBlank()) metaArtist
+            else payload?.artist?.takeIf { it.isNotBlank() } ?: metaArtist
+        val newAlbum = payload?.album?.takeIf { it.isNotBlank() }
+            ?: meta.getString(android.media.MediaMetadata.METADATA_KEY_ALBUM).orEmpty()
+        // 换歌判定走曲目身份模糊匹配(issue #68 #15):标题尾缀/译名/feat 写法变化
+        // 不再误判切歌;一侧标题为空白时回退为"变化"。见 TrackIdentity.isSameTrackIdentity。
+        if (!isSameTrackIdentity(title, artist, newTitle, newArtist)) {
             generation++
+            // 旧歌的外推/容差状态不得带进新歌:换歌后第一条真实位置无条件接受。
+            extrapolating = false
+            // 旧歌的位置基线同样作废:新歌首次推送只建基线,不判跳转。
+            seekDetector.reset()
             AppLog.i(
                 "LyricInfoLyricProducer",
-                "song changed: title=$newTitle artist=${payload.artist}"
+                "song changed: title=$newTitle artist=$newArtist"
             )
         }
         title = newTitle
-        artist = payload.artist.orEmpty()
-        album = payload.album.orEmpty()
+        artist = newArtist
+        album = newAlbum
         durationMs = meta.getLong(MEDIA_METADATA_KEY_DURATION).coerceAtLeast(0L)
-        timedLines = ElrcParser.parse(payload.lyric.orEmpty())
-        translationLines = ElrcParser.parse(payload.translation.orEmpty())
+        timedLines = resolveLyricInfoTimedLines(payload).let { parsed ->
+            // 开头元数据清理(issue #68 #4):版权/制作明细/标题歌手头,仅前 32 行且 ≤30s。
+            val filtered = LyricOpeningFilter.filterOpeningMetadata(parsed)
+            // 行时间戳词级对齐(issue #68 #18):行 start/end 锚到首词/末词;单词全零回填。
+            // 必须在重叠仲裁之前——重叠判定要基于最终时间轴。
+            val normalized = LyricTimelineSanitizer.resetLineTimestampsFromWords(filtered)
+            // 词锚定可能打乱时间序(词时序与行时序交叉的脏源):先稳定排序,
+            // 重叠仲裁与 activeLineAt 的"升序+break"前提才成立。
+            val ordered = LyricTimelineSanitizer.sortedByTimeline(normalized)
+            // 非刻意行间重叠截断(issue #68 #17):≥500ms 或(>100ms 且 >下一行时长 10%)
+            // 判有意保留;其余截断到下一行 start,防多行同亮/高亮跳动。
+            val sanitized = LyricTimelineSanitizer.sanitizeUnintentionalOverlaps(ordered)
+            val reAnchored = filtered.zip(normalized)
+                .count { (a, b) -> a.startMs != b.startMs || a.endMs != b.endMs }
+            val truncated = ordered.zip(sanitized)
+                .count { (a, b) -> a.endMs != b.endMs }
+            if (filtered.size != parsed.size || reAnchored > 0 || truncated > 0) {
+                AppLog.i(
+                    "LyricInfoLyricProducer",
+                    "timeline normalized: opening=${parsed.size - filtered.size}" +
+                        " reAnchored=$reAnchored truncated=$truncated for '$title'"
+                )
+            }
+            sanitized
+        }
+        // 翻译 lane 优先级:Bridge 规范 translationLyric → 完整版 translation → 精简版 transLyric。
+        translationLines = resolveLyricInfoTranslationLines(payload)
+        romaLines = ElrcParser.parse(payload?.roma.orEmpty())
+        // 标准 MediaSession 歌词键 fallback:payload 缺失或不含时间轴时,读标准
+        // METADATA_KEY_LYRICS(纯文本)作为非同步歌词源,进入 UNSYNCED 展示/keepalive 路径。
+        unsyncedLyrics = resolveUnsyncedLyricFallback(
+            hasTimedLines = timedLines.isNotEmpty(),
+            metadataLyrics = meta.getString(METADATA_KEY_LYRICS)
+        )
         val ps = c.playbackState
         if (ps != null) {
             applyPlaybackState(ps)
@@ -203,13 +335,52 @@ class LyricInfoLyricProducer(
         ) {
             currentPositionMs =
                 lastRealPositionMs + ((now - lastRealPositionClockMs) * lastPlaybackSpeed).toLong()
+            extrapolating = true
             return
         }
-        lastRealPositionMs = ps.position
+        // Stale→恢复（抬起手机、切通道回退）时，MediaSession position 可能短暂落后于
+        // 外推值（共享内存/回调延迟）。Lyricon 通道的 monotonicResume 在 1..300ms 容差内
+        // 保持外推值以避免行回退闪烁；本通道此前无条件接受 ps.position，抬起解冻时行
+        // 会回跳几秒。对齐同样的容差保护。
+        //
+        // 外推期恢复真实推送时重建跳转判定基线(issue #68 #19 修复):合成外推期间
+        // 无真实位置推送,冻结时长会让下一次真实推送的 mediaDelta 携带整段停滞而
+        // wallDelta 被 800ms 信任上限钳住,必然误报 seek。页面恢复属"本质连续"场景,
+        // 按 AMLL 语义不由判定器代判——首推只建基线。
+        if (extrapolating) {
+            seekDetector.reset()
+        }
+        val monotonicResume = isMonotonicExtrapolationResume(
+            wasExtrapolating = extrapolating,
+            extrapolatedPositionMs = currentPositionMs,
+            realPositionMs = ps.position
+        )
+        if (monotonicResume) {
+            // 保持单调外推值，把外推时钟重新锚定到它。
+            lastRealPositionMs = currentPositionMs
+        } else {
+            // 跳转判定(issue #68 #19):把"这次位置变化是否为真 seek"从隐式启发改为
+            // 显式判定器并落日志,真机可区分"用户拖进度条"与"源位置抖动"。
+            // 本通道行为不变——接受真实位置即 snap 选中行;判定结果为逐行源(#75)
+            // 复用与后续"seek 免追赶动画"策略提供统一出口。
+            val playing = ps.state == PlaybackState.STATE_PLAYING
+            if (seekDetector.detect(ps.position, playing)) {
+                AppLog.i(
+                    "LyricInfoLyricProducer",
+                    "seek detected: position=${ps.position} playing=$playing"
+                )
+                // 跨源 seek 转发:其他生产者的独立位置源可能整段冻结/漏发 onSeekTo
+                // (2026-09-28 真机实测拖动进度条后歌词 14s 不跟手),先观测到的一方
+                // 把权威位置递过去立即跟手(见 LyricProducers.notifyExternalSeek)。
+                LyricProducers.notifyExternalSeek(LyricSource.LYRICINFO, ps.position)
+            }
+            lastRealPositionMs = ps.position
+            currentPositionMs = ps.position
+        }
         lastRealPositionClockMs = now
         lastPlaybackSpeed = ps.playbackSpeed
         isPlayingState = ps.state == PlaybackState.STATE_PLAYING
-        currentPositionMs = ps.position
+        extrapolating = false
     }
 
     private val controllerCallback = object : MediaController.Callback() {
@@ -235,6 +406,7 @@ class LyricInfoLyricProducer(
                     // No fresh playback state: extrapolate from the last real position.
                     currentPositionMs =
                         lastRealPositionMs + ((now - lastRealPositionClockMs) * lastPlaybackSpeed).toLong()
+                    extrapolating = true
                 }
                 emit()
             }
@@ -249,29 +421,72 @@ class LyricInfoLyricProducer(
     private fun emit() {
         val c = controller ?: run { mutableState.value = null; return }
         if (timedLines.isEmpty()) {
-            // Connected session but no parseable lyrics yet: emit metadata-only.
-            emitTrack(null)
+            // Connected session but no parseable lyrics yet: emit track-level state,
+            // falling back to standard MediaSession lyrics (UNSYNCED) when present.
+            emitTrack(null, unsyncedLyrics)
             return
         }
-        val active = ElrcParser.activeLineAt(timedLines, currentPositionMs)
-        val translationText = active?.let { a ->
-            translationLines.firstOrNull { it.startMs == a.startMs }?.text.orEmpty()
-        }.orEmpty()
-        val words = active?.words?.takeIf { it.isNotEmpty() }
+        // 最后一句歌词唱完后（position 越过其 end，歌曲进入尾奏/纯器乐段落），清空活动行
+        // 让投影显示 🎶 占位。activeLineAt 返回「最后一条 start <= pos」的行，不检查 end，
+        // 这里显式兜住结尾，避免最后一句在尾奏期间长期滞留。
+        // 「歌词时间偏移」:选行与发射坐标走显示时间轴(播放位置 − 偏移);外推/seek 判定
+        // 等机制层保持原始坐标(currentPositionMs),跨源 seek 转发的仍是原始位置。
+        val displayPos = LyricTimeOffset.displayPositionMs(currentPositionMs, lyricTimeOffsetMs)
+        val active = activeLinePastEndOrNull(timedLines, displayPos)
+        val translationText = active
+            ?.let { matchSupplementalLine(it, timedLines, translationLines)?.text }
+            .orEmpty()
+        val romanizedText = active
+            ?.let { matchSupplementalLine(it, timedLines, romaLines)?.text }
+            .orEmpty()
+        val words = active?.words?.takeIf { it.isNotEmpty() }?.shiftedByOffset(lyricTimeOffsetMs)
         val lyricKind = when {
             active == null -> LyricKind.NONE
             words != null -> LyricKind.SYLLABLE
             else -> LyricKind.LINE
         }
-        val nextLine = timedLines
+        val nextTimedLine = timedLines
             .firstOrNull { it.startMs > currentPositionMs }
-            ?.text
+        val nextLine = nextTimedLine?.text.orEmpty()
+        // 下一行的辅助文字 lane(与主行同一 ±120ms 最近行匹配,见 matchSupplementalLine)。
+        val nextLineRomanized = nextTimedLine
+            ?.let { matchSupplementalLine(it, timedLines, romaLines)?.text }
             .orEmpty()
+        val nextLineTranslated = nextTimedLine
+            ?.let { matchSupplementalLine(it, timedLines, translationLines)?.text }
+            .orEmpty()
+        // nextLine 的选取比较保持原始坐标(与 Lyricon 路径同语义);仅发射值换算到显示时间轴。
         val nextLineStartMs = timedLines
             .asSequence()
             .map { it.startMs }
             .filter { it > currentPositionMs }
             .minOrNull()
+            ?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) }
+        // 对唱并发行候选(见 [selectDuetLineIndex]):timedLines 全部行参与时间窗重叠判定;
+        // 翻译/roma lane 与活动行同一匹配规则(±120ms 最近行,见 matchSupplementalLine)。
+        val duetLine = run {
+            val primaryIndex = active?.let { a -> timedLines.indexOf(a) } ?: -1
+            val companionIndex = if (primaryIndex < 0) {
+                -1
+            } else {
+                selectDuetLineIndex(
+                    timedLines.map { DuetLineWindow(it.startMs, it.endMs, false) },
+                    primaryIndex,
+                    displayPos
+                )
+            }
+            timedLines.getOrNull(companionIndex)?.let { second ->
+                LyricDuetLine(
+                    text = second.text,
+                    romanized = matchSupplementalLine(second, timedLines, romaLines)?.text.orEmpty(),
+                    translated = matchSupplementalLine(second, timedLines, translationLines)?.text.orEmpty(),
+                    alignedRight = false,
+                    lineStartMs = LyricTimeOffset.displayMs(second.startMs, lyricTimeOffsetMs),
+                    lineEndMs = LyricTimeOffset.displayMs(second.endMs, lyricTimeOffsetMs),
+                    words = second.words.orEmpty().shiftedByOffset(lyricTimeOffsetMs)
+                )
+            }
+        }
         val now = clock()
         sequence++
         mutableState.value = LyricProducerState(
@@ -285,10 +500,10 @@ class LyricInfoLyricProducer(
             album = album,
             imageId = "",
             line = active?.text.orEmpty(),
-            romanizedLine = "",
+            romanizedLine = romanizedText,
             translatedLine = translationText,
             lineIndex = active?.let { a -> timedLines.indexOf(a) } ?: -1,
-            positionMs = currentPositionMs,
+            positionMs = displayPos,
             durationMs = durationMs,
             sampledAtElapsedMs = now,
             speed = if (isPlayingState) lastPlaybackSpeed else 0f,
@@ -298,17 +513,48 @@ class LyricInfoLyricProducer(
             renderModes = defaultRenderModes(),
             lyricKind = lyricKind,
             alignedRight = false,
-            lineStartMs = active?.startMs ?: 0L,
-            lineEndMs = active?.endMs ?: 0L,
+            lineStartMs = active?.startMs?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) } ?: 0L,
+            lineEndMs = active?.endMs?.let { LyricTimeOffset.displayMs(it, lyricTimeOffsetMs) } ?: 0L,
             ruby = emptyList(),
             layoutGroups = emptyList(),
             hasTimedLyrics = timedLines.any { it.endMs > it.startMs },
             nextLineStartMs = nextLineStartMs,
-            nextLine = nextLine
+            nextLine = nextLine,
+            nextLineRomanized = nextLineRomanized,
+            nextLineTranslated = nextLineTranslated,
+            duetLine = duetLine
         )
     }
 
-    private fun emitTrack(active: ElrcParser.TimedLine?) {
+    /**
+     * 整首歌快照：timedLines（LRC/elrc 解析结果）+ translation/roma lane 按 startMs 对齐，
+     * 与 emit() 的活动行翻译匹配同一规则。纯文本歌词（timedLines 空）返回 null，自然不进
+     * 插件链。实现是纯读 + 一次映射，管线只在新会话首次进入插件链时调用。
+     */
+    override fun fullSongSnapshot(): LyricSongSnapshot? {
+        val lines = timedLines
+        if (lines.isEmpty()) return null
+        return LyricSongSnapshot(
+            producerId = PRODUCER_ID,
+            generation = generation,
+            trackUri = "lyricinfo:$title",
+            durationMs = durationMs,
+            rows = lines.map { line ->
+                LyricSongRow(
+                    startMs = line.startMs,
+                    endMs = line.endMs,
+                    text = line.text,
+                    // 翻译/roma 对齐与 emit() 同规则(issue #75 评审修复):±120ms 最近行,
+                    // 精确相等会丢掉发布误差几十毫秒的翻译 lane。
+                    translation = matchSupplementalLine(line, lines, translationLines)?.text.orEmpty(),
+                    roma = matchSupplementalLine(line, lines, romaLines)?.text.orEmpty(),
+                    words = line.words?.takeIf { it.isNotEmpty() }
+                )
+            }
+        )
+    }
+
+    private fun emitTrack(active: ElrcParser.TimedLine?, unsyncedLyrics: String? = null) {
         val now = clock()
         sequence++
         mutableState.value = LyricProducerState(
@@ -321,7 +567,9 @@ class LyricInfoLyricProducer(
             artist = artist,
             album = album,
             imageId = "",
-            line = active?.text.orEmpty(),
+            // UNSYNCED 行不参与逐行渲染(AodStateProjector 显示 🎶 占位),携带受 bounds
+            // 限制的原文仅供诊断 evidence 与未来非同步展示使用。
+            line = if (unsyncedLyrics != null) unsyncedLyrics else active?.text.orEmpty(),
             romanizedLine = "",
             translatedLine = "",
             lineIndex = -1,
@@ -333,7 +581,7 @@ class LyricInfoLyricProducer(
             receivedAtElapsedMs = now,
             words = null,
             renderModes = defaultRenderModes(),
-            lyricKind = LyricKind.NONE,
+            lyricKind = if (unsyncedLyrics != null) LyricKind.UNSYNCED else LyricKind.NONE,
             alignedRight = false,
             lineStartMs = 0L,
             lineEndMs = 0L,
@@ -347,13 +595,12 @@ class LyricInfoLyricProducer(
 
     companion object {
         private const val PRODUCER_ID = "lyricinfo"
-        private const val LYRIC_INFO_KEY = "lyricInfo"
+        internal const val LYRIC_INFO_KEY = "lyricInfo"
         private const val MEDIA_METADATA_KEY_DURATION = "android.media.metadata.DURATION"
+        private const val METADATA_KEY_LYRICS = "android.media.metadata.LYRICS"
         private const val POSITION_POLL_MS = 250L
         /** PlaybackState position 多久未更新视为 stale（播放器进程被冻结）。 */
         private const val STALE_POSITION_MS = 2_000L
-
-        private val lyricInfoJson = Json { ignoreUnknownKeys = true }
 
         /** Default render modes when customization is unavailable; matches the other producers. */
         private fun defaultRenderModes() = ProducerRenderModes(
@@ -361,7 +608,10 @@ class LyricInfoLyricProducer(
             textSize = "normal",
             textSizeCustom = 100,
             secondary = "Main only",
-            animation = "Karaoke fill",
+            // 兜底值必须过得了 aod/AodRenderPreferences.normalizeAodAnimation（只放行
+            // Minimal / BetterLyrics，其余回落 Gradient）：历史遗留的 "Karaoke fill" 会被
+            // 静默改写成 Gradient，是个纯误导的默认值。
+            animation = "Gradient",
             glow = "Off",
             lineSyncFill = "Top to bottom",
             overflow = "Wrap",
@@ -371,8 +621,79 @@ class LyricInfoLyricProducer(
     }
 }
 
-/** JSON shape written into `MediaMetadata.extras.lyricInfo` by the LyricInfo module. */
-@Serializable
+/**
+ * Stale→恢复（抬起手机、通道回退）时是否保持单调外推值:真实位置仅小幅落后(容差内)
+ * 视为共享内存/回调延迟,保持外推值避免行回退闪烁;大幅落后(seek/换歌/真回退)按真实
+ * 位置处理。与 Lyricon 通道的 monotonicResume 同一容差语义。
+ */
+/**
+ * Select the session this producer should follow. Prefer one that carries the `lyricInfo` extra
+ * (injected lyrics); if none exists, fall back to any active media session so playback metadata
+ * and MediaSession position are still available when the lyric injection module is absent or when
+ * another producer (Lyricon) dies — the recovery path for issue #5.
+ *
+ * [filterNonMusicSources] 为 true 时先剔除可证实的非音乐会话(视频应用包名 / 显式 MOVIE 等
+ * 内容类型,见 [MediaSourcePolicy])：视频播放不得触发歌词显示。兜底路径本身保持不变 ——
+ * 音乐应用没有注入歌词时仍可被选中;全部会话都被判定为非音乐时等同于「无会话」,
+ * 让仲裁器回退或进入空闲。
+ */
+internal fun pickMediaSession(
+    sessions: List<MediaController>,
+    filterNonMusicSources: Boolean = true
+): MediaController? {
+    val eligible = sessions.filter { isLyricEligibleSource(it, filterNonMusicSources) }
+    return eligible.firstOrNull { it.metadata?.getString(LyricInfoLyricProducer.LYRIC_INFO_KEY) != null }
+        ?: eligible.firstOrNull()
+}
+
+/**
+ * 该会话的来源是否允许进入歌词链。内容类型经 `MediaController.playbackInfo` 读取会话声明的
+ * `AudioAttributes`(公开 API);读取失败按未声明处理(fail-open,见 [MediaSourcePolicy])。
+ */
+internal fun isLyricEligibleSource(
+    controller: MediaController,
+    filterNonMusicSources: Boolean
+): Boolean = MediaSourcePolicy.isLyricEligible(
+    packageName = controller.packageName,
+    contentType = runCatching { controller.playbackInfo?.audioAttributes?.contentType }.getOrNull(),
+    filterEnabled = filterNonMusicSources
+)
+
+/**
+ * Select the active line for [positionMs]; returns null once the position has passed the final
+ * line's end (lyrics finished, song is in its instrumental outro) so projection shows the 🎶
+ * placeholder instead of leaving the last line stuck on screen until the song ends.
+ */
+internal fun activeLinePastEndOrNull(
+    lines: List<ElrcParser.TimedLine>,
+    positionMs: Long
+): ElrcParser.TimedLine? {
+    val active = ElrcParser.activeLineAt(lines, positionMs)
+    val last = lines.lastOrNull() ?: return active
+    return active?.takeUnless { positionMs >= last.endMs }
+}
+
+internal fun isMonotonicExtrapolationResume(
+    wasExtrapolating: Boolean,
+    extrapolatedPositionMs: Long,
+    realPositionMs: Long,
+    toleranceMs: Long = 300L
+): Boolean = wasExtrapolating &&
+    (extrapolatedPositionMs - realPositionMs) in 1..toleranceMs
+
+/**
+ * JSON shape written into `MediaMetadata.extras.lyricInfo`.
+ *
+ * 三个来源方言的宽松提取,未知键忽略(rawLyric/roma 为 limczhh/LyricInfo 完整版与
+ * Bridge Provider v5 共有语义:rawLyric 是原文逐字增强,翻译/罗马音是独立 lane):
+ * - limczhh/LyricInfo 完整版:songName/artist/album/songId/lyric/format/translation,
+ *   可选 rawLyric(逐字增强)/roma(罗马音),可选字段仅在有效非空时写入。
+ * - 精简版(Lite)是播放器原生输出,字段集随播放器而变(QQ 音乐用 transLyric 携带翻译,
+ *   还有 noLyric/lyricType/txtlyric 等),且 songId 等可能是数字类型。
+ * - ColorOS Live Lyrics Bridge Provider v5(PLAYER_INTEGRATION 契约):相同 lyric/
+ *   rawLyric 语义之上,规范翻译字段为 translationLyric,另带 trackKey/
+ *   sessionGeneration 等诊断字段;扩展字段只在携带时间标签时发布。
+ */
 internal data class LyricInfoPayload(
     val songName: String? = null,
     val artist: String? = null,
@@ -380,5 +701,171 @@ internal data class LyricInfoPayload(
     val songId: String? = null,
     val lyric: String? = null,
     val format: String? = null,
-    val translation: String? = null
+    val translation: String? = null,
+    val transLyric: String? = null,
+    val rawLyric: String? = null,
+    val translationLyric: String? = null,
+    val translatedLyric: String? = null,
+    val translateLyric: String? = null,
+    val lyricTranslation: String? = null,
+    val translationLrc: String? = null,
+    val transLrc: String? = null,
+    val roma: String? = null
 )
+
+/** lyricInfo JSON 解析器:宽松提取,未知键忽略。 */
+private val lyricInfoJson = Json { ignoreUnknownKeys = true }
+
+/**
+ * 宽松解析 lyricInfo JSON:字段缺失/类型不匹配(数字、boolean)一律降级为 null,
+ * 绝不因原生变体格式差异丢掉整个 payload(歌词是最关键字段)。
+ */
+internal fun parseLyricInfoPayload(raw: String): LyricInfoPayload? = runCatching {
+    val obj = lyricInfoJson.parseToJsonElement(raw) as? JsonObject ?: return null
+    // 字符串/数字/boolean 原始值都按文本接受(精简版 songId 可能是数字);
+    // null 字面量(JsonNull)与对象/数组降级为 null。
+    fun text(key: String): String? =
+        (obj[key] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content
+    LyricInfoPayload(
+        songName = text("songName"),
+        artist = text("artist"),
+        album = text("album"),
+        songId = text("songId"),
+        lyric = text("lyric"),
+        format = text("format"),
+        translation = text("translation"),
+        transLyric = text("transLyric"),
+        rawLyric = text("rawLyric"),
+        translationLyric = text("translationLyric"),
+        translatedLyric = text("translatedLyric"),
+        translateLyric = text("translateLyric"),
+        lyricTranslation = text("lyricTranslation"),
+        translationLrc = text("translationLrc"),
+        transLrc = text("transLrc"),
+        roma = text("roma")
+    )
+}.onFailure {
+    AppLog.w("LyricInfoLyricProducer", "decode lyricInfo failed", it)
+}.getOrNull()
+
+/**
+ * 判断是否为精简版(Lite)原生逐行 lyricInfo payload(纯函数,可单测)。
+ *
+ * 原生格式(ColorOS 锁屏岛协议)按行更新 MediaMetadata 并复用字段:songName 携带
+ * 当前歌词行,artist 是"歌名 - 歌手"复合串(实测 logcat 证据)。两个信号任一命中
+ * 即判定,命中后调用方应改用系统 MediaMetadata 的干净 title/artist:
+ * 1. songName 与 lyric 解析出的唯一一行文本一致(songName 即当前歌词行);
+ * 2. artist 包含系统 MediaMetadata 的干净歌名(复合串组成部分)。
+ * 完整版 payload(artist 为纯歌手名、lyric 为整首多行)不会命中任一信号。
+ */
+internal fun isNativePerLinePayload(
+    payload: LyricInfoPayload?,
+    metadataTitle: String
+): Boolean {
+    if (payload == null) return false
+    val lyricLines = ElrcParser.parse(payload.lyric.orEmpty())
+    if (lyricLines.size == 1 && payload.songName == lyricLines[0].text) return true
+    if (metadataTitle.isNotBlank() && payload.artist.orEmpty().contains(metadataTitle)) return true
+    return false
+}
+
+/**
+ * Resolve the lyric lane for a lyricInfo payload (pure function, unit-testable).
+ *
+ * 优先级与 ColorOS Live Lyrics Bridge 的 LyricInfoContract 语义对齐:
+ * - rawLyric 含逐字标签时整体作为歌词源(逐字 lane 由同一歌词模型生成,行时间齐备);
+ * - lyric 有时间轴时用 lyric(完整版与精简版都在这里);
+ * - lyric 不可解析而 rawLyric 可解析(raw-only payload)时回退到 rawLyric,Bridge 同样接受
+ *   该形态(LyricInfoContract.parse 的 display fallback)。
+ */
+internal fun resolveLyricInfoTimedLines(payload: LyricInfoPayload?): List<ElrcParser.TimedLine> {
+    val rawParsed = ElrcParser.parse(payload?.rawLyric.orEmpty())
+    if (rawParsed.any { !it.words.isNullOrEmpty() }) return rawParsed
+    val lineParsed = ElrcParser.parse(payload?.lyric.orEmpty())
+    return if (lineParsed.isEmpty() && rawParsed.isNotEmpty()) rawParsed else lineParsed
+}
+
+/**
+ * 翻译 lane 优先级:Bridge 规范 translationLyric → limczhh 完整版 translation →
+ * QQ 精简版 transLyric → Bridge LyricInfoContract 的其余 5 个别名键
+ * (translatedLyric/translateLyric/lyricTranslation/translationLrc/transLrc,issue #68)。
+ * 八条 lane 格式同为逐行 LRC,ElrcParser 统一解析;别名命中时 require 可解析出时间行
+ * (不可解析自然产出空列表,与旧行为一致)。
+ */
+internal fun resolveLyricInfoTranslationLines(
+    payload: LyricInfoPayload?
+): List<ElrcParser.TimedLine> = ElrcParser.parse(
+    payload?.translationLyric?.takeIf { it.isNotBlank() }
+        ?: payload?.translation?.takeIf { it.isNotBlank() }
+        ?: payload?.transLyric?.takeIf { it.isNotBlank() }
+        ?: payload?.translatedLyric?.takeIf { it.isNotBlank() }
+        ?: payload?.translateLyric?.takeIf { it.isNotBlank() }
+        ?: payload?.lyricTranslation?.takeIf { it.isNotBlank() }
+        ?: payload?.translationLrc?.takeIf { it.isNotBlank() }
+        ?: payload?.transLrc.orEmpty()
+)
+
+/**
+ * 翻译/罗马音 lane 与主行的对齐窗口(与 Bridge SupplementalTranslationPolicy 的
+ * SUPPLEMENTAL_MATCH_WINDOW_MS 一致):源与翻译行的发布误差常有几十毫秒,
+ * 旧实现的 startMs 精确相等会把这些行静默丢掉。
+ */
+internal const val SUPPLEMENTAL_MATCH_WINDOW_MS = 120L
+
+/**
+ * 在 [candidates] 中为 [primary] 选出应挂载的翻译/罗马音行(纯函数,可单测)。
+ *
+ * 匹配:窗口 ±[SUPPLEMENTAL_MATCH_WINDOW_MS] 内取 startMs 最近的候选。
+ * 两道护栏防误挂(语义与 Bridge SupplementalTranslationPolicy 对齐):
+ * 1. 最近主行:窗口内存在比 [primary] 严格更接近候选的其它主行 → 候选属于邻居,不挂;
+ * 2. 重复文本:窗口内另一主行已渲染与候选相同的文本 → 候选是重复歌词而非翻译,不挂。
+ */
+internal fun matchSupplementalLine(
+    primary: ElrcParser.TimedLine,
+    primaryLines: List<ElrcParser.TimedLine>,
+    candidates: List<ElrcParser.TimedLine>
+): ElrcParser.TimedLine? {
+    var best: ElrcParser.TimedLine? = null
+    var bestDistance = Long.MAX_VALUE
+    for (candidate in candidates) {
+        val distance = abs(candidate.startMs - primary.startMs)
+        if (distance <= SUPPLEMENTAL_MATCH_WINDOW_MS && distance < bestDistance) {
+            best = candidate
+            bestDistance = distance
+        }
+    }
+    val matched = best ?: return null
+    for (other in primaryLines) {
+        if (other === primary) continue
+        if (abs(other.startMs - matched.startMs) < bestDistance) return null
+    }
+    for (other in primaryLines) {
+        if (other === primary) continue
+        if (abs(other.startMs - primary.startMs) > SUPPLEMENTAL_MATCH_WINDOW_MS) continue
+        if (other.text.trim() == matched.text.trim()) return null
+    }
+    return matched
+}
+
+/**
+ * 标准 MediaSession 歌词键的截断上限:非同步歌词只用于诊断 evidence 与未来非同步展示,
+ * 不参与逐行渲染,超长文本按字符截断(远小于 wire 快照 48 KiB 聚合上限)。
+ */
+internal const val UNSYNCED_LYRICS_MAX_CHARS = 4_096
+
+/**
+ * 标准 MediaSession 歌词键 fallback(纯函数,可单测)。
+ *
+ * 播放器把整段纯文本歌词写进标准 `android.media.metadata.LYRICS`(无逐行时间轴)时,
+ * lyricInfo 通道不可用或不含时间轴,这里把该文本作为非同步歌词源返回:调用方据此以
+ * `LyricKind.UNSYNCED` 发射状态,进入既有的 UNSYNCED 展示(🎶 占位 + 大元数据)与
+ * keepAwakeUnsynced 保活语义。时间轴存在时返回 null(逐时歌词优先,不叠加)。
+ */
+internal fun resolveUnsyncedLyricFallback(
+    hasTimedLines: Boolean,
+    metadataLyrics: String?
+): String? {
+    if (hasTimedLines) return null
+    val text = metadataLyrics?.takeIf { it.isNotBlank() } ?: return null
+    return text.take(UNSYNCED_LYRICS_MAX_CHARS)
+}

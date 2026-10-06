@@ -1,9 +1,6 @@
 package com.eza.hyperglow.root.lockscreen
 
-import android.graphics.Canvas
-import android.graphics.Paint
 import android.graphics.Rect
-import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -16,22 +13,23 @@ import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.customization.CompiledCustomization
 import com.eza.hyperglow.customization.CompiledSurfaceProfile
 import com.eza.hyperglow.customization.SceneCompiler
+import com.eza.hyperglow.customization.metadataExpectedExtraLines
 import com.eza.hyperglow.root.aod.AodLyricCanvasView
 import com.eza.hyperglow.root.aod.AodCanvasVerticalAlignment
+import com.eza.hyperglow.root.aod.artworkSideDp
 import com.eza.hyperglow.root.aod.metadataWidgetHeightDp
-import com.eza.hyperglow.root.aod.textSizeModeMultiplier
 import com.eza.hyperglow.root.aod.toAodCanvasContent
 import com.eza.hyperglow.root.capability.XiaomiCapability
 import com.eza.hyperglow.root.capability.XiaomiCapabilityResolver
 import com.eza.hyperglow.root.projection.LyricKeepAliveSignal
 import com.eza.hyperglow.root.projection.LYRIC_SNAPSHOT_FRESH_MS
 import com.eza.hyperglow.root.projection.LyricRenderContent
+import com.eza.hyperglow.root.projection.LyricRetentionAnchor
 import com.eza.hyperglow.root.projection.LyricSnapshot
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
 import com.eza.hyperglow.root.projection.SystemUiLyricProjectionRuntime
 import com.eza.hyperglow.root.projection.SystemUiLyricSubscriber
-import com.eza.hyperglow.root.projection.freezeAt
-import com.eza.hyperglow.root.projection.isAuthorizedForPresentation
+import com.eza.hyperglow.root.projection.nextLyricRetentionAnchor
 import com.eza.hyperglow.root.projection.pauseLingerRemainingMs
 import com.eza.hyperglow.root.aod.AodSurfaceController
 import com.eza.hyperglow.root.transition.LinkageSceneRole
@@ -45,616 +43,18 @@ import com.eza.hyperglow.root.transition.resetLinkageView
 import com.eza.hyperglow.root.transition.transitionRectInWindow
 import com.eza.hyperglow.root.surface.PlacementEngine
 import com.eza.hyperglow.root.surface.PlacementEnvironment
-import com.eza.hyperglow.root.surface.PlacementRect
 import com.eza.hyperglow.root.surface.WidgetMeasurement
 import java.lang.ref.WeakReference
 import java.lang.reflect.Method
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
-internal data class LockscreenSceneRect(
-    val left: Int,
-    val top: Int,
-    val right: Int,
-    val bottom: Int
-) {
-    val width: Int get() = right - left
-    val height: Int get() = bottom - top
-}
+internal const val MIN_VISIBLE_ALPHA = 0.01f
 
-internal data class LockscreenVisibilityInputs(
-    val featureEnabled: Boolean,
-    val supported: Boolean,
-    val defaultTheme: Boolean,
-    val primaryDisplay: Boolean,
-    val keyguardShowing: Boolean,
-    val bouncerShowing: Boolean,
-    val freshSnapshot: Boolean,
-    val usableArea: Boolean
-)
-
-internal data class LockscreenNotificationCandidate(
-    val className: String,
-    val top: Int,
-    val bottom: Int = top + 1,
-    val left: Int = 0,
-    val right: Int = 0
-)
-
-internal data class LockscreenNotificationClipBounds(
-    val left: Int,
-    val top: Int,
-    val right: Int,
-    val bottom: Int
-)
-
-internal data class LockscreenNotificationBounds(
-    val top: Int,
-    val bottom: Int,
-    val left: Int = 0,
-    val right: Int = 0
-)
-
-internal data class LockscreenNotificationGeometry(
-    val effectiveBounds: LockscreenNotificationBounds?,
-    val cachedBounds: LockscreenNotificationBounds?
-)
-
-private const val TOP_MARGIN_DP = 16f
-private const val NOTIFICATION_GAP_DP = 8f
-private const val BOTTOM_RESERVE_DP = 120f
-private const val MIN_WIDTH_DP = 160f
-private const val MIN_HEIGHT_DP = 72f
-private const val PROGRESS_HEIGHT_DP = 4f
-private const val PROGRESS_GAP_DP = 10f
-private const val PRIMARY_BLOCK_HEIGHT_DP = 80f
-private const val SECONDARY_BLOCK_HEIGHT_DP = 48f
-private const val CARD_HORIZONTAL_PADDING_DP = 16f
-private const val CARD_VERTICAL_PADDING_DP = 16f
-private const val CARD_CORNER_RADIUS_DP = 28f
-private const val LOCKSCREEN_CARD_WIDTH_FRACTION = 0.92f
-private val CARD_BACKGROUND_COLOR = 0xD91A1A1Au.toInt()
-
-/** 卡片背景色 token → RGB(忽略 alpha,alpha 由 cardAlpha 单独控制)。 */
-private fun cardColorRgb(token: String): Int = when (token) {
-    "white" -> 0xFFFFFF
-    "dark_gray" -> 0x333333
-    "accent" -> 0x1ED760.toInt() // Spotify-ish green;动态取色上线前作为占位强调色
-    "blur" -> 0x1A1A1A // 与 black 同色,实际模糊由 surface scrim 提供
-    else -> 0x1A1A1A // "black"
-}
-private const val MIN_VISIBLE_ALPHA = 0.01f
 private const val MAX_NOTIFICATION_TRACE_CHILDREN = 6
+
 private const val VISIBILITY_DIAGNOSTIC_INTERVAL_MS = 2_000L
+
 private const val NOTIFICATION_TRACE_INTERVAL_MS = 1_000L
-/**
- * Notification rows animate while the keyguard settles (fade in/out, expand/collapse), so their
- * union bounds can jitter by a few px every frame. The lyric card's placement is derived from
- * these bounds, so following every frame makes the card "jump" during the animation. Only adopt a
- * new bounds value once it differs from the last applied one by more than this dead-band (dp).
- */
-private const val NOTIFICATION_GEOMETRY_DEAD_BAND_DP = 8f
-private const val REVERSE_ANCHOR_MINIMUM_DELAY_MS = 48L
-private const val REVERSE_ANCHOR_QUIET_PERIOD_MS = 32L
-private const val REVERSE_ANCHOR_FALLBACK_DEADLINE_MS = 240L
-private const val REVERSE_ANCHOR_PROBE_MS = 16L
-private const val LOCKSCREEN_ENTRY_SLIDE_DP = 20f
-/**
- * Lockscreen freshness tolerance while media is actively playing. The shared 5 s lyric-freshness
- * window is tighter than typical producer keepalive spacing, which makes the surface flap between
- * snapshots (visible -> stale -> hidden -> next keepalive -> visible). While playback is active the
- * line text and projected position are still valid well beyond 5 s, so a looser window keeps the
- * card stable without retaining stale content after playback actually stops.
- */
-private const val LOCKSCREEN_PLAYBACK_FRESH_MS = 15_000L
-
-private class AdaptiveLyricCardBackgroundView(context: android.content.Context) : View(context) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = CARD_BACKGROUND_COLOR }
-    private val rect = RectF()
-    private val density = resources.displayMetrics.density
-    private var lyricCanvas: AodLyricCanvasView? = null
-    private var progress: View? = null
-    private var cardEnabled = false
-
-    fun bind(canvas: AodLyricCanvasView, progressView: View) {
-        lyricCanvas = canvas
-        progress = progressView
-        canvas.setContentBoundsChangedListener(::invalidate)
-        invalidate()
-    }
-
-    fun setCardEnabled(enabled: Boolean) {
-        if (cardEnabled == enabled) return
-        cardEnabled = enabled
-        visibility = if (enabled) VISIBLE else GONE
-        invalidate()
-    }
-
-    /**
-     * 应用卡片背景色与不透明度。[alphaPercent] 0-100;[colorToken] 见
-     * [com.eza.hyperglow.customization.CARD_COLOR_VALUES]。在 backgroundStyle=="card"
-     * 时由 [applyCardBackground] 调用。
-     */
-    fun setCardAppearance(alphaPercent: Int, colorToken: String) {
-        val alpha = (alphaPercent.coerceIn(0, 100) * 255 / 100).coerceIn(0, 255)
-        val rgb = cardColorRgb(colorToken)
-        paint.color = (alpha shl 24) or (rgb and 0x00FFFFFF)
-        invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (!cardEnabled) return
-        val lyric = lyricCanvas ?: return
-        val content = lyric.visibleContentVerticalBounds() ?: return
-        val padding = CARD_VERTICAL_PADDING_DP * density
-        val top = (lyric.top + content.top - padding).coerceAtLeast(0f)
-        var bottom = lyric.top + content.bottom + padding
-        progress?.takeIf { it.visibility == VISIBLE && it.height > 0 }?.let {
-            bottom = maxOf(bottom, it.bottom + padding)
-        }
-        bottom = bottom.coerceAtMost(height.toFloat())
-        if (bottom <= top) return
-        rect.set(0f, top, width.toFloat(), bottom)
-        val radius = CARD_CORNER_RADIUS_DP * density
-        canvas.drawRoundRect(rect, radius, radius, paint)
-    }
-}
-
-private val LOCKSCREEN_NOTIFICATION_CONTENT_CLASSES = setOf(
-    "ExpandableNotificationRow",
-    "MiuiMediaHeaderView",
-    "ZenModeView"
-)
-
-private data class LockscreenLayoutResult(
-    val rect: LockscreenSceneRect,
-    val profile: CompiledSurfaceProfile,
-    val progressVisible: Boolean
-)
-
-internal fun shouldShowLockscreen(inputs: LockscreenVisibilityInputs): Boolean =
-    inputs.featureEnabled &&
-        inputs.supported &&
-        inputs.defaultTheme &&
-        inputs.primaryDisplay &&
-        inputs.keyguardShowing &&
-        !inputs.bouncerShowing &&
-        inputs.freshSnapshot &&
-        inputs.usableArea
-
-internal fun shouldRenderLockscreenSnapshot(
-    snapshot: LyricSnapshot?,
-    profileEnabled: Boolean,
-    transitionFailed: Boolean,
-    nowElapsedMs: Long
-): Boolean {
-    val current = snapshot ?: return false
-    val freshMs = if (current.playbackActive) LOCKSCREEN_PLAYBACK_FRESH_MS else LYRIC_SNAPSHOT_FRESH_MS
-    return current.visible &&
-        current.isAuthorizedForPresentation() &&
-        current.lockscreenEnabled &&
-        profileEnabled &&
-        !transitionFailed &&
-        !current.metadata.startsWith("AOD DEMO") &&
-        nowElapsedMs - current.updatedAtElapsedMs <= freshMs
-}
-
-internal fun freezeLockscreenSnapshot(
-    snapshot: LyricSnapshot,
-    nowElapsedMs: Long
-): LyricSnapshot = snapshot.freezeAt(nowElapsedMs, keepAliveWhileFrozen = false).copy(
-    playbackActive = false,
-    pauseRetentionEligible = true
-)
-
-internal fun resolveLockscreenMediaSnapshot(
-    latest: LyricSnapshot?,
-    retained: LyricSnapshot?,
-    mediaPlayerPresent: Boolean,
-    transitionSourceActive: Boolean = false
-): LyricSnapshot? = if (transitionSourceActive) {
-    latest?.takeIf { it.visible } ?: retained
-} else if (!mediaPlayerPresent) {
-    null
-} else {
-    latest?.takeIf { it.visible } ?: retained
-}
-
-internal fun retainedLockscreenSnapshotAfterUpdate(
-    incoming: LyricSnapshot,
-    lastVisible: LyricSnapshot?,
-    retained: LyricSnapshot?,
-    nowElapsedMs: Long,
-    pauseLingerMs: Long = 5_000L
-): LyricSnapshot? = if (incoming.visible) {
-    null
-} else if (incoming.pauseRetentionEligible) {
-    val pauseAtElapsedMs = incoming.updatedAtElapsedMs.coerceIn(0L, nowElapsedMs)
-    val candidate = retained ?: lastVisible?.let {
-        freezeLockscreenSnapshot(it, pauseAtElapsedMs)
-    }
-    candidate?.takeIf {
-        pauseLingerRemainingMs(it.sampledAtElapsedMs, pauseLingerMs, nowElapsedMs) != null
-    }
-} else if (incoming.playbackActive) {
-    retained?.takeIf { it.playbackActive } ?: lastVisible?.freezeAt(
-        nowElapsedMs,
-        keepAliveWhileFrozen = false
-    )?.copy(playbackActive = true, pauseRetentionEligible = false)
-} else {
-    null
-}
-
-internal fun shouldKeepLockscreenAwake(
-    enabled: Boolean,
-    visible: Boolean,
-    bouncerShowing: Boolean,
-    mediaPlayerPresent: Boolean,
-    playbackSpeed: Float
-): Boolean = enabled && visible && !bouncerShowing && mediaPlayerPresent && playbackSpeed > 0f
-
-internal fun isLockscreenNotificationContentClass(className: String): Boolean =
-    className.substringAfterLast('.') in LOCKSCREEN_NOTIFICATION_CONTENT_CLASSES
-
-internal fun shouldIncludeLockscreenNotificationChild(
-    visibility: Int,
-    alpha: Float,
-    linkageActive: Boolean
-): Boolean = visibility != View.GONE &&
-    (linkageActive || visibility == View.VISIBLE && alpha > MIN_VISIBLE_ALPHA)
-
-internal fun lockscreenNotificationCandidateFromLayout(
-    className: String,
-    stackLeft: Int,
-    stackTop: Int,
-    childX: Float,
-    childY: Float,
-    layoutWidth: Int,
-    layoutHeight: Int,
-    actualHeight: Int,
-    clipTopAmount: Int,
-    clipBottomAmount: Int,
-    clipBounds: LockscreenNotificationClipBounds?
-): LockscreenNotificationCandidate? {
-    val effectiveHeight = actualHeight.takeIf { it > 0 } ?: layoutHeight
-    if (layoutWidth <= 0 || effectiveHeight <= 0) return null
-    val visibleLeft = maxOf(0, clipBounds?.left ?: 0).coerceAtMost(layoutWidth)
-    val visibleRight = minOf(layoutWidth, clipBounds?.right ?: layoutWidth)
-        .coerceAtLeast(visibleLeft)
-    val visibleTop = maxOf(clipTopAmount.coerceAtLeast(0), clipBounds?.top ?: 0)
-        .coerceAtMost(effectiveHeight)
-    val visibleBottom = minOf(
-        effectiveHeight - clipBottomAmount.coerceAtLeast(0),
-        clipBounds?.bottom ?: effectiveHeight
-    ).coerceIn(visibleTop, effectiveHeight)
-    if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) return null
-    val childLeft = stackLeft + childX.roundToInt()
-    val childTop = stackTop + childY.roundToInt()
-    return LockscreenNotificationCandidate(
-        className = className,
-        top = childTop + visibleTop,
-        bottom = childTop + visibleBottom,
-        left = childLeft + visibleLeft,
-        right = childLeft + visibleRight
-    )
-}
-
-internal fun topmostLockscreenNotificationTop(
-    candidates: List<LockscreenNotificationCandidate>,
-    hostHeight: Int
-): Int? = lockscreenNotificationBounds(candidates, hostHeight)?.top
-
-internal fun lockscreenNotificationBounds(
-    candidates: List<LockscreenNotificationCandidate>,
-    hostHeight: Int
-): LockscreenNotificationBounds? {
-    val visible = candidates.asSequence()
-        .filter { isLockscreenNotificationContentClass(it.className) }
-        .mapNotNull {
-            val top = it.top.coerceIn(0, hostHeight)
-            val bottom = it.bottom.coerceIn(0, hostHeight)
-            if (bottom > top) {
-                LockscreenNotificationBounds(top, bottom, it.left, it.right)
-            } else {
-                null
-            }
-        }
-        .toList()
-    if (visible.isEmpty()) return null
-    return LockscreenNotificationBounds(
-        visible.minOf { it.top },
-        visible.maxOf { it.bottom },
-        visible.map { it.left }.filter { it > 0 }.minOrNull() ?: 0,
-        visible.map { it.right }.filter { it > 0 }.maxOrNull() ?: 0
-    )
-}
-
-internal fun resolveLockscreenNotificationGeometry(
-    hasNotification: Boolean,
-    current: LockscreenNotificationBounds?,
-    lastValid: LockscreenNotificationBounds?,
-    hostHeight: Int
-): LockscreenNotificationGeometry {
-    if (!hasNotification) return LockscreenNotificationGeometry(null, null)
-    val retained = current ?: lastValid
-    return LockscreenNotificationGeometry(
-        effectiveBounds = retained ?: LockscreenNotificationBounds(0, hostHeight),
-        cachedBounds = retained
-    )
-}
-
-/**
- * Dead-band stabilizer for the notification union bounds. Notification rows animate while the
- * keyguard settles, so their bounds can jitter by a few px every frame; the lyric card's placement
- * is derived from them, so following every frame makes the card "jump". Only adopt a new value once
- * it differs from the last applied one by at least [deadBandPx] in either top or bottom; otherwise
- * keep the last applied (stable) value. A null [current] clears the bounds as before.
- */
-internal fun stabilizeNotificationBounds(
-    current: LockscreenNotificationBounds?,
-    lastApplied: LockscreenNotificationBounds?,
-    deadBandPx: Int
-): LockscreenNotificationBounds? {
-    if (current == null) return null
-    val last = lastApplied ?: return current
-    val topDrift = abs(current.top - last.top)
-    val bottomDrift = abs(current.bottom - last.bottom)
-    return if (topDrift < deadBandPx && bottomDrift < deadBandPx) last else current
-}
-
-internal fun largestLockscreenFreeRegion(
-    rootWidth: Int,
-    rootHeight: Int,
-    clockBottom: Int,
-    margin: Int,
-    bottomReserve: Int,
-    notificationBounds: LockscreenNotificationBounds?
-): PlacementRect {
-    val safeTop = (clockBottom + margin).coerceIn(0, rootHeight)
-    val safeBottom = (rootHeight - bottomReserve).coerceIn(safeTop, rootHeight)
-    if (notificationBounds == null) {
-        return PlacementRect(0f, safeTop.toFloat(), rootWidth.toFloat(), safeBottom.toFloat())
-    }
-    val above = PlacementRect(
-        0f,
-        safeTop.toFloat(),
-        rootWidth.toFloat(),
-        (notificationBounds.top - margin).coerceIn(safeTop, safeBottom).toFloat()
-    )
-    val below = PlacementRect(
-        0f,
-        (notificationBounds.bottom + margin).coerceIn(safeTop, safeBottom).toFloat(),
-        rootWidth.toFloat(),
-        safeBottom.toFloat()
-    )
-    return if (below.height > above.height) below else above
-}
-
-internal fun lockscreenCardRegionAfterNotifications(
-    rootWidth: Int,
-    rootHeight: Int,
-    clockBottom: Int,
-    topMargin: Int,
-    notificationGap: Int,
-    bottomReserve: Int,
-    notificationBounds: LockscreenNotificationBounds?
-): PlacementRect {
-    val safeTop = (clockBottom + topMargin).coerceIn(0, rootHeight)
-    val safeBottom = (rootHeight - bottomReserve).coerceIn(safeTop, rootHeight)
-    val contentTop = notificationBounds?.bottom?.plus(notificationGap)
-        ?.coerceIn(safeTop, safeBottom)
-        ?: safeTop
-    return PlacementRect(
-        0f,
-        contentTop.toFloat(),
-        rootWidth.toFloat(),
-        safeBottom.toFloat()
-    )
-}
-
-internal fun estimatedLockscreenSceneHeight(
-    profile: CompiledSurfaceProfile,
-    density: Float,
-    fontScale: Float = 1f
-): Float {
-    val textScale = textSizeModeMultiplier(profile.textSize, profile.textSizeCustom) *
-        fontScale.coerceIn(0.8f, 1.5f)
-    val secondaryRows = when (profile.secondaryMode) {
-        "Both" -> 2
-        "Transliteration", "Translation" -> 1
-        else -> 0
-    }
-    val metadataHeight = if (profile.metadataVisible &&
-        profile.widgets.any { it.type == "metadata" }
-    ) metadataWidgetHeightDp(profile.metadataSizePercent) else 0f
-    val progressHeight = if (profile.widgets.any { it.type == "media_progress" }) {
-        PROGRESS_HEIGHT_DP + PROGRESS_GAP_DP
-    } else {
-        0f
-    }
-    val cardPadding = if (profile.backgroundStyle == "card") 24f else 0f
-    val primaryBlockHeight = if (profile.lyricLineLimit == 0) {
-        Float.POSITIVE_INFINITY
-    } else {
-        PRIMARY_BLOCK_HEIGHT_DP * profile.lyricLineLimit.coerceIn(1, 5) / 3f
-    }
-    return (primaryBlockHeight * textScale +
-        SECONDARY_BLOCK_HEIGHT_DP * secondaryRows * textScale.coerceAtMost(1.25f) +
-        metadataHeight + progressHeight + cardPadding) * density
-}
-
-internal fun maximumLockscreenClockBottom(hostHeight: Int, candidates: List<Int>): Int =
-    candidates.maxOrNull()?.coerceIn(0, hostHeight) ?: 0
-
-internal fun preferredLockscreenClockBottom(
-    hostHeight: Int,
-    preferred: Int,
-    fallbacks: List<Int>
-): Int = preferred.takeIf { it > 0 }?.coerceIn(0, hostHeight)
-    ?: maximumLockscreenClockBottom(hostHeight, fallbacks)
-
-internal fun frameLayoutGeometryChanged(
-    currentWidth: Int,
-    currentHeight: Int,
-    currentLeft: Int,
-    currentTop: Int,
-    width: Int,
-    height: Int,
-    left: Int,
-    top: Int
-): Boolean = currentWidth != width || currentHeight != height ||
-    currentLeft != left || currentTop != top
-
-internal class LockscreenAnchorStabilityGate(
-    private val minimumDelayMs: Long,
-    private val quietPeriodMs: Long,
-    private val fallbackDeadlineMs: Long
-) {
-    private var startedAt = Long.MIN_VALUE
-    private var changedAt = Long.MIN_VALUE
-    private var candidate: LockscreenSceneRect? = null
-    private var expected: LockscreenSceneRect? = null
-
-    fun start(nowElapsedMs: Long, expectedRect: LockscreenSceneRect?) {
-        startedAt = nowElapsedMs
-        changedAt = nowElapsedMs
-        candidate = null
-        expected = expectedRect
-    }
-
-    fun observe(rect: LockscreenSceneRect, nowElapsedMs: Long): Boolean {
-        val elapsed = nowElapsedMs - startedAt
-        if (elapsed < minimumDelayMs) return false
-        expected?.let {
-            if (rect == it) return true
-            if (elapsed < fallbackDeadlineMs) return false
-        }
-        if (candidate != rect) {
-            candidate = rect
-            changedAt = nowElapsedMs
-        }
-        return nowElapsedMs - changedAt >= quietPeriodMs || elapsed >= fallbackDeadlineMs
-    }
-
-    fun clear() {
-        startedAt = Long.MIN_VALUE
-        changedAt = Long.MIN_VALUE
-        candidate = null
-        expected = null
-    }
-}
-
-internal class LockscreenSettledRectTracker(
-    private val quietPeriodMs: Long
-) {
-    private var candidate: LockscreenSceneRect? = null
-    private var changedAt = Long.MIN_VALUE
-    private var settled: LockscreenSceneRect? = null
-
-    fun observe(rect: LockscreenSceneRect, nowElapsedMs: Long) {
-        if (candidate != rect) {
-            candidate = rect
-            changedAt = nowElapsedMs
-            return
-        }
-        promote(nowElapsedMs)
-    }
-
-    fun settledRect(nowElapsedMs: Long): LockscreenSceneRect? {
-        promote(nowElapsedMs)
-        return settled
-    }
-
-    fun clear() {
-        candidate = null
-        changedAt = Long.MIN_VALUE
-        settled = null
-    }
-
-    private fun promote(nowElapsedMs: Long) {
-        val current = candidate ?: return
-        if (nowElapsedMs - changedAt >= quietPeriodMs) settled = current
-    }
-}
-
-internal fun calculateLockscreenSceneRect(
-    rootWidth: Int,
-    rootHeight: Int,
-    clockBottom: Int,
-    topMargin: Int,
-    bottomReserve: Int,
-    desiredWidth: Int,
-    notificationTop: Int? = null,
-    anchor: String = "below_stock_clock",
-    verticalBias: Float = 0.5f,
-    maximumHeight: Int? = null
-): LockscreenSceneRect {
-    val width = desiredWidth.coerceIn(0, rootWidth.coerceAtLeast(0))
-    val left = ((rootWidth - width) / 2).coerceAtLeast(0)
-    val safeTop = (clockBottom + topMargin).coerceIn(0, rootHeight.coerceAtLeast(0))
-    val normalBottom = (rootHeight - bottomReserve).coerceAtLeast(0)
-    val collisionBottom = notificationTop?.minus(topMargin) ?: normalBottom
-    val safeBottom = minOf(normalBottom, collisionBottom).coerceAtLeast(safeTop)
-    val availableHeight = safeBottom - safeTop
-    val height = (maximumHeight ?: availableHeight).coerceIn(0, availableHeight)
-    val top = when (anchor) {
-        "screen_center" -> safeTop + (availableHeight - height) / 2
-        "screen_bottom_safe" -> safeBottom - height
-        "custom_vertical_bias" -> safeTop +
-            ((availableHeight - height) * verticalBias.coerceIn(0f, 1f)).roundToInt()
-        else -> safeTop
-    }
-    val bottom = top + height
-    return LockscreenSceneRect(left, top, left + width, bottom)
-}
-
-internal fun shouldReuseLockscreenHost(
-    currentHost: Any?,
-    candidateHost: Any?,
-    surfaceAttached: Boolean
-): Boolean = currentHost === candidateHost && surfaceAttached
-
-internal class LatestFrameRequestGate {
-    private var pending = false
-
-    fun request(): Boolean {
-        if (pending) return false
-        pending = true
-        return true
-    }
-
-    fun consume(): Boolean {
-        if (!pending) return false
-        pending = false
-        return true
-    }
-
-    fun cancel() {
-        pending = false
-    }
-}
-
-internal class LockscreenMotionChangeTracker {
-    private var fingerprint: Long? = null
-
-    fun update(next: Long): Boolean {
-        val previous = fingerprint
-        fingerprint = next
-        return previous != null && previous != next
-    }
-
-    fun clear() {
-        fingerprint = null
-    }
-}
-
-private data class NotificationMotionMethods(
-    val contentClassName: String?,
-    val actualHeight: Method?,
-    val clipTopAmount: Method?,
-    val clipBottomAmount: Method?
-)
 
 internal const val LOCKSCREEN_INSERTION_INDEX = 0
 
@@ -674,6 +74,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
     private var latestSnapshot: LyricSnapshot? = null
     private var lastVisibleSnapshot: LyricSnapshot? = null
     private var retainedMediaSnapshot: LyricSnapshot? = null
+    private var retentionAnchor: LyricRetentionAnchor? = null
     private val pauseLingerExpiry = object : Runnable {
         override fun run() {
             val retained = retainedMediaSnapshot ?: return
@@ -687,6 +88,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 return
             }
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             requestRefresh()
         }
@@ -837,6 +239,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 stockMediaPlayerObserved = false
                 lastVisibleSnapshot = null
                 retainedMediaSnapshot = null
+                retentionAnchor = null
                 cancelPauseLingerExpiry()
             }
             AodSurfaceController.onStockMediaPlayerPresenceChanged(present)
@@ -850,6 +253,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         if (resolvedSnapshot.visible) {
             lastVisibleSnapshot = resolvedSnapshot
             retainedMediaSnapshot = null
+            retentionAnchor = null
             scheduleFreshnessExpiry(resolvedSnapshot)
         } else {
             cancelFreshnessExpiry()
@@ -857,12 +261,18 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 lastVisibleSnapshot = SystemUiLyricProjectionRuntime.projection
                     .cachedVisibleSnapshot()
             }
+            val nowElapsedMs = SystemClock.elapsedRealtime()
+            retentionAnchor = nextLyricRetentionAnchor(
+                resolvedSnapshot, retentionAnchor, nowElapsedMs
+            )
             retainedMediaSnapshot = retainedLockscreenSnapshotAfterUpdate(
                 resolvedSnapshot,
                 lastVisibleSnapshot,
                 retainedMediaSnapshot,
-                SystemClock.elapsedRealtime(),
-                customization?.pauseLingerMs ?: 5_000L
+                retentionAnchor,
+                nowElapsedMs,
+                customization?.pauseLingerMs ?: 5_000L,
+                pauseRetentionEnabled = customization?.pauseShowContent ?: false
             )
             if (retainedMediaSnapshot == null && !resolvedSnapshot.playbackActive) {
                 lastVisibleSnapshot = null
@@ -886,6 +296,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         cancelPauseLingerExpiry()
         customization = null
         runtimeProfile = null
@@ -898,6 +309,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         cancelPauseLingerExpiry()
         cancelFreshnessExpiry()
         hideSurface()
@@ -905,6 +317,33 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
 
     override fun onCustomization(configuration: CompiledCustomization) {
         customization = configuration
+        val receivedLock = configuration.profiles[SceneCompiler.SURFACE_LOCKSCREEN]
+        // 诊断留痕:与 AodSurfaceController 同款,确认锁屏控制器收到配置及收到的档位。
+        HookLogger.w(
+            TAG,
+            "Customization received: lockAnim=${receivedLock?.animation} " +
+                "lockGlow=${receivedLock?.glow} rtNull=${runtimeProfile == null}"
+        )
+        // 「暂停时显示歌曲信息、歌词」关闭(或驻留时长已过)时,丢弃暂停驻留快照并立即隐藏,
+        // 与 AOD 侧同一语义:开关切换立即生效,不等下一条暂停边。
+        val retained = retainedMediaSnapshot?.takeIf { snapshot ->
+            !snapshot.pauseRetentionEligible || configuration.pauseShowContent &&
+                pauseLingerRemainingMs(
+                    snapshot.sampledAtElapsedMs,
+                    configuration.pauseLingerMs,
+                    SystemClock.elapsedRealtime()
+                ) != null
+        }
+        if (retainedMediaSnapshot != null && retained == null) {
+            retainedMediaSnapshot = null
+            retentionAnchor = null
+            lastVisibleSnapshot = null
+            latestSnapshot = null
+            cancelPauseLingerExpiry()
+            cancelFreshnessExpiry()
+            hideSurface()
+            return
+        }
         runtimeProfile = null
         lastRenderedProfile = null
         lastRenderContent = null
@@ -940,6 +379,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             SystemClock.elapsedRealtime()
         ) ?: run {
             retainedMediaSnapshot = null
+            retentionAnchor = null
             lastVisibleSnapshot = null
             requestRefresh()
             return
@@ -969,13 +409,13 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 sceneRole == LinkageSceneRole.TRANSITION_SOURCE
         )
         val wasVisible = directSurface.visibility == View.VISIBLE && canvas.visibility == View.VISIBLE
-        val layoutResult = layoutCanvas(controller, host, canvas)
-        val rect = layoutResult?.rect
-        val supported = XiaomiCapabilityResolver.hasCapability(XiaomiCapability.LOCKSCREEN_HOST) &&
-            XiaomiCapabilityResolver.hasCapability(XiaomiCapability.LOCKSCREEN_GEOMETRY)
         val eligibleSnapshot = snapshot?.takeIf {
             canRenderLockscreen(it, allowExpired = it === retainedMediaSnapshot)
         }
+        val layoutResult = layoutCanvas(controller, host, canvas, eligibleSnapshot)
+        val rect = layoutResult?.rect
+        val supported = XiaomiCapabilityResolver.hasCapability(XiaomiCapability.LOCKSCREEN_HOST) &&
+            XiaomiCapabilityResolver.hasCapability(XiaomiCapability.LOCKSCREEN_GEOMETRY)
         val visibilityInputs = LockscreenVisibilityInputs(
             featureEnabled = true,
             supported = supported,
@@ -1045,11 +485,16 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             progressView?.stop()
         } else {
             val renderContent = eligibleSnapshot.renderContent()
-            val renderProfile = layoutResult!!.profile
+            val renderProfile = checkNotNull(layoutResult) {
+                "visible lockscreen implies a layout result"
+            }.profile
             if (!wasVisible || renderContent != lastRenderContent ||
                 renderProfile != lastRenderedProfile
             ) {
-                canvas.setContent(eligibleSnapshot.toAodCanvasContent(renderProfile))
+                logRenderProfileProbe(eligibleSnapshot, renderProfile)
+                canvas.setContent(
+                    eligibleSnapshot.toAodCanvasContent(renderProfile, duet = true)
+                )
                 lastRenderContent = renderContent
                 lastRenderedProfile = renderProfile
             }
@@ -1071,7 +516,8 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
     private fun layoutCanvas(
         controller: Any,
         host: FrameLayout,
-        canvas: AodLyricCanvasView
+        canvas: AodLyricCanvasView,
+        pendingSnapshot: LyricSnapshot?
     ): LockscreenLayoutResult? {
         if (host.width <= 0 || host.height <= 0) {
             layoutDiagnostic = "host=${host.width}x${host.height}"
@@ -1108,18 +554,78 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 notificationBounds
             )
         }
-        val metadataHeight = if (profile.metadataVisible &&
-            profile.widgets.any { it.type == "metadata" }
-        ) metadataWidgetHeightDp(profile.metadataSizePercent) * density else 0f
+        val cardStyle = profile.backgroundStyle == "card"
+        val horizontalInset = if (cardStyle) (CARD_HORIZONTAL_PADDING_DP * density).roundToInt() else 0
+        val verticalInset = if (cardStyle) (CARD_VERTICAL_PADDING_DP * density).roundToInt() else 0
+        val placementWidthFraction = if (cardStyle) {
+            maxOf(profile.widthFraction, LOCKSCREEN_CARD_WIDTH_FRACTION)
+        } else {
+            profile.widthFraction
+        }
         val progressHeightWithGap = if (profile.widgets.any { it.type == "media_progress" }) {
             (PROGRESS_HEIGHT_DP + PROGRESS_GAP_DP) * density
         } else {
             0f
         }
         val fontScale = host.resources.displayMetrics.scaledDensity / density.coerceAtLeast(0.1f)
-        val desiredHeight = minOf(
-            host.height * profile.maxHeightFraction,
-            estimatedLockscreenSceneHeight(profile, density, fontScale)
+        // 自适应卡片高度:宽度与高度无关,先按放置宽(卡片样式取通知宽)定内容宽,再实测内容
+        // 自然堆叠高;「高度」设置仍是上限,设置估算只兜底无内容/未测量时。
+        val placementWidth = freeRegion.width * placementWidthFraction
+        val placedLeft = freeRegion.left + (freeRegion.width - placementWidth) / 2f
+        val notificationLeft = notificationBounds?.left ?: 0
+        val notificationRight = notificationBounds?.right ?: 0
+        val matchesNotificationWidth = cardStyle &&
+            notificationRight - notificationLeft >= minWidth(host)
+        val sceneWidth = if (matchesNotificationWidth) {
+            notificationRight - notificationLeft
+        } else {
+            (placedLeft + placementWidth).roundToInt() - placedLeft.roundToInt()
+        }
+        val measureContentWidth = (sceneWidth - horizontalInset * 2).coerceAtLeast(1)
+        val metadataBudgeted = profile.metadataVisible &&
+            profile.widgets.any { it.type == "metadata" }
+        val measured = pendingSnapshot?.toAodCanvasContent(profile, duet = true)
+            ?.copy(metadataVisible = metadataBudgeted)
+            ?.let { canvas.measureContentStack(it, measureContentWidth) }
+        // 歌曲信息内容(per-surface):高度预算按本面 profile 的 parts/separators 推导,
+        // 与画布按面组装的口径一致(改一面不再影响另一面的布局预算)。
+        val metadataExtraLines = metadataExpectedExtraLines(
+            profile.metadataParts,
+            profile.metadataSeparators
+        )
+        // 歌曲图片槽边长(dp):关闭自适应时取固定自定义边长,静态高度估算需按图片入账,
+        // 否则大尺寸图片会被元数据组件裁切(实测路径走 measureContentStack 的行实测高)。
+        val artworkHeightDp = if (profile.artworkVisible) {
+            artworkSideDp(
+                profile.metadataSizePercent,
+                fontScale,
+                profile.artworkAdaptiveScale,
+                profile.artworkSizeDp
+            )
+        } else {
+            0f
+        }
+        val metadataHeight = when {
+            !metadataBudgeted -> 0f
+            measured != null -> measured.metadataRowHeightPx
+            else -> metadataWidgetHeightDp(
+                profile.metadataSizePercent,
+                metadataExtraLines,
+                artworkHeightDp
+            ) * density
+        }
+        val desiredHeight = adaptiveLockscreenSceneHeight(
+            measuredContentStackPx = measured?.stackHeightPx ?: 0f,
+            estimatedSceneHeightPx = estimatedLockscreenSceneHeight(
+                profile,
+                density,
+                fontScale,
+                metadataExtraLines,
+                artworkHeightDp
+            ),
+            progressHeightWithGapPx = progressHeightWithGap,
+            cardVerticalPaddingPx = verticalInset * 2f,
+            maximumPx = host.height * profile.maxHeightFraction
         )
         val measurements = profile.widgets.mapNotNull { widget ->
             when (widget.type) {
@@ -1132,11 +638,6 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 "media_progress" -> WidgetMeasurement(widget, progressHeightWithGap)
                 else -> null
             }
-        }
-        val placementWidthFraction = if (profile.backgroundStyle == "card") {
-            maxOf(profile.widthFraction, LOCKSCREEN_CARD_WIDTH_FRACTION)
-        } else {
-            profile.widthFraction
         }
         val placementProfile = if (avoidsNotifications) {
             profile.copy(
@@ -1170,10 +671,6 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         )
         runtimeProfile = renderProfile
         progressView?.setPalette(renderProfile.palette)
-        val notificationLeft = notificationBounds?.left ?: 0
-        val notificationRight = notificationBounds?.right ?: 0
-        val matchesNotificationWidth = renderProfile.backgroundStyle == "card" &&
-            notificationRight - notificationLeft >= minWidth(host)
         val rect = LockscreenSceneRect(
             if (matchesNotificationWidth) notificationLeft else placed.left.roundToInt(),
             placed.top.roundToInt(),
@@ -1190,9 +687,6 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         val progressEnabled = "media_progress" in visibleTypes
         val progressHeight = if (progressEnabled) (PROGRESS_HEIGHT_DP * density).roundToInt() else 0
         val progressGap = if (progressEnabled) (PROGRESS_GAP_DP * density).roundToInt() else 0
-        val cardEnabled = renderProfile.backgroundStyle == "card"
-        val horizontalInset = if (cardEnabled) (CARD_HORIZONTAL_PADDING_DP * density).roundToInt() else 0
-        val verticalInset = if (cardEnabled) (CARD_VERTICAL_PADDING_DP * density).roundToInt() else 0
         val contentWidth = (rect.width - horizontalInset * 2).coerceAtLeast(0)
         val lyricHeight = (rect.height - progressHeight - progressGap - verticalInset * 2)
             .coerceAtLeast(0)
@@ -1520,7 +1014,11 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                         )
                     )
                 }
-                lyricCanvas = AodLyricCanvasView(context, useDozeHandlerCadence = true).also { canvas ->
+                lyricCanvas = AodLyricCanvasView(
+                    context,
+                    useDozeHandlerCadence = true,
+                    refreshRateCapProvider = { customization?.aodRefreshRateCap ?: 0 }
+                ).also { canvas ->
                     canvas.visibility = View.GONE
                     canvas.isClickable = false
                     canvas.isLongClickable = false
@@ -1538,7 +1036,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                     progress.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                     card.addView(progress, FrameLayout.LayoutParams(0, 0))
                 }
-                cardBackgroundView?.bind(lyricCanvas!!, progressView!!)
+                cardBackgroundView?.bind(checkNotNull(lyricCanvas), checkNotNull(progressView))
                 addView(card, FrameLayout.LayoutParams(0, 0))
             }
         }
@@ -1688,6 +1186,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         latestSnapshot = null
         lastVisibleSnapshot = null
         retainedMediaSnapshot = null
+        retentionAnchor = null
         stockMediaPlayerObserved = false
         cancelPauseLingerExpiry()
         customization = null
@@ -1802,6 +1301,21 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
 
     private fun currentLockscreenProfile(): CompiledSurfaceProfile =
         lockscreenProfile() ?: DEFAULT_LOCKSCREEN_PROFILE
+
+    private var lastRenderProbeKey = ""
+
+    /**
+     * 诊断探针(配置下发排查):与 AodSurfaceController 同款,记录锁屏渲染时实际
+     * 读到的 profile 档位与快照档位,只在值变化时留痕。
+     */
+    private fun logRenderProfileProbe(snapshot: LyricSnapshot, profile: CompiledSurfaceProfile) {
+        val key = "custNull=${customization == null} rtNull=${runtimeProfile == null} " +
+            "profileAnim=${profile.animation} profileGlow=${profile.glow} " +
+            "snapAnim=${snapshot.animationMode} snapGlow=${snapshot.glowMode}"
+        if (key == lastRenderProbeKey) return
+        lastRenderProbeKey = key
+        HookLogger.w(TAG, "Render profile probe: $key")
+    }
 
     private fun isSceneActive(): Boolean = sceneRole != LinkageSceneRole.INACTIVE
 

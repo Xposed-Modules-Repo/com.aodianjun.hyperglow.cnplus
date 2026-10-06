@@ -5,19 +5,22 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 获取应用列表:用于枚举已安装的音乐应用(网易云/QQ音乐等),以按需补全歌词源/检测可用播放器 -->
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <queries>
         <package android:name="com.spotify.music" />
         <package android:name="com.android.systemui" />
         <package android:name="com.miui.aod" />
+        <package android:name="org.lsposed.manager" />
     </queries>
 
+    <!-- enableOnBackInvokedCallback:预测性返回手势(API 33+)的显式开关。App 内导航
+         走 miuix-nav 的 NavDisplay,它经 androidx.navigationevent 接收逐帧返回进度。 -->
     <application
         android:name=".HyperGlowApplication"
         android:allowBackup="false"
-        android:icon="@drawable/ic_launcher"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
@@ -78,6 +81,11 @@
             android:grantUriPermissions="true">
             <grant-uri-permission android:pathPrefix="/" />
         </provider>
+
+        <provider
+            android:name=".bridge.CustomFontProvider"
+            android:authorities="${applicationId}.customfont"
+            android:exported="true" />
 
         <service
             android:name=".producer.LyricInfoNotificationListener"

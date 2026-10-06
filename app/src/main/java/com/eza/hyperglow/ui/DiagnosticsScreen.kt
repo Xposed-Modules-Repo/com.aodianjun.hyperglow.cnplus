@@ -8,9 +8,7 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -34,11 +32,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -63,12 +63,12 @@ import com.eza.hyperglow.diagnostics.utf8Size
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
-import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.basic.TopAppBar
+import top.yukonga.miuix.kmp.basic.TextField
+import top.yukonga.miuix.kmp.basic.TextFieldDefaults
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.RadioButtonPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
@@ -146,8 +146,6 @@ internal fun DiagnosticsScreen(onBack: () -> Unit) {
         ).show()
     }
 
-    BackHandler(onBack = onBack)
-
     LaunchedEffect(activeCapture?.startedAtElapsedMillis) {
         while (activeCapture != null) {
             delay(1_000L)
@@ -167,12 +165,11 @@ internal fun DiagnosticsScreen(onBack: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = appSurfaceColor(),
         topBar = {
-            TopAppBar(
+            AppTopBar(
                 title = stringResource(R.string.action_report_problem),
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Text("←") }
-                }
+                onBack = onBack
             )
         }
     ) { innerPadding ->
@@ -572,30 +569,37 @@ internal fun DiagnosticsScreen(onBack: () -> Unit) {
             show = true,
             onDismissRequest = { showPreviewDialog = false }
         ) {
-            LazyColumn(modifier = Modifier.heightIn(max = 520.dp)) {
+            LazyColumn(modifier = Modifier.heightIn(max = dialogContentMaxHeight())) {
                 if (readablePreview == null) {
                     item { DiagnosticPreviewText(previewJson) }
                 } else {
                     item { DiagnosticPreviewText(readablePreview.reportJson) }
-                    item { DiagnosticPreviewHeading("rawDiagnostics") }
+                    item {
+                        DiagnosticPreviewHeading(
+                            stringResource(R.string.diagnostic_preview_section_raw)
+                        )
+                    }
                     item {
                         DiagnosticPreviewBlock(
-                            "diagnosticEventsAndLogs",
+                            stringResource(R.string.diagnostic_preview_events),
                             readablePreview.diagnosticEventsAndLogs
                         )
                     }
                     item {
-                        DiagnosticPreviewBlock("crashExcerpt", readablePreview.crashExcerpt)
+                        DiagnosticPreviewBlock(
+                            stringResource(R.string.diagnostic_preview_crash),
+                            readablePreview.crashExcerpt
+                        )
                     }
                     item {
                         DiagnosticPreviewBlock(
-                            "lsposedModuleLines",
+                            stringResource(R.string.diagnostic_preview_lsposed),
                             readablePreview.lsposedModuleLines
                         )
                     }
                     item {
                         DiagnosticPreviewBlock(
-                            "runtimeSettings",
+                            stringResource(R.string.diagnostic_preview_settings),
                             readablePreview.runtimeSettingsJson
                         )
                     }
@@ -616,10 +620,11 @@ private fun DiagnosticPreviewHeading(text: String) {
 
 @Composable
 private fun DiagnosticPreviewBlock(label: String, value: String) {
+    val emptyLabel = stringResource(R.string.diagnostic_preview_empty)
     Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
         Text(text = label, fontSize = 11.sp)
         Text(
-            text = value.ifEmpty { "(empty)" },
+            text = value.ifEmpty { emptyLabel },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 4.dp)
@@ -662,12 +667,19 @@ private fun DiagnosticDescriptionField(
             .padding(start = 14.dp, top = 12.dp, end = 14.dp, bottom = 34.dp)
             .alpha(if (enabled) 1f else 0.56f)
     ) {
-        BasicTextField(
+        TextField(
             value = value,
             onValueChange = onValueChange,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopStart),
+            insideMargin = DpSize(0.dp, 0.dp),
+            colors = TextFieldDefaults.textFieldColors(
+                backgroundColor = Color.Transparent,
+                labelColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
+            ),
+            label = stringResource(R.string.diagnostic_description),
+            useLabelAsPlaceholder = true,
             enabled = enabled,
             textStyle = TextStyle(
                 color = MiuixTheme.colorScheme.onSurfaceContainerHighest,
@@ -676,19 +688,7 @@ private fun DiagnosticDescriptionField(
             cursorBrush = SolidColor(MiuixTheme.colorScheme.primary),
             singleLine = false,
             minLines = 4,
-            maxLines = 10,
-            decorationBox = { input ->
-                Box {
-                    if (value.isEmpty()) {
-                        Text(
-                            text = stringResource(R.string.diagnostic_description),
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            fontSize = 16.sp
-                        )
-                    }
-                    input()
-                }
-            }
+            maxLines = 10
         )
         Text(
             text = stringResource(
