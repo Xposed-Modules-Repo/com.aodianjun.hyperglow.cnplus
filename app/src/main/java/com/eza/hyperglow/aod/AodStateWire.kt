@@ -92,6 +92,11 @@ internal data class AodStateWireDuetLine(
     val alignedRight: Boolean = false,
     /** 标记识别版分侧(v6 起);渲染面按本面「识别对唱标记」开关选用。 */
     val alignedRightMarkers: Boolean = false,
+    /**
+     * 和声标记(v9 起):插件行 role=BG 的 x-bg 回声,渲染面走辅助行车道(小字号辅助行),
+     * 与对唱(不同演唱者,主行同款并排)区分。纯布尔,不携带文本,不进聚合文本预算。
+     */
+    val harmony: Boolean = false,
     val lineStartMs: Long,
     val lineEndMs: Long,
     val words: List<AodStateWireWord> = emptyList()
@@ -143,6 +148,12 @@ internal data class AodStateWireSnapshot(
     val sampledAtElapsedMs: Long,
     val speed: Float,
     val words: List<AodStateWireWord>,
+    /**
+     * 插件提供的逐字翻译词表(v8 起,见 `PluginLyricField.TRANSLATION_WORDS`):翻译辅助行
+     * 按真实词窗点亮;空表 = 无词级数据,渲染侧回落行窗口合成。片段不指向原文,
+     * source 范围恒 -1(与并发行词表同口径)。
+     */
+    val translationWords: List<AodStateWireWord> = emptyList(),
     val ruby: List<AodStateWireRuby>,
     val layoutGroups: List<AodStateWireLayoutGroup>,
     val weight: String,
@@ -168,7 +179,15 @@ internal data class AodStateWireSnapshot(
     /** 封面稳定键(包名+曲目身份),渲染侧按帧缓存解码位图;空串=无封面。 */
     val artworkKey: String = "",
     /** 对唱并发行(仅息屏消费);null = 无并发行或「显示并发歌词(对唱)」已关。 */
-    val duetLine: AodStateWireDuetLine? = null
+    val duetLine: AodStateWireDuetLine? = null,
+    /**
+     * 长间奏窗口(v10,参考 HyperLyric「歌词长间奏显示倒计时圆点」):上一行 end .. 下一行
+     * start 之间的原始空隙(投影层判定 ≥4s 才携带);0/0 = 无。渲染面按本面「长间奏倒计时
+     * 圆点」开关与「显示下一行」延迟映射解析成圆点窗口(见 root.aod.InterludeDots),
+     * 不透明传递策略原语。
+     */
+    val interludeStartMs: Long = 0L,
+    val interludeEndMs: Long = 0L
 )
 
 internal sealed interface AodStateWireMessage {
@@ -433,6 +452,17 @@ internal object AodStateWireCodec {
                     output.writeInt(word.sourceStart)
                     output.writeInt(word.sourceEnd)
                 }
+                // v8:插件逐字翻译词表(条数 + 载荷);与主行词表同一上限与聚合文本预算。
+                output.writeInt(snapshot.translationWords.size)
+                snapshot.translationWords.forEach { word ->
+                    output.writeBoundedString(word.text)
+                    output.writeBoundedString(word.romanized)
+                    output.writeLong(word.startMs)
+                    output.writeLong(word.endMs)
+                    output.writeStrictBoolean(word.boundaryAfter)
+                    output.writeInt(word.sourceStart)
+                    output.writeInt(word.sourceEnd)
+                }
                 snapshot.ruby.forEach { ruby ->
                     output.writeInt(ruby.start)
                     output.writeInt(ruby.end)
@@ -449,6 +479,7 @@ internal object AodStateWireCodec {
                 output.write(snapshot.artworkJpeg.bytes)
                 output.writeBoundedString(snapshot.artworkKey)
                 // v4:对唱并发行(存在位 + 载荷);文本走聚合文本预算(isValidSnapshot 校验)。
+                // v9:分侧两版之后追加和声标记(纯布尔,无文本/条数,预算与校验口径不变)。
                 val duet = snapshot.duetLine
                 output.writeStrictBoolean(duet != null)
                 duet?.let { line ->
@@ -458,6 +489,7 @@ internal object AodStateWireCodec {
                     output.writeBoundedString(line.translated)
                     output.writeStrictBoolean(line.alignedRight)
                     output.writeStrictBoolean(line.alignedRightMarkers)
+                    output.writeStrictBoolean(line.harmony)
                     output.writeLong(line.lineStartMs)
                     output.writeLong(line.lineEndMs)
                     line.words.forEach { word ->
@@ -470,6 +502,9 @@ internal object AodStateWireCodec {
                         output.writeInt(word.sourceEnd)
                     }
                 }
+                // v10:长间奏窗口(原始空隙两端;0/0 = 无)。
+                output.writeLong(snapshot.interludeStartMs)
+                output.writeLong(snapshot.interludeEndMs)
             }
             bytes.toByteArray().takeIf {
                 it.isNotEmpty() && it.size <= AodStateWireLimits.MAX_ENCODED_BODY_BYTES
@@ -609,6 +644,30 @@ internal object AodStateWireCodec {
                     sourceEnd = input.readInt()
                 )
             }
+            val translationWordCount =
+                input.readBoundedCount(AodStateWireLimits.MAX_WORDS) ?: return null
+            val translationWords = ArrayList<AodStateWireWord>(translationWordCount)
+            repeat(translationWordCount) {
+                val text = input.readBoundedString(
+                    AodStateWireLimits.MAX_LYRIC_CHARS,
+                    allowEmpty = true,
+                    budget = budget
+                ) ?: return null
+                val wordRomanized = input.readBoundedString(
+                    AodStateWireLimits.MAX_LYRIC_CHARS,
+                    allowEmpty = true,
+                    budget = budget
+                ) ?: return null
+                translationWords += AodStateWireWord(
+                    text = text,
+                    romanized = wordRomanized,
+                    startMs = input.readLong(),
+                    endMs = input.readLong(),
+                    boundaryAfter = input.readStrictBoolean() ?: return null,
+                    sourceStart = input.readInt(),
+                    sourceEnd = input.readInt()
+                )
+            }
             val ruby = ArrayList<AodStateWireRuby>(rubyCount)
             repeat(rubyCount) {
                 ruby += AodStateWireRuby(
@@ -652,6 +711,9 @@ internal object AodStateWireCodec {
             ) ?: return null
             val hasDuet = input.readStrictBoolean() ?: return null
             val duetLine = if (hasDuet) decodeDuetLine(input, budget) ?: return null else null
+            // v10:长间奏窗口(原始空隙两端;0/0 = 无)。
+            val interludeStartMs = input.readLong()
+            val interludeEndMs = input.readLong()
             if (input.available() != 0) return null
             AodStateWireSnapshot(
                 trackGeneration = trackGeneration,
@@ -695,6 +757,7 @@ internal object AodStateWireCodec {
                 sampledAtElapsedMs = sampledAtElapsedMs,
                 speed = speed,
                 words = words.toList(),
+                translationWords = translationWords.toList(),
                 ruby = ruby.toList(),
                 layoutGroups = layoutGroups.toList(),
                 weight = weight,
@@ -714,7 +777,9 @@ internal object AodStateWireCodec {
                 adaptiveSectioning = adaptiveSectioning,
                 artworkJpeg = artworkJpeg,
                 artworkKey = artworkKey,
-                duetLine = duetLine
+                duetLine = duetLine,
+                interludeStartMs = interludeStartMs,
+                interludeEndMs = interludeEndMs
             ).takeIf(::isValidSnapshot)
         } catch (_: Exception) {
             null
@@ -739,6 +804,7 @@ internal object AodStateWireCodec {
             ) ?: return null
             val alignedRight = input.readStrictBoolean() ?: return null
             val alignedRightMarkers = input.readStrictBoolean() ?: return null
+            val harmony = input.readStrictBoolean() ?: return null
             val lineStartMs = input.readLong()
             val lineEndMs = input.readLong()
             val words = ArrayList<AodStateWireWord>(wordCount)
@@ -763,6 +829,7 @@ internal object AodStateWireCodec {
                 translated = translated,
                 alignedRight = alignedRight,
                 alignedRightMarkers = alignedRightMarkers,
+                harmony = harmony,
                 lineStartMs = lineStartMs,
                 lineEndMs = lineEndMs,
                 words = words.toList()
@@ -774,6 +841,7 @@ internal object AodStateWireCodec {
 
     private fun isValidSnapshot(snapshot: AodStateWireSnapshot): Boolean {
         if (snapshot.words.size > AodStateWireLimits.MAX_WORDS ||
+            snapshot.translationWords.size > AodStateWireLimits.MAX_WORDS ||
             snapshot.ruby.size > AodStateWireLimits.MAX_RUBY ||
             snapshot.layoutGroups.size > AodStateWireLimits.MAX_LAYOUT_GROUPS
         ) return false
@@ -785,6 +853,14 @@ internal object AodStateWireCodec {
             snapshot.sampledAtElapsedMs < 0L || !snapshot.speed.isFinite() ||
             snapshot.speed !in 0f..AodStateWireLimits.MAX_PLAYBACK_SPEED ||
             snapshot.textSizeCustom !in 0..500
+        ) return false
+        // 长间奏窗口(v10):0/0 = 无;有值时两端都须为正、终点不早于起点、不得越歌长
+        // (与 lineEndMs 同口径;半截窗口整包拒收)。
+        if (snapshot.interludeStartMs < 0L ||
+            snapshot.interludeEndMs < snapshot.interludeStartMs ||
+            (snapshot.interludeEndMs > 0L &&
+                (snapshot.interludeStartMs <= 0L ||
+                    snapshot.interludeEndMs > snapshot.durationMs))
         ) return false
         if (snapshot.burnInPattern != normalizeAodBurnInPattern(snapshot.burnInPattern) ||
             snapshot.burnInIntervalMs != normalizeAodBurnInInterval(snapshot.burnInIntervalMs) ||
@@ -867,6 +943,16 @@ internal object AodStateWireCodec {
                 !validSourceRange(word.sourceStart, word.sourceEnd, snapshot.original.length)
             ) return false
         }
+        // 插件逐字翻译词表:条数与主行词表共享上限;文本入同一聚合 UTF-8 预算;时间窗
+        // 不得越歌长(与主行同口径)。片段不指向原文,source 范围不校验(与并发行词表同口径)。
+        // 计数顺序与投影侧 fitAodEnhancementBudget 一致(词 → 逐字翻译词 → 注音 → 布局组)。
+        for (word in snapshot.translationWords) {
+            if (!budget.accept(word.text, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+                !budget.accept(word.romanized, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
+                word.startMs < 0L || word.endMs < word.startMs ||
+                word.endMs > snapshot.durationMs
+            ) return false
+        }
         for (ruby in snapshot.ruby) {
             if (!budget.accept(ruby.reading, AodStateWireLimits.MAX_LYRIC_CHARS, true) ||
                 ruby.start < 0 || ruby.end <= ruby.start || ruby.end > snapshot.original.length
@@ -889,6 +975,7 @@ internal object AodStateWireCodec {
         ) return false
         // 对唱并发行:词级条数与主行共享上限;文本/副文本入同一聚合 UTF-8 预算;
         // 时间窗/词级时间不得越歌长(与主行同口径,超限整包拒收)。
+        // harmony(v9)是纯布尔,无文本与条数,这里与 fitAodEnhancementBudget 都无需新增口径。
         snapshot.duetLine?.let { duet ->
             if (snapshot.words.size + duet.words.size > AodStateWireLimits.MAX_WORDS) return false
             if (duet.text.isBlank() || duet.text != duet.text.trim() ||
@@ -984,12 +1071,15 @@ internal object AodStateWireCodec {
 
     private const val BODY_MAGIC = 0x414F4453
 
-    /** v7:metadata 区追加原始 title/artist/album + largeMetadata + 标记识别版分侧(主行与并发行),
+    /** v10:间奏区追加长间奏窗口(interludeStartMs/interludeEndMs,原始空隙两端,0/0 = 无);
+     *  v9:并发行区追加和声标记(harmony,纯布尔,渲染侧据其走辅助行车道);
+     *  v8:词表区追加插件逐字翻译词表(translationWords,条数+载荷,翻译辅助行按真实词窗点亮);
+     *  v7:metadata 区追加原始 title/artist/album + largeMetadata + 标记识别版分侧(主行与并发行),
      *  让渲染面按本面「歌曲信息内容」/「识别对唱标记」独立组装与选侧(per-surface);
      *  v6:样式区追加 aodLandscapeFullscreenSafeMarginPercent(横屏全屏化安全边界);
      *  v5:行文本区追加 nextLineRomanized/nextLineTranslated(下一行辅助文字);
      *  v4:对照尾部追加对唱并发行(duetLine,存在性+载荷);v3 追加歌曲图片帧。 */
-    private const val BODY_VERSION = 7
+    private const val BODY_VERSION = 10
     private const val MAX_UTF8_BYTES_PER_UTF16_CHAR = 4
 }
 

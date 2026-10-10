@@ -40,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.eza.hyperglow.R
+import com.eza.hyperglow.aod.AodRenderPreferences
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Color
@@ -63,6 +64,15 @@ import com.eza.hyperglow.customization.ARTWORK_SIZE_MAX_DP
 import com.eza.hyperglow.customization.ARTWORK_SIZE_MIN_DP
 import com.eza.hyperglow.customization.METADATA_SEPARATORS
 import com.eza.hyperglow.customization.METADATA_SEPARATOR_NEWLINE
+import com.eza.hyperglow.customization.METADATA_LAYOUTS
+import com.eza.hyperglow.customization.METADATA_LAYOUT_SINGLE
+import com.eza.hyperglow.customization.METADATA_LAYOUT_STACKED
+import com.eza.hyperglow.customization.MAX_SONG_INFO_ARTIST_SIZE_PERCENT
+import com.eza.hyperglow.customization.MIN_SONG_INFO_ARTIST_SIZE_PERCENT
+import com.eza.hyperglow.customization.metadataStacksArtistLine
+import com.eza.hyperglow.customization.normalizeMetadataLayout
+import com.eza.hyperglow.customization.SECONDARY_TEXT_SIZE_PERCENT_MAX
+import com.eza.hyperglow.customization.SECONDARY_TEXT_SIZE_PERCENT_MIN
 import com.eza.hyperglow.customization.SceneCompiler
 import com.eza.hyperglow.customization.SurfaceProfile
 import com.eza.hyperglow.customization.composeSongMetadata
@@ -73,8 +83,10 @@ import com.eza.hyperglow.customization.normalizeArtworkSizeDp
 import com.eza.hyperglow.customization.normalizeMetadataParts
 import com.eza.hyperglow.customization.normalizeMetadataSeparator
 import com.eza.hyperglow.customization.normalizeMetadataSeparators
+import com.eza.hyperglow.customization.normalizeSecondaryTextSizePercent
 import com.eza.hyperglow.root.aod.LyricTypefaceResolver
 import com.eza.hyperglow.root.aod.metadataWidgetHeightDp
+import com.eza.hyperglow.root.projection.LyricDuetLine
 import com.eza.hyperglow.root.projection.LyricRuby
 import com.eza.hyperglow.root.projection.LyricSnapshot
 import com.eza.hyperglow.root.projection.LyricWord
@@ -117,6 +129,9 @@ internal fun LyricAppearanceSection(
     footer: (@Composable () -> Unit)? = null
 ) {
     val context = LocalContext.current
+    // 「不显示非歌词内容」是应用级偏好(非按面),外观编辑页的悬浮预览同样要跟随它,
+    // 否则编辑页预览与实机/首页预览分叉(预览即实机)。
+    val hideCreditLines = remember { AodRenderPreferences.read(context).hideCreditLines }
     // 状态按曲面重建:两个分段复用同一实现,切分段即换编辑面(文档同源,各自只改本面)。
     var editorState by remember(surface) {
         mutableStateOf(
@@ -286,7 +301,8 @@ internal fun LyricAppearanceSection(
                 // 内容项取本面编译后的已解析值(含文档级兜底),预览与实机同源。
                 metadataParts = compiledPreviewProfile.metadataParts,
                 metadataSeparators = compiledPreviewProfile.metadataSeparators,
-                duetMarkers = compiledPreviewProfile.duetMarkers
+                duetMarkers = compiledPreviewProfile.duetMarkers,
+                hideCreditLines = hideCreditLines
             )
         }
         LazyColumn(
@@ -385,6 +401,15 @@ internal fun LyricAppearanceSection(
                     stringResource(R.string.setting_duet_concurrent),
                     summary = stringResource(R.string.summary_duet_concurrent)
                 )
+                // 长间奏倒计时圆点(per-surface):本行 end 与下一行 start 空隙 ≥4s 时,歌词行
+                // 槽位改画三个倒计时圆点(参考 HyperLyric 同名方案)。息屏与锁屏各自独立开关;
+                // 关闭后间奏期恢复原来的上一行滞留/下一行预览呈现,零变化。
+                SwitchPreference(
+                    selectedProfile.interludeCountdown,
+                    { enabled -> updateSelected { it.copy(interludeCountdown = enabled) } },
+                    stringResource(R.string.setting_interlude_countdown),
+                    summary = stringResource(R.string.summary_interlude_countdown)
+                )
                 // 识别对唱标记(per-surface):标记是内容级解释,息屏与锁屏各自独立生效,
                 // 改本面不影响另一面。本面未显式设置时以文档级值作有效值。
                 SwitchPreference(
@@ -413,26 +438,75 @@ internal fun LyricAppearanceSection(
                     valueRange = LyricTimeOffset.MIN_OFFSET_MS.toFloat()..LyricTimeOffset.MAX_OFFSET_MS.toFloat(),
                     steps = 199
                 )
+                // 辅助文字内容:多选(转写 / 翻译 / 和声 可任意组合,逐项勾选即时生效)。
+                // 值为逗号连接的内容集合 + 和声状态位(词表见 SECONDARY_CONTENT_TOKENS);
+                // 历史四档按「显示和声」解释,归一与校验共用 normalizeAuxMode。
                 AodChoiceRow(AodChoiceKind.SECONDARY_TEXT, selectedProfile.secondaryMode) {
                     openChoice(
                         AodChoiceKind.SECONDARY_TEXT,
-                        listOf("Main only", "Transliteration", "Translation", "Both"),
+                        com.eza.hyperglow.customization.SECONDARY_CONTENT_TOKENS,
                         selectedProfile.secondaryMode
                     ) { value -> updateSelected { it.copy(secondaryMode = value) } }
                 }
-                if (selectedProfile.secondaryMode != "Main only" ||
-                    selectedProfile.secondaryNextLine
-                ) {
+                // 辅助文字大小(per-surface):相对主行的倍率,100% = 历史值,硬顶 0.62×主行。
+                // 常显:和声行不受「辅助文字模式=仅主行」门控,照抄高亮/逐字两条的可见条件
+                // 会漏掉和声场景(见 SurfaceProfile.secondaryTextSizePercent)。
+                TextSizePreference(
+                    title = stringResource(R.string.setting_secondary_text_size),
+                    percent = selectedProfile.secondaryTextSizePercent.coerceIn(
+                        SECONDARY_TEXT_SIZE_PERCENT_MIN,
+                        SECONDARY_TEXT_SIZE_PERCENT_MAX
+                    ),
+                    minPercent = SECONDARY_TEXT_SIZE_PERCENT_MIN,
+                    maxPercent = SECONDARY_TEXT_SIZE_PERCENT_MAX,
+                    onDecrease = {
+                        updateSelected {
+                            it.copy(
+                                secondaryTextSizePercent = normalizeSecondaryTextSizePercent(
+                                    it.secondaryTextSizePercent - 5
+                                )
+                            )
+                        }
+                    },
+                    onIncrease = {
+                        updateSelected {
+                            it.copy(
+                                secondaryTextSizePercent = normalizeSecondaryTextSizePercent(
+                                    it.secondaryTextSizePercent + 5
+                                )
+                            )
+                        }
+                    }
+                )
+                // 辅助文字自适应大小(per-surface):装得下恒用设定字号(既有呈现逐像素不变),
+                // 装不下缩到可读性下限;第二行辅助行/和声行/并发行辅助行一并生效。
+                SwitchPreference(
+                    selectedProfile.secondaryAutoSize,
+                    { enabled -> updateSelected { it.copy(secondaryAutoSize = enabled) } },
+                    stringResource(R.string.setting_secondary_auto_size),
+                    summary = stringResource(R.string.summary_secondary_auto_size)
+                )
+                // 露出门槛:任一辅助内容在显示(音标/翻译/和声,和声默认在——见 auxHarmonyShown)
+                // 时露出;多选里三者都不勾时没有辅助行可作用,不露出。
+                val auxAnyContent =
+                    com.eza.hyperglow.customization.auxShowsReading(selectedProfile.secondaryMode) ||
+                        com.eza.hyperglow.customization.auxShowsTranslation(
+                            selectedProfile.secondaryMode
+                        ) ||
+                        com.eza.hyperglow.customization.auxHarmonyShown(
+                            selectedProfile.secondaryMode
+                        )
+                if (auxAnyContent || selectedProfile.secondaryNextLine) {
                     SwitchPreference(
                         selectedProfile.secondaryTextBright,
                         { bright -> updateSelected { it.copy(secondaryTextBright = bright) } },
                         stringResource(R.string.setting_bright_secondary_text)
                     )
                 }
-                // 辅助文字逐字效果(per-surface):第一行辅助文字行(音标/翻译)随歌词逐字点亮。
-                // 只在辅助文字模式非「仅主行」时露出(没有第一行辅助文字行时该开关无对象);
+                // 辅助文字逐字效果(per-surface):第一行辅助文字行(音标/翻译)与和声行随歌词逐字点亮。
+                // 只在有辅助内容显示时露出(没有任何辅助行时该开关无对象,见 auxAnyContent);
                 // 第二行歌词及其辅助行不参与。
-                if (selectedProfile.secondaryMode != "Main only") {
+                if (auxAnyContent) {
                     SwitchPreference(
                         selectedProfile.secondaryWordKaraoke,
                         { enabled ->
@@ -547,6 +621,57 @@ internal fun LyricAppearanceSection(
                             }
                         }
                     )
+                    AodChoiceRow(
+                        AodChoiceKind.SONG_INFO_LAYOUT,
+                        normalizeMetadataLayout(selectedProfile.metadataLayout)
+                    ) {
+                        openChoice(
+                            AodChoiceKind.SONG_INFO_LAYOUT,
+                            METADATA_LAYOUTS,
+                            normalizeMetadataLayout(selectedProfile.metadataLayout)
+                        ) { value -> updateSelected { it.copy(metadataLayout = value) } }
+                    }
+                    // 堆叠式歌手行字号:仅当本面组装确实产出独立的歌手行时才有意义
+                    // (single 布局、或行内分隔符把各部分并成一行时整行按歌名字号)。
+                    if (metadataStacksArtistLine(
+                            effectiveMetadataParts,
+                            effectiveMetadataSeparators,
+                            selectedProfile.metadataLayout
+                        )
+                    ) {
+                        TextSizePreference(
+                            title = stringResource(R.string.setting_song_info_artist_size),
+                            percent = selectedProfile.metadataArtistSizePercent.coerceIn(
+                                MIN_SONG_INFO_ARTIST_SIZE_PERCENT,
+                                MAX_SONG_INFO_ARTIST_SIZE_PERCENT
+                            ),
+                            // 滑杆边界取歌手字号自己的范围(默认 50..200 会把 − 按钮在 50 以下禁用)。
+                            minPercent = MIN_SONG_INFO_ARTIST_SIZE_PERCENT,
+                            maxPercent = MAX_SONG_INFO_ARTIST_SIZE_PERCENT,
+                            onDecrease = {
+                                updateSelected {
+                                    it.copy(
+                                        metadataArtistSizePercent =
+                                            (it.metadataArtistSizePercent - 5).coerceIn(
+                                                MIN_SONG_INFO_ARTIST_SIZE_PERCENT,
+                                                MAX_SONG_INFO_ARTIST_SIZE_PERCENT
+                                            )
+                                    )
+                                }
+                            },
+                            onIncrease = {
+                                updateSelected {
+                                    it.copy(
+                                        metadataArtistSizePercent =
+                                            (it.metadataArtistSizePercent + 5).coerceIn(
+                                                MIN_SONG_INFO_ARTIST_SIZE_PERCENT,
+                                                MAX_SONG_INFO_ARTIST_SIZE_PERCENT
+                                            )
+                                    )
+                                }
+                            }
+                        )
+                    }
                     // 内容编辑:勾选/排序显示部分(歌名/歌手/专辑),并逐槽独立选择相邻两项之间的分隔符。
                     ArrowPreference(
                         title = stringResource(R.string.setting_song_info_parts),
@@ -1034,7 +1159,33 @@ internal fun LyricAppearanceSection(
 
     // 选项弹窗最后合成:保证在内容编辑弹窗之上弹出(逐槽分隔符选择需要覆盖在其上方)。
     activeChoice?.let { selected ->
-        if (selected.kind == AodChoiceKind.FONT) {
+        if (selected.kind == AodChoiceKind.SECONDARY_TEXT) {
+            // 辅助文字内容:多选。逐项勾选即时生效(不关闭弹窗);勾选态用本地状态推进——
+            // AodChoice.current 是打开弹窗那一刻的快照,拿它判勾选会永远停在打开时的样子。
+            var mode by remember(selected) { mutableStateOf(selected.current) }
+            WindowDialog(
+                title = stringResource(selected.kind.titleRes),
+                show = true,
+                onDismissRequest = { activeChoice = null }
+            ) {
+                Column {
+                    selected.values.forEach { value ->
+                        SwitchPreference(
+                            com.eza.hyperglow.customization.auxContentChecked(mode, value),
+                            { _ ->
+                                val next = com.eza.hyperglow.customization.toggleAuxContent(
+                                    mode,
+                                    value
+                                )
+                                mode = next
+                                selected.onSelect(next)
+                            },
+                            auxContentItemLabel(context, value)
+                        )
+                    }
+                }
+            }
+        } else if (selected.kind == AodChoiceKind.FONT) {
             FontChoiceDialog(
                 selected = selected,
                 customNames = customFontNames,
@@ -1175,9 +1326,51 @@ internal fun collectDemoSnapshot(
         words = demoWords(line.original),
         // 演示快照携带注音:让「注音」开关在无实时歌词时也能在预览里看出效果
         // (实机仅在 rubyVisible == false 时清空,见 LyricCanvasMapper)。
-        ruby = line.ruby
+        ruby = line.ruby,
+        // 演示并发行(和声):让「显示并发歌词(对唱)」开关在无实时歌词时也能在预览里
+        // 看出效果;装配规则见 [demoDuetLine](纯函数,JVM 可测)。
+        duetLine = demoDuetLine(line),
+        // 演示长间奏窗口:让「长间奏显示倒计时圆点」开关在无实时歌词时也能在预览里看出效果。
+        // 只在一轮循环里的一拍携带(装配见 [demoInterludeSpan],纯函数 JVM 可测),
+        // 其余各拍照常显示歌词文本——与演示并发行同式:演示数据只承载"这一拍有该特性"。
+        interludeStartMs = demoInterludeSpan(index)?.first ?: 0L,
+        interludeEndMs = demoInterludeSpan(index)?.last ?: 0L
     )
 }
+
+/**
+ * 演示快照的长间奏窗口(纯函数,JVM 可测):只在循环里的一拍([DEMO_INTERLUDE_INDEX])携带,
+ * 其余各拍返回 null(无长间奏),预览照常显示歌词文本。
+ *
+ * 窗口取 [DEMO_INTERLUDE_WINDOW_MS](5s,确实过 4s 阈值),并把该拍的演示位置放在窗口内
+ * [DEMO_INTERLUDE_ENTRY_PROGRESS](40%)处 —— 落在"前两个点已点亮、尚未开始渐隐"的
+ * 阶段,是最能说明该特性的定格形态。演示位置在一拍内不变(演示快照逐拍切换,不像实机
+ * 逐帧投影),故圆点是定格的;这与演示并发行同为静态演示数据,不是逐帧动画。
+ */
+internal fun demoInterludeSpan(index: Int): LongRange? {
+    if (index != DEMO_INTERLUDE_INDEX) return null
+    val positionMs = index * DEMO_LINE_SWITCH_MS
+    val startMs = positionMs - (DEMO_INTERLUDE_WINDOW_MS * DEMO_INTERLUDE_ENTRY_PROGRESS).toLong()
+    return startMs..(startMs + DEMO_INTERLUDE_WINDOW_MS)
+}
+
+/**
+ * 演示副行 → 并发行(纯函数,JVM 可测):文本为空不产出(与实机 duetLine 文本为空整条
+ * 丢弃同口径)。[DemoLine.duetHarmony] 决定它走哪条车道:带括号的回声句(AMLL x-bg 形态)
+ * 按**和声**下发,预览与实机同源走辅助行车道(小字号辅助行)——不再堆主行同款大字行
+ * (两条一样的大字行是真机 2026-10-07 反馈的错观感);不同声部的对唱句按**对唱**下发,
+ * 走主行同款大字行(与实机非 BG 行同源)。两种样式都要在无实时歌词时可见。
+ */
+internal fun demoDuetLine(line: DemoLine): LyricDuetLine? =
+    line.duet?.takeIf { it.isNotBlank() }?.let { duet ->
+        LyricDuetLine(
+            text = duet,
+            harmony = line.duetHarmony,
+            lineStartMs = 0,
+            lineEndMs = DEMO_LINE_SWITCH_MS,
+            words = demoWords(duet)
+        )
+    }
 
 /**
  * 演示歌词行按界面语言选择:English 用英文演示曲,其余(跟随系统/简体中文)用中文演示曲。
@@ -1211,7 +1404,19 @@ internal class DemoLine(
      * 在预览里看出效果。必须覆盖整行 —— 只标首词会在预览里留下一截拼音(owner 2026-10-06
      * 反馈的「文字上方零星的转写内容」),且各段读音拼接后要与 [romanized] 逐字一致。
      */
-    val ruby: List<LyricRuby>
+    val ruby: List<LyricRuby>,
+    /**
+     * 同句副行(可空,仅演示数据用):让「显示并发歌词(对唱)」在无实时歌词时也能在预览里
+     * 看出来。演示快照不走按面标记剥离(见 collectDemoSnapshot),这里直接写剥离后的形态,
+     * 避免预览出现实机默认设置下不会上屏的行首标记文本。
+     */
+    val duet: String? = null,
+    /**
+     * 副行是否和声(role=BG 的 x-bg 回声):true 走辅助行车道(小字号),false 走主行同款
+     * 大字行。演示数据两种都给(回声句 + 不同声部的对唱句),否则「对唱=主行同款」这一样式
+     * 在无实时歌词时看不到(见 [demoDuetLine])。
+     */
+    val duetHarmony: Boolean = true
 )
 
 internal class DemoTrack(
@@ -1262,7 +1467,9 @@ internal val DEMO_LINES_ZH = listOf(
             LyricRuby(15, 17, "piàoliang"),
             LyricRuby(17, 18, "de"),
             LyricRuby(18, 20, "lín piàn")
-        )
+        ),
+        // 和声副行:带括号的回声句(x-bg 形态),走辅助行车道(见 demoDuetLine)。
+        duet = "（也要飞向那片蓝天）"
     ),
     DemoLine(
         "走吧 就算我们无法让大雨停下",
@@ -1291,7 +1498,11 @@ internal val DEMO_LINES_ZH = listOf(
             LyricRuby(9, 11, "tiānzhēn"),
             LyricRuby(11, 12, "ér"),
             LyricRuby(12, 14, "wěidà")
-        )
+        ),
+        // 对唱副行:不同声部的答句(非回声),走主行同款大字行(见 demoDuetLine);
+        // 文本与主行不同文,避免预览出现「两条一样的大字行」的错观感。
+        duet = "哪怕世界从未回答",
+        duetHarmony = false
     )
 )
 
@@ -1308,7 +1519,9 @@ internal val DEMO_LINES_EN = listOf(
         "In my dreams, I feel your light",
         "ɪn maɪ driːmz aɪ fiːl jɔː laɪt",
         "在我的梦里，我感受到你的光芒",
-        emptyList()
+        emptyList(),
+        // 和声副行:带括号的回声句(x-bg 形态),走辅助行车道(见 demoDuetLine)。
+        duet = "(Shining through the endless night)"
     ),
     DemoLine(
         "I feel love is born again",
@@ -1326,12 +1539,31 @@ internal val DEMO_LINES_EN = listOf(
         "Take my hand now, stay close to me",
         "teɪk maɪ hænd naʊ steɪ kloʊs tə miː",
         "现在握住我的手，靠近我",
-        emptyList()
+        emptyList(),
+        // 对唱副行:不同声部的答句(非回声),走主行同款大字行(见 demoDuetLine);
+        // 文本与主行不同文,避免预览出现「两条一样的大字行」的错观感。
+        duet = "And I will never let you go",
+        duetHarmony = false
     )
 )
 
 /** How long each demo line stays on screen before cycling to the next. */
 internal const val DEMO_LINE_SWITCH_MS = 2_500L
+
+/**
+ * 演示快照携带长间奏窗口的拍号(纯函数 [demoInterludeSpan] 用):只在这一拍演示圆点,
+ * 其余各拍照常显示歌词文本。
+ */
+private const val DEMO_INTERLUDE_INDEX = 1
+
+/** 演示长间奏窗口长度:5s,确实过 [MIN_INTERLUDE_GAP_MS](4s) 阈值。 */
+private const val DEMO_INTERLUDE_WINDOW_MS = 5_000L
+
+/**
+ * 演示圆点的定格进度(窗口内):40% —— 前两个点已点亮、渐隐段(60%)尚未开始,
+ * 是最能说明该特性的形态。
+ */
+private const val DEMO_INTERLUDE_ENTRY_PROGRESS = 0.4f
 
 /**
  * 演示逐字时间戳:把演示行切成词(空格处切分,否则每 2 字一块),首词按长音节加权
@@ -1586,14 +1818,16 @@ private fun TextSizePreference(
     title: String,
     percent: Int,
     onDecrease: () -> Unit,
-    onIncrease: () -> Unit
+    onIncrease: () -> Unit,
+    minPercent: Int = 50,
+    maxPercent: Int = 200
 ) {
     BasicComponent(
         title = title,
         endActions = {
             IconButton(
                 onClick = onDecrease,
-                enabled = percent > 50,
+                enabled = percent > minPercent,
                 backgroundColor = MiuixTheme.colorScheme.surfaceContainerHighest,
                 cornerRadius = 24.dp,
                 minHeight = 48.dp,
@@ -1613,7 +1847,7 @@ private fun TextSizePreference(
             Spacer(Modifier.width(12.dp))
             IconButton(
                 onClick = onIncrease,
-                enabled = percent < 200,
+                enabled = percent < maxPercent,
                 backgroundColor = MiuixTheme.colorScheme.surfaceContainerHighest,
                 cornerRadius = 24.dp,
                 minHeight = 48.dp,
@@ -1632,6 +1866,16 @@ private fun effectiveTextSizePercent(profile: SurfaceProfile): Int = when (profi
     "custom" -> profile.textSizeCustom.coerceIn(50, 200)
     else -> 100
 }
+
+/** 辅助文字多选条目标签(内容词表条目;摘要另按集合拼接,见 [choiceDisplayLabel])。 */
+private fun auxContentItemLabel(context: android.content.Context, token: String): String =
+    context.getString(
+        when (token) {
+            "Transliteration" -> R.string.option_transliteration
+            "Translation" -> R.string.option_translation
+            else -> R.string.option_background_vocal
+        }
+    )
 
 private fun choiceDisplayLabel(
     context: android.content.Context,
@@ -1669,6 +1913,13 @@ private fun choiceDisplayLabel(
     })
     AodChoiceKind.SONG_INFO_POSITION -> context.getString(
         if (value == "bottom") R.string.option_bottom else R.string.option_top
+    )
+    AodChoiceKind.SONG_INFO_LAYOUT -> context.getString(
+        if (value == METADATA_LAYOUT_SINGLE) {
+            R.string.option_song_info_layout_single
+        } else {
+            R.string.option_song_info_layout_stacked
+        }
     )
     AodChoiceKind.SONG_INFO_SEPARATOR -> metadataSeparatorDisplayLabel(context, value)
     AodChoiceKind.SONG_ARTWORK_SHAPE -> context.getString(
@@ -1754,12 +2005,25 @@ private fun choiceDisplayLabel(
         "500" -> R.string.option_slow
         else -> R.string.option_normal
     })
-    AodChoiceKind.SECONDARY_TEXT -> context.getString(when (value) {
-        "Transliteration" -> R.string.option_transliteration
-        "Translation" -> R.string.option_translation
-        "Both" -> R.string.option_both
-        else -> R.string.option_main_only
-    })
+    AodChoiceKind.SECONDARY_TEXT -> {
+        // 多选摘要:已勾选内容按词表序以 " + " 连接;一个都不勾显示「仅主歌词」。
+        val parts = buildList {
+            if (com.eza.hyperglow.customization.auxShowsReading(value)) {
+                add(context.getString(R.string.option_transliteration))
+            }
+            if (com.eza.hyperglow.customization.auxShowsTranslation(value)) {
+                add(context.getString(R.string.option_translation))
+            }
+            if (com.eza.hyperglow.customization.auxHarmonyShown(value)) {
+                add(context.getString(R.string.option_background_vocal))
+            }
+        }
+        if (parts.isEmpty()) {
+            context.getString(R.string.option_main_only)
+        } else {
+            parts.joinToString(" + ")
+        }
+    }
     AodChoiceKind.LONG_LINES -> context.getString(
         if (value == "Clip") R.string.option_clip else R.string.option_wrap
     )
@@ -1804,6 +2068,7 @@ private enum class AodChoiceKind(@param:StringRes val titleRes: Int) {
     LONG_LINES(R.string.choice_long_lines),
     LYRIC_LINES(R.string.choice_lyric_lines),
     SONG_INFO_POSITION(R.string.choice_song_info_position),
+    SONG_INFO_LAYOUT(R.string.choice_song_info_layout),
     SONG_INFO_SEPARATOR(R.string.choice_song_info_separator),
     SONG_ARTWORK_SHAPE(R.string.choice_song_artwork_shape),
     TEXT_WEIGHT(R.string.choice_text_weight),

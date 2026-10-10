@@ -126,7 +126,18 @@ data class AodRenderConfig(
      * 把息屏逐字动画降为粗粒度步进(约 5fps)以显著降低绘制功耗。默认开启(保持历史行为);
      * 关闭后息屏画布始终按 [aodRefreshRateCap] 的帧上限渲染,不因电量/温度降帧。
      */
-    val aodPowerSaver: Boolean = true
+    val aodPowerSaver: Boolean = true,
+    /**
+     * 「不显示非歌词内容(作词/作曲等)」:歌词里的制作名单行(见
+     * [com.eza.hyperglow.producer.LyricCreditLineFilter])被视为非歌词,在投影层整行隐藏,
+     * 歌词进入下一帧时不再由这些占位行占据显示窗口。
+     *
+     * 默认**关闭**,保持历史行为:部分歌词源把这类名单当曲目介绍摆在开场,是与歌词
+     * 正文一同交付的内容;隐藏与否交由用户决定,且与
+     * [com.eza.hyperglow.producer.LyricOpeningFilter] 的保守语义(作词/作曲不隐藏)
+     * 互不冲突——本开关是新增能力,不是在既有开场清理里补一条词表的改动。
+     */
+    val hideCreditLines: Boolean = false
 ) {
     companion object {
         /** 出厂默认配置;备份解码时用于逐字段回退缺失/类型错误的值。 */
@@ -142,12 +153,14 @@ internal fun normalizeAodAlignment(value: String?): String = when (value) {
     else -> "auto"
 }
 
-internal fun normalizeAodSecondary(value: String?): String = when (value) {
-    "Transliteration" -> "Transliteration"
-    "Translation" -> "Translation"
-    "Both" -> "Both"
-    else -> "Main only"
-}
+/**
+ * AOD 侧辅助文字模式归一:与编译/SystemUI/设置页共用同一份词表归一
+ * ([com.eza.hyperglow.customization.normalizeAuxMode])——多选档(逗号连接的集合 +
+ * 和声状态位)必须原样通过,历史四档同样原样保留;两处归一不一致会让 wire 的
+ * validate_rewrote_fields 拒收整份配置(实机表现为「设置页正常、实机毫无变化」)。
+ */
+internal fun normalizeAodSecondary(value: String?): String =
+    com.eza.hyperglow.customization.normalizeAuxMode(value)
 
 internal fun normalizeAodOverflow(value: String?): String = when (value) {
     "Clip" -> "Clip"
@@ -362,6 +375,7 @@ object AodRenderPreferences {
     const val AOD_REFRESH_RATE_CAP = "aod_refresh_rate_cap"
     const val AOD_POWER_SAVER = "aod_power_saver"
     const val FILTER_NON_MUSIC_SOURCES = "filter_non_music_sources"
+    const val HIDE_CREDIT_LINES = "hide_credit_lines"
 
     // SharedPreferences throws ClassCastException when an older/imported value has the wrong
     // primitive type. Treat malformed entries as missing so a bad setting cannot crash startup.
@@ -466,7 +480,8 @@ object AodRenderPreferences {
             prefs.safeBoolean(AOD_DEBUG_SHOW_CANVAS_FRAME, false),
             normalizeAodRefreshRateCap(prefs.safeInt(AOD_REFRESH_RATE_CAP, 0)),
             prefs.safeBoolean(FILTER_NON_MUSIC_SOURCES, true),
-            prefs.safeBoolean(AOD_POWER_SAVER, true)
+            prefs.safeBoolean(AOD_POWER_SAVER, true),
+            prefs.safeBoolean(HIDE_CREDIT_LINES, false)
         ).also { cachedConfig = it }
     }
 

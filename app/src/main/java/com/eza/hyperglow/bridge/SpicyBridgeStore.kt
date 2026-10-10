@@ -56,9 +56,13 @@ internal fun normalizeSpicyBridgeRenderModes(
     weight = candidate.weight.takeIf { it in SPICY_WEIGHTS } ?: "Medium",
     textSize = candidate.textSize.takeIf { it in SPICY_TEXT_SIZES } ?: "normal",
     textSizeCustom = candidate.textSizeCustom.coerceIn(0, 500),
-    secondary = when (candidate.secondary) {
-        "Transliteration", "Translation", "Both" -> candidate.secondary
-        "Romanization", "Romanized" -> "Transliteration"
+    secondary = when {
+        candidate.secondary == "Romanization" || candidate.secondary == "Romanized" ->
+            "Transliteration"
+        // 历史四档与多选内容集合都按词表归一原样通过(同 animation 白名单语义:漏一处即
+        // 「设置页正常、实机不变」);词表外的值仍回落「仅主歌词」。
+        com.eza.hyperglow.customization.normalizeAuxMode(candidate.secondary) ==
+            candidate.secondary -> candidate.secondary
         else -> "Main only"
     },
     animation = when (candidate.animation) {

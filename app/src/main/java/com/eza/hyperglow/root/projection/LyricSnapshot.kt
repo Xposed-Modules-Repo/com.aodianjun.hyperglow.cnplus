@@ -48,6 +48,11 @@ internal data class LyricDuetLine(
     val alignedRight: Boolean = false,
     /** 分侧(标记识别版)。 */
     val alignedRightMarkers: Boolean = false,
+    /**
+     * 和声行(插件行 role=BG 的 x-bg 回声):渲染面走辅助行车道,不与对唱同款
+     * (语义见 [com.eza.hyperglow.producer.LyricDuetLine.harmony])。
+     */
+    val harmony: Boolean = false,
     val lineStartMs: Long = 0L,
     val lineEndMs: Long = 0L,
     val words: List<LyricWord> = emptyList()
@@ -110,6 +115,11 @@ internal data class LyricSnapshot(
     val sampledAtElapsedMs: Long = 0L,
     val speed: Float = 1f,
     val words: List<LyricWord> = emptyList(),
+    /**
+     * 插件提供的逐字翻译词表(词级译文 + 时间窗,见 `PluginLyricField.TRANSLATION_WORDS`):
+     * 翻译辅助行按真实词窗点亮。空表 = 无词级数据,渲染侧回落行窗口合成。
+     */
+    val translationWords: List<LyricWord> = emptyList(),
     val ruby: List<LyricRuby> = emptyList(),
     val layoutGroups: List<LyricLayoutGroup> = emptyList(),
     val weight: String = "Medium",
@@ -132,7 +142,14 @@ internal data class LyricSnapshot(
     /** 封面稳定键(包名+曲目身份);空串=无封面,渲染侧按帧缓存解码位图。 */
     val artworkKey: String = "",
     /** 对唱并发行(仅息屏消费);null = 无并发行或「显示并发歌词(对唱)」已关。 */
-    val duetLine: LyricDuetLine? = null
+    val duetLine: LyricDuetLine? = null,
+    /**
+     * 长间奏窗口(上一行 end .. 下一行 start 的原始空隙;0/0 = 无)。渲染面按本面
+     * 「长间奏倒计时圆点」开关与「显示下一行」延迟映射解析成圆点窗口
+     * (见 root.aod.interludeDotsWindow)。
+     */
+    val interludeStartMs: Long = 0L,
+    val interludeEndMs: Long = 0L
 ) {
     fun renderContent(): LyricRenderContent = LyricRenderContent(
         trackGeneration,
@@ -157,6 +174,7 @@ internal data class LyricSnapshot(
         sampledAtElapsedMs,
         speed,
         words,
+        translationWords,
         ruby,
         layoutGroups,
         weight,
@@ -175,7 +193,9 @@ internal data class LyricSnapshot(
         metadataAnchor,
         adaptiveSectioning,
         artworkKey,
-        duetLine
+        duetLine,
+        interludeStartMs,
+        interludeEndMs
     )
 }
 
@@ -205,6 +225,8 @@ internal data class LyricRenderContent(
     val sampledAtElapsedMs: Long,
     val speed: Float,
     val words: List<LyricWord>,
+    /** 插件逐字翻译词表(见 [LyricSnapshot.translationWords]);空表 = 回落行窗口合成。 */
+    val translationWords: List<LyricWord> = emptyList(),
     val ruby: List<LyricRuby>,
     val layoutGroups: List<LyricLayoutGroup>,
     val weight: String,
@@ -231,7 +253,13 @@ internal data class LyricRenderContent(
      * 对唱并发行(锁屏/息屏各自按自己的开关门控后)。纳入变更指纹:主行不变而并发行
      * 单独加入/离开时,控制器也要重投内容(与 artworkKey 同为内容级指纹)。
      */
-    val duetLine: LyricDuetLine? = null
+    val duetLine: LyricDuetLine? = null,
+    /**
+     * 长间奏窗口(原始空隙两端;0/0 = 无)。纳入变更指纹:窗口单独出现/消失/平移时
+     * 控制器也要重投内容(渲染面按本面开关解析成圆点窗口)。
+     */
+    val interludeStartMs: Long = 0L,
+    val interludeEndMs: Long = 0L
 )
 
 internal data class LyricKeepAliveSignal(
@@ -389,6 +417,19 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
             sourceEnd = range.second
         )
     }.toList()
+    // 插件逐字翻译词表:条数/文本/时间轻量钳制(与 words 同口径);片段不指向原文,
+    // source 范围不参与(恒 -1)。
+    val translationWords = snapshot.translationWords.asSequence().take(MAX_WORDS).map { word ->
+        val startMs = word.startMs.coerceAtLeast(0L)
+        word.copy(
+            text = word.text.take(MAX_LYRIC_LENGTH),
+            romanized = "",
+            startMs = startMs,
+            endMs = word.endMs.coerceAtLeast(startMs),
+            sourceStart = -1,
+            sourceEnd = -1
+        )
+    }.toList()
     val ruby = snapshot.ruby.asSequence().take(MAX_RUBY).mapNotNull { item ->
         val start = (item.start - trimOffset).coerceAtLeast(0)
         val end = (item.end - trimOffset).coerceAtMost(original.length)
@@ -445,6 +486,15 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
             )
         }
     }
+    // 长间奏窗口:两端钳到歌长,半截/退化窗口整体清零(与投影侧 normalizeAodDisplayState
+    // 同口径;wire 侧 isValidSnapshot 已做过整包校验,这里只兜直接构造的快照)。
+    val interludeStartMs = snapshot.interludeStartMs.coerceAtLeast(0L).let {
+        if (duration > 0L) it.coerceAtMost(duration) else it
+    }
+    val interludeEndMs = snapshot.interludeEndMs.coerceAtLeast(0L).let {
+        if (duration > 0L) it.coerceAtMost(duration) else it
+    }
+    val interludeValid = interludeStartMs > 0L && interludeEndMs > interludeStartMs
     return snapshot.copy(
         revision = snapshot.revision.coerceAtLeast(0L),
         trackGeneration = snapshot.trackGeneration.coerceAtLeast(0L),
@@ -488,12 +538,15 @@ internal fun normalizeLyricSnapshot(snapshot: LyricSnapshot): LyricSnapshot {
             snapshot.aodCanvasPaddingLandscapeYPercent
         ),
         words = words,
+        translationWords = translationWords,
         ruby = ruby,
         layoutGroups = layoutGroups,
         textSizeCustom = snapshot.textSizeCustom.coerceIn(0, 500),
         artworkJpeg = artworkJpeg,
         artworkKey = artworkKey,
-        duetLine = duetLine
+        duetLine = duetLine,
+        interludeStartMs = if (interludeValid) interludeStartMs else 0L,
+        interludeEndMs = if (interludeValid) interludeEndMs else 0L
     )
 }
 
@@ -560,6 +613,17 @@ internal fun AodStateWireMessage.toLyricProjectionMessage(): LyricProjectionMess
                     sourceEnd = word.sourceEnd
                 )
             },
+            translationWords = value.translationWords.map { word ->
+                LyricWord(
+                    text = word.text,
+                    romanized = word.romanized,
+                    startMs = word.startMs,
+                    endMs = word.endMs,
+                    boundaryAfter = word.boundaryAfter,
+                    sourceStart = word.sourceStart,
+                    sourceEnd = word.sourceEnd
+                )
+            },
             ruby = value.ruby.map { item ->
                 LyricRuby(item.start, item.end, item.reading)
             },
@@ -589,6 +653,8 @@ internal fun AodStateWireMessage.toLyricProjectionMessage(): LyricProjectionMess
             adaptiveSectioning = value.adaptiveSectioning,
             artworkJpeg = value.artworkJpeg.bytes,
             artworkKey = value.artworkKey,
+            interludeStartMs = value.interludeStartMs,
+            interludeEndMs = value.interludeEndMs,
             duetLine = value.duetLine?.let { line ->
                 LyricDuetLine(
                     text = line.text,
@@ -596,6 +662,7 @@ internal fun AodStateWireMessage.toLyricProjectionMessage(): LyricProjectionMess
                     translated = line.translated,
                     alignedRight = line.alignedRight,
                     alignedRightMarkers = line.alignedRightMarkers,
+                    harmony = line.harmony,
                     lineStartMs = line.lineStartMs,
                     lineEndMs = line.lineEndMs,
                     words = line.words.map { word ->

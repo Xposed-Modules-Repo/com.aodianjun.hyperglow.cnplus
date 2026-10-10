@@ -83,6 +83,18 @@ data class SurfaceProfile(
      * 只作用于第一行辅助文字;第二行歌词及其辅助行不参与。默认关,关闭时逐字行为零变化。
      */
     val secondaryWordKaraoke: Boolean = false,
+    /**
+     * 辅助文字字号(相对主行的倍率百分比,50..150):100 = 历史值(与既有逐值相等)。
+     * 倍率只作用于 0.48×主行 的比例项,可读性下限不随之缩放,结果硬顶 0.62×主行
+     * (见 root.aod.secondaryReadingTextSizeSp),「辅助行不得逼近主行」的性格线不回退。
+     */
+    val secondaryTextSizePercent: Int = SECONDARY_TEXT_SIZE_PERCENT_DEFAULT,
+    /**
+     * 辅助文字自适应大小(每个 surface 独立):装得下恒用设定字号(既有呈现逐像素不变);
+     * 装不下时在 [可读性下限, 设定字号] 内缩小到刚好装下;到下限仍装不下取下限
+     * (接受溢出/裁切,与 overflow=Clip 口径一致)。
+     */
+    val secondaryAutoSize: Boolean = true,
     val lyricLineLimit: Int = DEFAULT_LYRIC_LINE_LIMIT,
     /** Show the upcoming next lyric line dimmed below the active line. */
     val showNextLine: Boolean = false,
@@ -93,7 +105,21 @@ data class SurfaceProfile(
     val secondaryNextLine: Boolean = false,
     val metadataVisible: Boolean = false,
     val metadataAnchor: String = "top",
+    /**
+     * 歌曲信息布局(`stacked` / `single`;上游 amarinne/hyperglow 99ba119 项 #1):
+     * `stacked` 按本面分隔符组装,含换行槽位时歌名在上、歌手/专辑各占一行;
+     * `single` 把所有切片用行内中点分隔符并成一行(整行按歌名字号)。
+     * 未知值一律按 `stacked` 处理(见 [normalizeMetadataLayout])。
+     */
+    val metadataLayout: String = METADATA_LAYOUT_STACKED,
     val metadataSizePercent: Int = 100,
+    /**
+     * 堆叠式歌曲信息的歌手行字号(相对歌名行的百分比,40..100,默认 80;上游
+     * amarinne/hyperglow 84a0c9ce 项 #2)。仅当歌曲信息按换行分隔符堆叠成多行时生效
+     * (见 [metadataStacksArtistLine]);行内分隔符(如 ` · `)把歌名/歌手并成一行时整行按
+     * 歌名字号,本值不参与。越界值经 [normalizeSongInfoArtistSizePercent] 回落默认值而非钳制。
+     */
+    val metadataArtistSizePercent: Int = DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT,
     /**
      * 歌曲信息(歌名/歌手)对齐:auto/start/center/end。"auto" 跟随主歌词对齐的解析结果
      * (见 resolveRowAlignmentMode),显式值独立于主对齐生效。
@@ -142,6 +168,13 @@ data class SurfaceProfile(
      * 锁屏恒 solo;关闭后快照不携带并发行,呈现与关闭前 solo 行为逐字一致。默认开(上游同值)。
      */
     val duetConcurrent: Boolean = true,
+    /**
+     * 长间奏倒计时圆点(参考 HyperLyric limczhh/HyperLyric 同名方案):本行 end 与下一行
+     * start 之间的空隙 ≥4s 时,歌词行槽位改画三个倒计时圆点(逐点点亮 + 末段渐隐),
+     * 取代上一行滞留/下一行预览。per-surface 开关,锁屏与息屏各自独立;默认开。
+     * 详见 root.aod.InterludeDots / aod.InterludeCountdown。
+     */
+    val interludeCountdown: Boolean = true,
     val rubyVisible: Boolean = true,
     val weight: String = "Medium",
     val textSize: String = "normal",
@@ -287,10 +320,18 @@ data class CompiledSurfaceProfile(
     /** 卡片背景色 token,见 [CARD_COLOR_VALUES]。仅当 backgroundStyle=="card" 时生效。 */
     val cardColor: String = "black",
     val metadataSizePercent: Int = 100,
+    /** 歌曲信息布局(stacked/single),见 [SurfaceProfile.metadataLayout];编译时经 [normalizeMetadataLayout] 归一。 */
+    val metadataLayout: String = METADATA_LAYOUT_STACKED,
+    /** 堆叠式歌曲信息的歌手行字号百分比,见 [SurfaceProfile.metadataArtistSizePercent];编译时经 [normalizeSongInfoArtistSizePercent] 归一。 */
+    val metadataArtistSizePercent: Int = DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT,
     val rubyVisible: Boolean = true,
     val secondaryTextBright: Boolean = true,
     /** 辅助文字逐字效果,见 [SurfaceProfile.secondaryWordKaraoke]。 */
     val secondaryWordKaraoke: Boolean = false,
+    /** 辅助文字字号倍率,见 [SurfaceProfile.secondaryTextSizePercent];编译时经 [normalizeSecondaryTextSizePercent] 归一。 */
+    val secondaryTextSizePercent: Int = SECONDARY_TEXT_SIZE_PERCENT_DEFAULT,
+    /** 辅助文字自适应大小,见 [SurfaceProfile.secondaryAutoSize]。 */
+    val secondaryAutoSize: Boolean = true,
     val lyricLineLimit: Int = DEFAULT_LYRIC_LINE_LIMIT,
     /** Show the upcoming next lyric line dimmed below the active line. */
     val showNextLine: Boolean = false,
@@ -318,6 +359,8 @@ data class CompiledSurfaceProfile(
     val duetAlignment: Boolean = true,
     /** 对唱并发行开关,见 [SurfaceProfile.duetConcurrent];仅息屏面消费,锁屏编译进档但不渲染。 */
     val duetConcurrent: Boolean = true,
+    /** 长间奏倒计时圆点开关,见 [SurfaceProfile.interludeCountdown];每个 surface 独立生效。 */
+    val interludeCountdown: Boolean = true,
     /** 歌曲信息显示部分;由该 surface 的 [SurfaceProfile.metadataParts] 解析(空则继承文档级)编译而来。 */
     val metadataParts: String = METADATA_PARTS_DEFAULT,
     /** 歌曲信息逐槽分隔符序列;由该 surface 的 [SurfaceProfile.metadataSeparators] 解析编译而来。 */
@@ -347,6 +390,139 @@ internal fun normalizeLyricLineLimit(value: Int): Int = when (value) {
     in 1..5 -> value
     else -> DEFAULT_LYRIC_LINE_LIMIT
 }
+
+/** 辅助文字字号倍率下限(相对主行百分比)。 */
+const val SECONDARY_TEXT_SIZE_PERCENT_MIN = 50
+
+/**
+ * 辅助文字字号倍率上限:0.48×1.5 = 0.72 会被 0.62×主行的硬顶截住,上限天然饱和
+ * (上限本身就是「倍率项不失真」的边界)。
+ */
+const val SECONDARY_TEXT_SIZE_PERCENT_MAX = 150
+
+/** 辅助文字字号默认倍率(100% = 与历史字号公式逐值相等)。 */
+const val SECONDARY_TEXT_SIZE_PERCENT_DEFAULT = 100
+
+/**
+ * 辅助文字内容档「和声」:x-bg 回声(插件行 role=BG)作为辅助行内容——音标/翻译不取,
+ * 和声行照常走辅助行车道。与「显示并发歌词(对唱)」开关解耦:选中本档时和声候选不再要求
+ * 该开关(参考 HyperLyric 把和声与对唱拆成两个开关;CN+ 此前两者共用一个)。
+ */
+const val SECONDARY_MODE_BACKGROUND_VOCAL = "BackgroundVocal"
+
+/**
+ * 辅助文字内容档「不要和声」:多选样式的显式关闭位。词表里恒有且只有一个和声状态位
+ * ([SECONDARY_MODE_BACKGROUND_VOCAL] 或本值),历史四档(不含状态位)按「显示和声」解释
+ * ——既保历史行为逐字节不变,也让多选写出的值永不与历史档撞名(见 [normalizeAuxMode])。
+ */
+const val SECONDARY_MODE_NO_HARMONY = "NoHarmony"
+
+/** 辅助文字内容词表(多选样式的条目,顺序即摘要与规范序)。 */
+val SECONDARY_CONTENT_TOKENS = listOf(
+    "Transliteration",
+    "Translation",
+    SECONDARY_MODE_BACKGROUND_VOCAL
+)
+
+/** 历史四档 + #246 的和声档:按「显示和声」解释,归一化时原样保留(不与多选值混同)。 */
+private val SECONDARY_LEGACY_MODES = setOf(
+    "Main only",
+    "Transliteration",
+    "Translation",
+    "Both",
+    SECONDARY_MODE_BACKGROUND_VOCAL
+)
+
+private fun auxTokenSet(mode: String): Set<String> =
+    mode.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+
+/** 第一行辅助行是否取音标(转写)。历史档与多选档同源判据。 */
+fun auxShowsReading(mode: String): Boolean =
+    mode == "Transliteration" || mode == "Both" || "Transliteration" in auxTokenSet(mode)
+
+/** 第一行辅助行是否取翻译。历史档与多选档同源判据。 */
+fun auxShowsTranslation(mode: String): Boolean =
+    mode == "Translation" || mode == "Both" || "Translation" in auxTokenSet(mode)
+
+/**
+ * 和声辅助行是否显示:历史档恒显示(行为不变);多选档按状态位——显式关闭位
+ * [SECONDARY_MODE_NO_HARMONY] 在则隐藏。
+ */
+fun auxHarmonyShown(mode: String): Boolean =
+    mode in SECONDARY_LEGACY_MODES || SECONDARY_MODE_NO_HARMONY !in auxTokenSet(mode)
+
+/**
+ * 和声候选是否与「显示并发歌词(对唱)」解耦放行:历史和声档(选中即放行)或多选里勾了和声
+ * ——此时即使本面关掉对唱开关也要拿到和声候选(见 AodStateProjector / LyricCanvasMapper)。
+ */
+fun auxHarmonyAsAux(mode: String): Boolean =
+    mode == SECONDARY_MODE_BACKGROUND_VOCAL ||
+        SECONDARY_MODE_BACKGROUND_VOCAL in auxTokenSet(mode)
+
+/**
+ * 辅助文字模式归一(编译 / SystemUI 二次校验 / AOD 归一化 / Spicy 桥 / 设置页共用一份,
+ * 各处不一致会让 wire 的 validate_rewrote_fields 拒收整份配置):
+ * 历史档原样保留;多选值按词表规范化(去重、定序、和声状态位恒有且只有一个)。
+ */
+fun normalizeAuxMode(value: String?): String {
+    val v = value?.trim().orEmpty()
+    if (v.isEmpty()) return "Main only"
+    if (v in SECONDARY_LEGACY_MODES) return v
+    val tokens = auxTokenSet(v)
+    val hasContent = "Transliteration" in tokens || "Translation" in tokens
+    val hasHarmonyState = SECONDARY_MODE_BACKGROUND_VOCAL in tokens ||
+        SECONDARY_MODE_NO_HARMONY in tokens
+    // 词表外的值(历史遗留/损坏配置)按历史缺省「仅主歌词」处理,不臆造内容档。
+    if (!hasContent && !hasHarmonyState) return "Main only"
+    val harmonyOff = SECONDARY_MODE_NO_HARMONY in tokens
+    val out = ArrayList<String>(3)
+    if ("Transliteration" in tokens) out += "Transliteration"
+    if ("Translation" in tokens) out += "Translation"
+    out += if (harmonyOff) SECONDARY_MODE_NO_HARMONY else SECONDARY_MODE_BACKGROUND_VOCAL
+    return out.joinToString(",")
+}
+
+/**
+ * 多选样式的勾选态:内容条目在 [mode] 下是否选中(设置页与摘要共用同一判据)。
+ */
+fun auxContentChecked(mode: String, token: String): Boolean = when (token) {
+    "Transliteration" -> auxShowsReading(mode)
+    "Translation" -> auxShowsTranslation(mode)
+    SECONDARY_MODE_BACKGROUND_VOCAL -> auxHarmonyShown(mode)
+    else -> false
+}
+
+/**
+ * 多选样式的一次勾选/取消:在 [mode] 上翻转 [token] 后按 [normalizeAuxMode] 规范落地。
+ * 非词表条目原样返回(防误写)。
+ */
+fun toggleAuxContent(mode: String, token: String): String {
+    if (token !in SECONDARY_CONTENT_TOKENS) return mode
+    val tokens = auxTokenSet(mode).toMutableSet()
+    // 历史档先展开成显式集合:历史档恒含和声,展开后与多选语义同源。
+    if (mode in SECONDARY_LEGACY_MODES) {
+        tokens.clear()
+        if (mode == "Transliteration" || mode == "Both") tokens += "Transliteration"
+        if (mode == "Translation" || mode == "Both") tokens += "Translation"
+        tokens += SECONDARY_MODE_BACKGROUND_VOCAL
+    }
+    if (token in tokens) tokens -= token else tokens += token
+    if (token == SECONDARY_MODE_BACKGROUND_VOCAL && token in tokens) {
+        tokens -= SECONDARY_MODE_NO_HARMONY
+    }
+    if (token == SECONDARY_MODE_BACKGROUND_VOCAL && token !in tokens) {
+        tokens += SECONDARY_MODE_NO_HARMONY
+    }
+    return normalizeAuxMode(tokens.joinToString(","))
+}
+
+
+/**
+ * 辅助文字字号倍率归一:compile 与 SystemUI 二次校验必须调用同一份(两处归一不一致会让
+ * wire 的 validate_rewrote_fields 拒收整份配置,实机表现为「设置页正常、实机毫无变化」)。
+ */
+internal fun normalizeSecondaryTextSizePercent(value: Int): Int =
+    value.coerceIn(SECONDARY_TEXT_SIZE_PERCENT_MIN, SECONDARY_TEXT_SIZE_PERCENT_MAX)
 
 /** 换行动画的「跟随音源」哨兵值:不覆盖歌词源自带的过渡偏好。 */
 const val LINE_TRANSITION_AUTO = "Auto"
@@ -455,6 +631,21 @@ const val METADATA_SEPARATOR_NEWLINE = "newline"
 
 /** 默认逐槽分隔符序列(默认两部分之间一个换行)。 */
 const val METADATA_SEPARATORS_DEFAULT = METADATA_SEPARATOR_NEWLINE
+
+// --- 歌曲信息布局:stacked / single(上游 amarinne/hyperglow 99ba119 项 #1) ---
+
+/** 堆叠布局:含换行槽位时歌名在上、歌手/专辑各占一行(历史默认行为)。 */
+const val METADATA_LAYOUT_STACKED = "stacked"
+
+/** 单行布局:所有切片用行内中点分隔符并成一行,整行按歌名字号。 */
+const val METADATA_LAYOUT_SINGLE = "single"
+
+/** 歌曲信息布局 token 词表(设置界面选项来源)。 */
+val METADATA_LAYOUTS = listOf(METADATA_LAYOUT_STACKED, METADATA_LAYOUT_SINGLE)
+
+/** 布局归一:只有 `single` 走单行,其余(含未知/空值)一律按 [METADATA_LAYOUT_STACKED]。 */
+internal fun normalizeMetadataLayout(value: String?): String =
+    if (value == METADATA_LAYOUT_SINGLE) METADATA_LAYOUT_SINGLE else METADATA_LAYOUT_STACKED
 
 /** 歌曲信息分隔符 token 词表;"newline" 为换行,其余为行内分隔符(见 [metadataSeparatorText])。 */
 val METADATA_SEPARATORS = listOf(
@@ -571,6 +762,46 @@ internal fun metadataExpectedExtraLines(parts: String, separators: String): Int 
         .count { it == METADATA_SEPARATOR_NEWLINE }
     return (newlineGaps - 1).coerceAtLeast(0)
 }
+
+// --- 歌曲信息:堆叠式歌手字号(上游 amarinne/hyperglow 84a0c9ce 项 #2) ---
+
+/**
+ * 堆叠式歌曲信息的歌手行默认字号(相对歌名行的百分比):80 复刻出厂的小字号歌手行,
+ * 设置界面把范围收在 40..100,歌手段永不大于其上方歌名。
+ */
+const val DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT = 80
+const val MIN_SONG_INFO_ARTIST_SIZE_PERCENT = 40
+const val MAX_SONG_INFO_ARTIST_SIZE_PERCENT = 100
+
+/**
+ * 堆叠式歌手行字号归一:越界/零值回落出厂默认而非钳制(上游同语义)——坏文档渲染出默认的
+ * 层级关系,而不是被钳到 0 变成零高行(行盒按字号量 ascent/descent,零字号行高为 0)。
+ * compile 与 SystemUI 二次校验必须调用同一份(两处归一不一致会让 wire 的
+ * validate_rewrote_fields 拒收整份配置,实机表现为「设置页正常、实机毫无变化」)。
+ */
+internal fun normalizeSongInfoArtistSizePercent(value: Int): Int =
+    if (value in MIN_SONG_INFO_ARTIST_SIZE_PERCENT..MAX_SONG_INFO_ARTIST_SIZE_PERCENT) {
+        value
+    } else {
+        DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT
+    }
+
+/**
+ * 歌曲信息是否堆叠出独立的歌手行(第 0 行歌名之后的各行按歌手字号渲染):
+ * [layout] 为 `single`(全部切片并成一行)时恒为 false;否则按本面有效 parts/separators
+ * 组装后至少含一个换行槽位、且显示部分 ≥2 个。行内分隔符(如 ` · `)把各部分并成一行时
+ * 同样恒为 false —— 整行按歌名字号,歌手字号设置对结果无影响(设置界面据此隐藏该项)。
+ */
+internal fun metadataStacksArtistLine(
+    parts: String,
+    separators: String,
+    layout: String = METADATA_LAYOUT_STACKED
+): Boolean =
+    normalizeMetadataLayout(layout) == METADATA_LAYOUT_STACKED &&
+        metadataGapCount(parts) > 0 &&
+        normalizeMetadataSeparators(separators, parts)
+            .split(',')
+            .any { it == METADATA_SEPARATOR_NEWLINE }
 
 // --- 歌曲图片:形状与旋转 ---
 

@@ -79,6 +79,8 @@
     <string name="summary_lyric_source_superlyric">使用 SuperLyric Xposed 模块，通过 Binder 实时推送当前歌词行。</string>
     <string name="summary_lyric_source_lyricinfo">使用 LyricInfo Xposed 模块，读取注入到媒体会话元数据中的歌词。</string>
     <string name="setting_filter_non_music_sources">视频等非音乐音频不显示歌词</string>
+    <string name="setting_hide_credit_lines">不显示非歌词内容（作词/作曲等）</string>
+    <string name="summary_hide_credit_lines">把「作词/作曲/编曲」这类制作名单行当作非歌词隐藏，不在息屏与锁屏上显示；遇到这类行时自动显示下一句歌词或播放占位符。</string>
     <string name="summary_filter_non_music_sources">识别当前音频源（播放器应用与会话声明的音频内容类型）：视频、播客等非音乐内容播放时不显示歌词。</string>
     <string name="label_active_source">当前歌词源</string>
     <string name="summary_active_source">%1$s · %2$s</string>
@@ -363,6 +365,11 @@
     <string name="summary_lyric_time_offset">正数延后显示,负数提前显示(±5 秒)</string>
 <string name="setting_duet_concurrent">显示并发歌词（对唱）</string>
 <string name="summary_duet_concurrent">另一行唱词与主行播放窗口重叠达到 1 秒时,两行同时显示、各画各的逐字扫光。锁屏与息屏各自独立开关。</string>
+    <string name="setting_interlude_countdown">长间奏显示倒计时圆点</string>
+    <string name="summary_interlude_countdown">当前行与下一行之间的空隙达到 4 秒时,歌词行位置改画三个圆点,随下一行临近逐点点亮再渐隐。锁屏与息屏各自独立开关。</string>
+    <string name="setting_secondary_text_size">辅助文字大小</string>
+    <string name="setting_secondary_auto_size">辅助文字自适应大小</string>
+    <string name="summary_secondary_auto_size">装不下时缩小到可读下限</string>
     <string name="setting_bright_secondary_text">高亮辅助文字</string>
     <string name="setting_secondary_word_karaoke">辅助文字逐字效果</string>
     <string name="summary_secondary_word_karaoke">第一行辅助文字(音标/翻译)随歌词逐字点亮;源未提供逐字时间时按行窗口合成推进。第二行歌词及其辅助文字不受影响。</string>
@@ -375,6 +382,10 @@
     <string name="setting_show_next_line">显示下一行歌词</string>
     <string name="setting_show_song_info">显示歌曲信息</string>
     <string name="choice_song_info_position">歌曲信息位置</string>
+    <string name="choice_song_info_layout">歌曲信息布局</string>
+    <string name="option_song_info_layout_stacked">堆叠</string>
+    <string name="option_song_info_layout_single">单行</string>
+    <string name="setting_song_info_artist_size">歌手行大小</string>
     <string name="setting_song_info_size">歌曲信息大小</string>
     <string name="setting_song_info_parts">歌曲信息内容</string>
     <string name="setting_hide_album_same_as_title">专辑与歌名一致时隐藏专辑</string>
@@ -481,6 +492,7 @@
     <string name="option_transliteration">转写</string>
     <string name="option_translation">翻译</string>
     <string name="option_both">两者</string>
+    <string name="option_background_vocal">和声</string>
     <string name="option_wrap">换行</string>
     <string name="option_clip">裁切</string>
     <string name="option_regular">常规</string>

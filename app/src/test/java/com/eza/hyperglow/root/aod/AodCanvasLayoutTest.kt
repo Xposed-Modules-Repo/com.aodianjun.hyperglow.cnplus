@@ -297,6 +297,138 @@ class AodCanvasLayoutTest {
     }
 
     @Test
+    fun canvasContentCarriesProfileSongInfoLayoutAndArtistSize() {
+        val profile = SceneCompiler.compile(
+            CustomizationDocument(
+                profiles = mapOf(
+                    SceneCompiler.SURFACE_AOD to SurfaceProfile(
+                        metadataVisible = true,
+                        metadataLayout = "single",
+                        metadataArtistSizePercent = 55,
+                        widgets = listOf(WidgetSpec("lyrics"), WidgetSpec("metadata"))
+                    )
+                )
+            )
+        ).profiles.getValue(SceneCompiler.SURFACE_AOD)
+        val snapshot = LyricSnapshot(original = "line", metadata = "Song\nArtist")
+
+        val mapped = snapshot.toAodCanvasContent(profile)
+        assertEquals("single", mapped.metadataLayout)
+        assertEquals(55, mapped.metadataArtistSizePercent)
+        // 未给 profile 时按出厂默认:堆叠 + 80%。
+        val fallback = snapshot.toAodCanvasContent(null)
+        assertEquals("stacked", fallback.metadataLayout)
+        assertEquals(80, fallback.metadataArtistSizePercent)
+    }
+
+    @Test
+    fun metadataPiecesSplitOnNewlineAndMiddleDot() {
+        assertEquals(listOf("Song", "Artist"), metadataLineTexts("Song\nArtist"))
+        assertEquals(listOf("Song", "Artist"), metadataLineTexts("Song · Artist"))
+        assertEquals(emptyList<String>(), metadataLineTexts(""))
+        assertEquals(listOf("Song"), metadataLineTexts("  Song  "))
+    }
+
+    @Test
+    fun singleLayoutJoinsPiecesWithMiddleDot() {
+        assertEquals("Song · Artist", metadataSingleLineText("Song\nArtist"))
+        assertEquals("", metadataSingleLineText(""))
+        assertEquals("Song", metadataSingleLineText("Song"))
+    }
+
+    @Test
+    fun stackedSongInfoStylesEveryPieceAfterTitleAsArtist() {
+        assertEquals(setOf(1), metadataArtistPieceIndexes(2))
+        assertEquals(setOf(1, 2), metadataArtistPieceIndexes(3))
+        assertEquals(emptySet<Int>(), metadataArtistPieceIndexes(1))
+        assertEquals(emptySet<Int>(), metadataArtistPieceIndexes(0))
+    }
+
+    @Test
+    fun uniformLineStackMatchesTheSingleSizeStepExactly() {
+        // 全同字号的块必须逐值等于旧的单一行盒步进,混合字号支持不能挪动普通歌词行。
+        val ascent = -30f
+        val descent = 8f
+        val offsets = mixedSizeLineBaselineOffsets(
+            floatArrayOf(ascent, ascent, ascent),
+            floatArrayOf(descent, descent, descent)
+        )
+        assertEquals(0f, offsets[0], 0.0001f)
+        assertEquals(38f, offsets[1], 0.0001f)
+        assertEquals(76f, offsets[2], 0.0001f)
+        assertEquals(
+            3f * (descent - ascent),
+            mixedSizeLineStackHeight(
+                offsets,
+                floatArrayOf(ascent, ascent, ascent),
+                floatArrayOf(descent, descent, descent)
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun mixedSizeStackPullsSmallLineUpUnderTheLargeOne() {
+        val titleAscent = -30f
+        val titleDescent = 8f
+        val artistAscent = -24f
+        val artistDescent = 6f
+        val offsets = mixedSizeLineBaselineOffsets(
+            floatArrayOf(titleAscent, artistAscent),
+            floatArrayOf(titleDescent, artistDescent)
+        )
+        // 步进 = 歌名 descent(8) − 歌手 ascent(−24) = 32,小于按歌名行盒推的 38。
+        assertEquals(32f, offsets[1], 0.0001f)
+        assertTrue(offsets[1] < titleDescent - titleAscent)
+        assertEquals(
+            offsets[1] + artistDescent - titleAscent,
+            mixedSizeLineStackHeight(
+                offsets,
+                floatArrayOf(titleAscent, artistAscent),
+                floatArrayOf(titleDescent, artistDescent)
+            ),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun emptyAndMismatchedMetricArraysDegradeToZero() {
+        val empty = mixedSizeLineBaselineOffsets(FloatArray(0), FloatArray(0))
+        assertEquals(0, empty.size)
+        assertEquals(0f, mixedSizeLineStackHeight(empty, FloatArray(0), FloatArray(0)), 0.0001f)
+        val ragged = mixedSizeLineBaselineOffsets(floatArrayOf(-10f, -10f, -10f), floatArrayOf(2f))
+        assertEquals(1, ragged.size)
+    }
+
+    @Test
+    fun songInfoArtistScaleFollowsSettingWithinEditorBounds() {
+        assertEquals(0.8f, songInfoArtistScale(80), 0.0001f)
+        assertEquals(0.4f, songInfoArtistScale(40), 0.0001f)
+        assertEquals(1f, songInfoArtistScale(100), 0.0001f)
+        // 越界值钳在编辑器范围内,而不是画出零高/超大行。
+        assertEquals(0.4f, songInfoArtistScale(0), 0.0001f)
+        assertEquals(1f, songInfoArtistScale(400), 0.0001f)
+    }
+
+    @Test
+    fun originalLineBaselineFallsBackToUniformStepWithoutOffsets() {
+        assertEquals(
+            100f + 2f * (40f + 4f) + 3f + 5f,
+            originalLineBaseline(100f, 2, 40f, 3f, 5f, 4f),
+            0.0001f
+        )
+    }
+
+    @Test
+    fun originalLineBaselineUsesMixedOffsetsWhenSupplied() {
+        assertEquals(
+            100f + 32f + 3f + 5f,
+            originalLineBaseline(100f, 1, 38f, 3f, 5f, 4f, floatArrayOf(0f, 32f)),
+            0.0001f
+        )
+    }
+
+    @Test
     fun artworkGeometryScalesWithMetadataTextSize() {
         // 槽边长 = 歌曲信息字号 × 1.6;前置宽度 = 槽 + 6dp 间距(实机与预览同源)。
         assertEquals(16f, artworkSidePx(10f), 0.0001f)
@@ -846,6 +978,8 @@ class AodCanvasLayoutTest {
         assertFalse(hasFirstLineAuxText("Transliteration", "", "trans"))
         assertFalse(hasFirstLineAuxText("Translation", "roma", ""))
         assertFalse(hasFirstLineAuxText("Both", "", ""))
+        // 「和声」档不取音标/翻译:和声行走自己的辅助行车道(内容非空也不出第一行辅助行)。
+        assertFalse(hasFirstLineAuxText("BackgroundVocal", "roma", "trans"))
     }
 
     @Test
@@ -1724,6 +1858,84 @@ class AodCanvasLayoutTest {
         assertEquals(
             listOf(0 until 1, 1 until 2),
             balancedChunkRanges(listOf(140f, 40f), 120f, 3)
+        )
+    }
+
+    @Test
+    fun clausePunctuationEndsPhrasesForLineBreaks() {
+        assertTrue(endsWithClausePunctuation("pire,"))
+        assertTrue(endsWithClausePunctuation("toi."))
+        assertTrue(endsWithClausePunctuation("vraiment ? »"))
+        assertTrue(endsWithClausePunctuation("終わり。"))
+        assertFalse(endsWithClausePunctuation("toi"))
+        assertFalse(endsWithClausePunctuation("(toi)"))
+        assertFalse(endsWithClausePunctuation(""))
+    }
+
+    @Test
+    fun balancedSplitPrefersCommaBreakWhenItNeedsNoExtraLine() {
+        val widths = listOf(20f, 50f, 45f, 30f, 20f, 35f)
+        // 不带标点提示时,均衡断点落在 "c'est" 之后。
+        assertEquals(
+            listOf(0 until 3, 3 until 6),
+            balancedChunkRanges(widths, 130f, 2)
+        )
+        // "Le pire," 单独成行后余下部分放得下第二行,于是同为两行时逗号断点胜出。
+        assertEquals(
+            listOf(0 until 2, 2 until 6),
+            balancedChunkRanges(
+                widths,
+                130f,
+                2,
+                breakAfter = listOf(false, true, false, false, false, false)
+            )
+        )
+    }
+
+    @Test
+    fun punctuationHintNeverAddsAnotherLine() {
+        assertEquals(
+            listOf(0 until 2, 2 until 4),
+            balancedChunkRanges(
+                listOf(50f, 50f, 50f, 50f),
+                100f,
+                3,
+                breakAfter = listOf(false, false, true, false)
+            )
+        )
+    }
+
+    @Test
+    fun punctuationWeightingStaysInertWithoutUsableBreaks() {
+        // 无标点提示(空表/全 false)时结果与加权前逐值一致。
+        val widths = listOf(40f, 40f, 40f, 40f)
+        assertEquals(
+            balancedChunkRanges(widths, 120f, 3),
+            balancedChunkRanges(widths, 120f, 3, breakAfter = emptyList())
+        )
+        assertEquals(
+            balancedChunkRanges(widths, 120f, 3),
+            balancedChunkRanges(widths, 120f, 3, breakAfter = listOf(false, false, false, false))
+        )
+        val uneven = listOf(20f, 50f, 45f, 30f, 20f, 35f)
+        assertEquals(
+            balancedChunkRanges(uneven, 130f, 2),
+            balancedChunkRanges(
+                uneven,
+                130f,
+                2,
+                breakAfter = listOf(false, false, false, false, false, false)
+            )
+        )
+        // 末块以标点结尾不构成行间断点,断点与无提示时一致。
+        assertEquals(
+            balancedChunkRanges(uneven, 130f, 2),
+            balancedChunkRanges(
+                uneven,
+                130f,
+                2,
+                breakAfter = listOf(false, false, false, false, false, true)
+            )
         )
     }
 

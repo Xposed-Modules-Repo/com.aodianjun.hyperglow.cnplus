@@ -111,6 +111,7 @@ class AodStateProjectorTest {
         translatedLine: String = "",
         lineIndex: Int = -1,
         words: List<LyricWord>? = null,
+        translationWords: List<LyricWord> = emptyList(),
         alignedRight: Boolean = false,
         lineStartMs: Long = 0L,
         lineEndMs: Long = 0L,
@@ -118,6 +119,9 @@ class AodStateProjectorTest {
         layoutGroups: List<LyricLayoutGroup> = emptyList(),
         hasTimedLyrics: Boolean = true,
         nextLineStartMs: Long? = null,
+        nextLine: String = "",
+        nextLineRomanized: String = "",
+        nextLineTranslated: String = "",
         language: String = "",
         positionMs: Long = 0L,
         durationMs: Long = 180_000L,
@@ -152,6 +156,7 @@ class AodStateProjectorTest {
         playing = playing,
         receivedAtElapsedMs = sampledAtElapsedMs,
         words = words,
+        translationWords = translationWords,
         renderModes = renderModes(),
         lyricKind = lyricKind,
         alignedRight = alignedRight,
@@ -161,6 +166,9 @@ class AodStateProjectorTest {
         layoutGroups = layoutGroups,
         hasTimedLyrics = hasTimedLyrics,
         nextLineStartMs = nextLineStartMs,
+        nextLine = nextLine,
+        nextLineRomanized = nextLineRomanized,
+        nextLineTranslated = nextLineTranslated,
         language = language
     )
 
@@ -178,6 +186,45 @@ class AodStateProjectorTest {
             powerSessionPolicy = AodPowerSessionPolicy(),
             userId = 0
         )
+
+    // --- 插件逐字翻译词表(translationWords,翻译辅助行按真实词窗点亮)---
+
+    @Test
+    fun pluginTranslationWordsAreForwardedForActiveLine() {
+        val s = state(
+            line = "I love you",
+            translatedLine = "我爱你",
+            lineIndex = 0,
+            lineStartMs = 0L,
+            lineEndMs = 2_000L,
+            words = listOf(LyricWord("I love you", "", 0L, 2_000L, true)),
+            translationWords = listOf(
+                LyricWord("我", "", 0L, 600L, true),
+                LyricWord(" 爱", "", 600L, 1_200L, true),
+                LyricWord(" 你", "", 1_200L, 2_000L, true)
+            )
+        )
+        val out = project(s)
+
+        assertEquals(3, out.translationWords.size)
+        assertEquals(listOf("我", " 爱", " 你"), out.translationWords.map { it.text })
+        assertEquals(600L, out.translationWords[1].startMs)
+        assertEquals(2_000L, out.translationWords[2].endMs)
+    }
+
+    /** 无活动行(空档占位符)时不携带逐字翻译词表——与 words 同一门控。 */
+    @Test
+    fun pluginTranslationWordsAreDroppedWithoutActiveLine() {
+        val s = state(
+            line = "",
+            translatedLine = "我爱你",
+            lineIndex = -1,
+            translationWords = listOf(LyricWord("我", "", 0L, 600L, true))
+        )
+        val out = project(s)
+
+        assertTrue(out.translationWords.isEmpty())
+    }
 
     // --- 语言不一致的日语假名注音(上游 8422d78)---
 
@@ -999,6 +1046,131 @@ class AodStateProjectorTest {
         assertEquals("下一句", out.nextLine)
     }
 
+    // --- 长间奏倒计时圆点(参考 HyperLyric「歌词长间奏显示倒计时圆点」)---
+    // 投影层只下发**原始空隙**两端(上一行 end .. 下一行 start);延迟与 per-surface
+    // 开关都在渲染映射层解析(见 root.aod.interludeDotsWindow)。
+
+    @Test
+    fun interludeSpanIsCarriedWhenGapReachesFourSeconds() {
+        // 活动行 end=7s,下一行 start=13s:空隙 6s ≥ 4s → 下发原始窗口。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "正在唱",
+            lineIndex = 0,
+            lineStartMs = 5_000L,
+            lineEndMs = 7_000L,
+            nextLineStartMs = 13_000L,
+            positionMs = 6_000L
+        )
+        val out = project(s)
+        assertEquals(7_000L, out.interludeStartMs)
+        assertEquals(13_000L, out.interludeEndMs)
+    }
+
+    @Test
+    fun interludeSpanIsOmittedForShortGaps() {
+        // 空隙 3s(< 4s):不下发——3 个圆点在这么短的空隙里只是一闪而过的噪音。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "正在唱",
+            lineIndex = 0,
+            lineStartMs = 5_000L,
+            lineEndMs = 7_000L,
+            nextLineStartMs = 10_000L,
+            positionMs = 6_000L
+        )
+        val out = project(s)
+        assertEquals(0L, out.interludeStartMs)
+        assertEquals(0L, out.interludeEndMs)
+    }
+
+    @Test
+    fun interludeSpanIsOmittedWithoutNextLineStart() {
+        // 缺下一行起点(生产者未给出):不臆造窗口终点。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "正在唱",
+            lineIndex = 0,
+            lineStartMs = 5_000L,
+            lineEndMs = 7_000L,
+            nextLineStartMs = null,
+            positionMs = 6_000L
+        )
+        val out = project(s)
+        assertEquals(0L, out.interludeStartMs)
+        assertEquals(0L, out.interludeEndMs)
+    }
+
+    @Test
+    fun interludeSpanIsDroppedWhenNoSurfaceWantsTheCountdown() {
+        // 两面开关都关闭 → 源头撤走(与 duetConcurrent 同式:画布无 per-build 间奏状态)。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "正在唱",
+            lineIndex = 0,
+            lineStartMs = 5_000L,
+            lineEndMs = 7_000L,
+            nextLineStartMs = 13_000L,
+            positionMs = 6_000L
+        )
+        val bothOff = compiled.copy(
+            profiles = linkedMapOf(
+                SceneCompiler.SURFACE_LOCKSCREEN to
+                    compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN)
+                        .copy(interludeCountdown = false),
+                SceneCompiler.SURFACE_AOD to
+                    aodProfile(enabled = true, metadataVisible = true).copy(interludeCountdown = false)
+            )
+        )
+        val out = project(s, compiled = bothOff)
+        assertEquals(0L, out.interludeStartMs)
+        assertEquals(0L, out.interludeEndMs)
+
+        // 只开一面即携带(渲染面按自己的开关解析,数据面不做 per-surface 剪裁)。
+        val lockscreenOnly = compiled.copy(
+            profiles = linkedMapOf(
+                SceneCompiler.SURFACE_LOCKSCREEN to
+                    compiled.profiles.getValue(SceneCompiler.SURFACE_LOCKSCREEN),
+                SceneCompiler.SURFACE_AOD to
+                    aodProfile(enabled = true, metadataVisible = true).copy(interludeCountdown = false)
+            )
+        )
+        val carried = project(s, compiled = lockscreenOnly)
+        assertEquals(7_000L, carried.interludeStartMs)
+        assertEquals(13_000L, carried.interludeEndMs)
+    }
+
+    @Test
+    fun interludeSpanYieldsToLargeMetadataIntro() {
+        // 既有「开场/间奏大元数据」引导优先:引导显示期间不下发间奏窗口,既有元数据
+        // 行为零改动(圆点让位于引导,引导结束后按剩余窗口继续)。
+        // 构造:无活动行(行文本为空)但状态携带一条覆盖该位置的占位行窗口(Spicy 的
+        // 空白间奏行),lyricState=INTERLUDE —— 策略在引导窗口内返回 true。
+        fun state(metaAvailable: Boolean) = state(
+            lyricKind = LyricKind.LINE,
+            hasTimedLyrics = true,
+            line = "",
+            lineIndex = 0,
+            lineStartMs = 2_000L,
+            lineEndMs = 8_000L,
+            positionMs = 1_000L,
+            nextLineStartMs = 20_000L,
+            title = if (metaAvailable) "Title" else "",
+            artist = if (metaAvailable) "Artist" else ""
+        )
+        // 有元数据 → 引导显示中 → 窗口不下发(元数据仍占主行位置)。
+        val withIntro = project(state(metaAvailable = true))
+        assertTrue(withIntro.metadata.contains("Title"))
+        assertTrue(withIntro.metadata.contains("Artist"))
+        assertEquals(0L, withIntro.interludeStartMs)
+        assertEquals(0L, withIntro.interludeEndMs)
+        // 无元数据(引导不启动)→ 同一份状态照样拿到窗口:证明上面的 0/0 确实是大
+        // 元数据门控造成的,而不是这条状态本身没有长间奏。
+        val withoutIntro = project(state(metaAvailable = false))
+        assertEquals(2_000L, withoutIntro.interludeStartMs)
+        assertEquals(20_000L, withoutIntro.interludeEndMs)
+    }
+
     @Test
     fun activeLineIgnoresPreviewEvenWithNextLinePresent() {
         // 有活动行 → 完全不变:主行/辅助行/下一行槽位/窗口都保持原行为。
@@ -1117,4 +1289,125 @@ class AodStateProjectorTest {
         assertEquals(0L, out.lineEndMs)
     }
 
+    // --- 「不显示非歌词内容(作词/作曲等)」---
+
+    private fun creditPrefs(hideCreditLines: Boolean) = prefs.copy(hideCreditLines = hideCreditLines)
+
+    private fun projectWithPrefs(
+        state: LyricProducerState,
+        hideCreditLines: Boolean,
+        now: Long = 0L
+    ): AodDisplayState =
+        projectToDisplay(
+            state = state,
+            now = now,
+            prefs = creditPrefs(hideCreditLines),
+            compiled = compiled,
+            metadataIntroPolicy = SongMetadataIntroPolicy(),
+            powerSessionPolicy = AodPowerSessionPolicy(),
+            userId = 0
+        )
+
+    @Test
+    fun creditLinesAreShownWhenTheSwitchIsOff() {
+        // 默认(关闭)零行为变化:名单行照常显示——历史行为与 LyricOpeningFilter 的
+        // 保守语义(作词/作曲不隐藏)都由本用例钉住。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "作词：张三",
+            lineIndex = 0,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_000L
+        )
+        val out = projectWithPrefs(s, hideCreditLines = false)
+        assertEquals("作词：张三", out.original)
+    }
+
+    @Test
+    fun creditLineIsReplacedByNextLyricWhenTheSwitchIsOn() {
+        // 名单行不当主行:与实机的空档预览同口径,主行提前显示下一行真实歌词。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "作词：张三",
+            lineIndex = 0,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_000L,
+            nextLine = "真正的第一句歌词",
+            nextLineStartMs = 3_000L
+        )
+        val out = projectWithPrefs(s, hideCreditLines = true)
+        assertEquals("真正的第一句歌词", out.original)
+        // 下一行已被顶到主行 → 「下一行」槽位清空,同一句不出现两次。
+        assertEquals("", out.nextLine)
+        assertFalse(out.lineLevelSync)
+        assertTrue(out.words.isEmpty())
+    }
+
+    @Test
+    fun creditLineFallsBackToPlaceholderWhenNoRealNextLineExists() {
+        // 名单行且下一行也是名单 → 不把名单搬到主行/下一行,回落到播放占位符。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "作词：张三",
+            lineIndex = 0,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_000L,
+            nextLine = "作曲：李四",
+            nextLineStartMs = 3_000L
+        )
+        val out = projectWithPrefs(s, hideCreditLines = true)
+        assertEquals("🎶", out.original)
+        assertEquals("", out.nextLine)
+    }
+
+    @Test
+    fun creditNextLineIsDroppedFromTheNextLineSlot() {
+        // 主行是正常歌词、下一行是名单:下一行槽位清空,主行不变。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "真正的歌词",
+            lineIndex = 0,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_000L,
+            nextLine = "作曲：李四",
+            nextLineRomanized = "zuò qǔ",
+            nextLineTranslated = "composer",
+            nextLineStartMs = 3_000L
+        )
+        val out = projectWithPrefs(s, hideCreditLines = true)
+        assertEquals("真正的歌词", out.original)
+        assertEquals("", out.nextLine)
+        assertEquals("", out.nextLineRomanized)
+        assertEquals("", out.nextLineTranslated)
+        // 关闭开关时同状态下发原值(零回归)。
+        val off = projectWithPrefs(s, hideCreditLines = false)
+        assertEquals("作曲：李四", off.nextLine)
+        assertEquals("zuò qǔ", off.nextLineRomanized)
+    }
+
+    @Test
+    fun normalLyricsAreUnaffectedByTheSwitch() {
+        // 普通歌词:开关开与关逐字段一致(保守原则的外层验证)。
+        val s = state(
+            lyricKind = LyricKind.LINE,
+            line = "真正的歌词",
+            romanizedLine = "roma",
+            translatedLine = "tr",
+            lineIndex = 0,
+            lineStartMs = 1_000L,
+            lineEndMs = 3_000L,
+            nextLine = "下一句歌词",
+            nextLineStartMs = 3_000L
+        )
+        val on = projectWithPrefs(s, hideCreditLines = true)
+        val off = projectWithPrefs(s, hideCreditLines = false)
+        assertEquals("真正的歌词", on.original)
+        assertEquals(off.original, on.original)
+        assertEquals(off.romanized, on.romanized)
+        assertEquals(off.translated, on.translated)
+        assertEquals(off.nextLine, on.nextLine)
+        assertEquals(off.lineStartMs, on.lineStartMs)
+        assertEquals(off.lineEndMs, on.lineEndMs)
+        assertTrue(on.lineLevelSync)
+    }
 }

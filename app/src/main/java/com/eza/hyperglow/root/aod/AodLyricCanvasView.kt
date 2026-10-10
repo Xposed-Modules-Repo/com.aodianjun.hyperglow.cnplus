@@ -18,6 +18,10 @@ import com.eza.hyperglow.aod.AOD_ROTATION_MODE_PORTRAIT
 import com.eza.hyperglow.aod.DEFAULT_CANVAS_PADDING_PERCENT
 import com.eza.hyperglow.aod.DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT
 import com.eza.hyperglow.customization.ARTWORK_SHAPE_CIRCLE
+import com.eza.hyperglow.customization.METADATA_LAYOUT_SINGLE
+import com.eza.hyperglow.customization.METADATA_LAYOUT_STACKED
+import com.eza.hyperglow.producer.DuetLineWindow
+import com.eza.hyperglow.producer.shouldAdoptDuetLineCandidate
 import com.eza.hyperglow.root.HookLogger
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -117,12 +121,91 @@ internal class AodLyricCanvasView(
     // 对唱并发行(duetLine)加入淡入状态:内容键变化即重计时,淡入完成后归零(恒全亮)。
     private var duetLineKey: String? = null
     private var duetJoinStartedAt = 0L
+    /**
+     * 并发行**自己**的换行过渡(退场 → 入场,无位移段;时间线见 [duetRowTransitionTimeline]):
+     * 起点快照给出旧并发行行的内容与槽位(退场层重画它),两段进度由挂钟时钟驱动(见
+     * [duetRowTransitionClock])。null = 无预设过渡(回落加入淡入/静态)。只在并发行自己的
+     * 内容键变化时建立——主行换行不改它的内容键(见 [aodDuetContentKey])。
+     */
+    private var duetExitSnapshot: CanvasSnapshot? = null
+    private var duetTransitionTimeline: LineTransitionTimeline? = null
+    /** 并发行过渡的挂钟起点;0 = 尚未落帧(首帧到达才起算,低节拍/doze 下保证整段可见)。 */
+    private var duetTransitionStartedAtElapsedMs = 0L
+    /** 并发行过渡期间的原始位置高水位(seek/拖动判定基准,只进不退;见 [isTransitionSeekJump])。 */
+    private var duetTransitionHighWaterPositionMs = 0L
+    /**
+     * 并发行自己的时间轴锁(见 [latchDuetLine]):主行换行只换候选来源,不换屏上内容——
+     * 已上屏的并发行锁到它自己的窗口结束才让位。null = 当前无并发行。
+     */
+    private var duetLockLine: AodCanvasDuetLine? = null
+    /** 并发行锁的位置高水位(seek/倒退判定基准,只进不退;换歌或明显倒退时重算)。 */
+    private var duetLockHighWaterPositionMs = 0L
 
     /** 并发行加入淡入系数:未在淡入期恒 1;淡入窗口内 0→1 线性推进。 */
     private fun duetJoinAlpha(): Float {
         if (duetJoinStartedAt == 0L) return 1f
         val elapsed = (SystemClock.elapsedRealtime() - duetJoinStartedAt).coerceAtLeast(0L)
         return (elapsed.toFloat() / DUET_JOIN_FADE_MS).coerceIn(0f, 1f)
+    }
+
+    /**
+     * 并发行自己的过渡时钟:挂钟式([lineTransitionClockAtElapsed]),首帧落帧才起算。
+     * **不按位置驱动**:并发行内容与播放位置来自两条时间轴(见 [drawDuetOriginal] 注释,
+     * 实测同一句 5.2s vs 20.5s),位置推进量随时可能已越过过渡总时长,按位置换算会把
+     * 退场/入场一帧推完(与主行旧账压缩补播同因,见 [transitionWallClockDriven])——
+     * 挂钟有界,「并发行换行时动画真的看得见」由结构保证。seek/拖动仍按原始位置高水位
+     * 立即结束([isTransitionSeekJump],与主行同一判据)。
+     */
+    private fun duetRowTransitionClock(): LineTransitionClock? {
+        val timeline = duetTransitionTimeline ?: return null
+        val nowElapsedMs = SystemClock.elapsedRealtime()
+        if (duetTransitionStartedAtElapsedMs == 0L) duetTransitionStartedAtElapsedMs = nowElapsedMs
+        duetTransitionHighWaterPositionMs =
+            maxOf(duetTransitionHighWaterPositionMs, projectedPosition())
+        val clock = lineTransitionClockAtElapsed(
+            nowElapsedMs - duetTransitionStartedAtElapsedMs,
+            timeline
+        )
+        return if (isTransitionSeekJump(projectedPosition(), duetTransitionHighWaterPositionMs)) {
+            clock.copy(interrupted = true)
+        } else {
+            clock
+        }
+    }
+
+    /** 结束并发行自己的过渡:清空起点快照与时钟状态,静态绘制立即接管。 */
+    private fun endDuetRowTransition() {
+        duetExitSnapshot = null
+        duetTransitionTimeline = null
+        duetTransitionStartedAtElapsedMs = 0L
+        duetTransitionHighWaterPositionMs = 0L
+    }
+
+    /**
+     * 并发行自己的时间轴(见 [shouldAdoptDuetLineCandidate]):主行换行(活动行变化)只改变
+     * **候选来源**,不改变屏上的并发行——已上屏的并发行锁到它自己的窗口结束才让位;换歌
+     * (代次变化)与位置明显倒退(seek/拖动)时解锁,按本次候选重选。
+     */
+    private fun latchDuetLine(incoming: AodCanvasContent): AodCanvasContent {
+        val candidate = incoming.duetLine
+        val locked = duetLockLine
+        val trackChanged = incoming.trackGeneration != content.trackGeneration
+        val seekBack = locked != null && !trackChanged &&
+            incoming.positionMs < duetLockHighWaterPositionMs - TRANSITION_REWIND_TOLERANCE_MS
+        val adopt = trackChanged || seekBack || shouldAdoptDuetLineCandidate(
+            locked = locked?.let { DuetLineWindow(it.lineStartMs, it.lineEndMs, false) },
+            incoming = candidate?.let { DuetLineWindow(it.lineStartMs, it.lineEndMs, false) },
+            positionMs = incoming.positionMs
+        )
+        if (adopt) duetLockLine = candidate
+        // 高水位只进不退;换歌/倒退后从当前位置重算,否则锁会在倒退后的低位上永久失效。
+        duetLockHighWaterPositionMs = if (trackChanged || seekBack) {
+            incoming.positionMs
+        } else {
+            maxOf(duetLockHighWaterPositionMs, incoming.positionMs)
+        }
+        val line = duetLockLine ?: return incoming
+        return if (line === candidate) incoming else incoming.copy(duetLine = line)
     }
     private var handoffActive = false
     private var suppressNextLineTransition = false
@@ -233,12 +316,18 @@ internal class AodLyricCanvasView(
         context.createPackageContext(BuildConfig.APPLICATION_ID, Context.CONTEXT_IGNORE_SECURITY)
     }.getOrNull()
     private val metadataPaint = paint(14f, 0xB3FFFFFF.toInt(), Typeface.NORMAL)
+    /** 堆叠式歌曲信息的歌手行 Paint(字号按 metadataArtistSizePercent 缩放,见 applyContentStyle)。 */
+    private val metadataArtistPaint =
+        paint(14f * SONG_INFO_ARTIST_SCALE, 0xB3FFFFFF.toInt(), Typeface.NORMAL)
     private val artworkPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private var artworkBitmap: Bitmap? = null
     private var artworkBitmapKey = ""
     /** 暂停停转时冻结的旋转角:节拍门停后偶发重绘不推进角度,恢复播放前保持停转时刻画面。 */
     private var lastArtworkSpinAngle = 0f
     private val originalPaint = paint(27f, Color.WHITE, Typeface.NORMAL)
+    /** 切歌开场占位里歌手段的歌词字号 Paint(字号按 metadataArtistSizePercent 缩放)。 */
+    private val introArtistPaint =
+        paint(27f * SONG_INFO_ARTIST_SCALE, Color.WHITE, Typeface.NORMAL)
     private val romanizedPaint = paint(17f, Color.WHITE, Typeface.NORMAL)
     private val translatedPaint = paint(17f, Color.WHITE, Typeface.ITALIC)
     private val nextLinePaint = paint(15f, 0x59FFFFFF.toInt(), Typeface.NORMAL).apply {
@@ -247,6 +336,8 @@ internal class AodLyricCanvasView(
     private val rubyPaint = paint(11f, 0xB3FFFFFF.toInt(), Typeface.NORMAL).apply {
         textAlign = Paint.Align.CENTER
     }
+    /** 共享扫光块里混合字号行(堆叠开场占位的歌手段)的临时 Paint(见 glowLinePaint;逐帧复用)。 */
+    private val glowLineScratchPaint = Paint()
     private val debugFramePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xAAFF5252.toInt() // 画布边界(逻辑帧 ow×oh)
         style = Paint.Style.STROKE
@@ -257,6 +348,11 @@ internal class AodLyricCanvasView(
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
     }
+    /**
+     * 长间奏倒计时圆点绘制器(参考 HyperLyric「歌词长间奏显示倒计时圆点」):
+     * 数学在 [InterludeDots] 纯函数里,本类只做 android.graphics 落点,与预览同源。
+     */
+    private val interludeDotsRenderer = InterludeDotsRenderer()
     private var currentRenderStyle = captureRenderStyle()
     private var contentBoundsChangedListener: (() -> Unit)? = null
     private var sceneActive = false
@@ -327,6 +423,7 @@ internal class AodLyricCanvasView(
     private var stableLineWords: List<AodCanvasWord> = emptyList()
     private var stableLineGroups: List<AodCanvasLayoutGroup> = emptyList()
     private var stableLineRuby: List<AodCanvasRuby> = emptyList()
+    private var stableLineTranslationWords: List<AodCanvasWord> = emptyList()
 
     /** 下一行文本稳定化(见 [isNextLineStale]):最近一次「已就绪」的下一行文本。 */
     private var stableNextLine: String = ""
@@ -339,11 +436,17 @@ internal class AodLyricCanvasView(
     private fun stabilizeLineEnhancements(incoming: AodCanvasContent): AodCanvasContent {
         val identity = aodCanvasLineIdentity(incoming)
         val sameLine = stableLineIdentity == identity
+        // 逐字翻译词表(插件提供)也参与稳定化:它决定翻译辅助行的折行形态(逐字段 vs 行窗口
+        // 合成),演唱中到达时同样不能重排——与词表/注音同一条「同行只认第一次形态」的口径。
+        val translationWordsArrived =
+            incoming.translationWords.isNotEmpty() != stableLineTranslationWords.isNotEmpty()
         val adopt = shouldAdoptLineEnhancements(
             sameLine = sameLine,
-            layoutSignatureChanged = aodLineLayoutSignature(incoming.words, incoming.layoutGroups) !=
+            layoutSignatureChanged = translationWordsArrived ||
+                aodLineLayoutSignature(incoming.words, incoming.layoutGroups) !=
                 aodLineLayoutSignature(stableLineWords, stableLineGroups),
-            incomingEnriches = incoming.words.isNotEmpty() && stableLineWords.isEmpty(),
+            incomingEnriches = (incoming.words.isNotEmpty() && stableLineWords.isEmpty()) ||
+                (incoming.translationWords.isNotEmpty() && stableLineTranslationWords.isEmpty()),
             positionMs = incoming.positionMs,
             lineStartMs = incoming.lineStartMs
         )
@@ -353,7 +456,8 @@ internal class AodLyricCanvasView(
             incoming.copy(
                 words = stableLineWords,
                 layoutGroups = stableLineGroups,
-                ruby = stableLineRuby
+                ruby = stableLineRuby,
+                translationWords = stableLineTranslationWords
             )
         }
         // 下一行:与主行同文 = 未就绪(刚被晋级的那句,新下一行尚未到达),沿用上一版文本——
@@ -368,6 +472,7 @@ internal class AodLyricCanvasView(
         stableLineWords = result.words
         stableLineGroups = result.layoutGroups
         stableLineRuby = result.ruby
+        stableLineTranslationWords = result.translationWords
         return result
     }
 
@@ -383,11 +488,13 @@ internal class AodLyricCanvasView(
                 HookLogger.i("AodLyricCanvasView", "setContent in: $incomingKey")
             }
         }
-        val nextContent = stabilizeLineEnhancements(
-            incomingContent.copy(
-                animationMode = normalizeAodAnimation(incomingContent.animationMode),
-                motionMode = normalizeAodMotion(incomingContent.motionMode),
-                overflowMode = normalizeAodOverflow(incomingContent.overflowMode)
+        val nextContent = latchDuetLine(
+            stabilizeLineEnhancements(
+                incomingContent.copy(
+                    animationMode = normalizeAodAnimation(incomingContent.animationMode),
+                    motionMode = normalizeAodMotion(incomingContent.motionMode),
+                    overflowMode = normalizeAodOverflow(incomingContent.overflowMode)
+                )
             )
         )
         // 行变更判定:身份(曲目/行窗/文本)变化才算换行;「同曲同文、仅时间窗更新」不算——
@@ -448,10 +555,36 @@ internal class AodLyricCanvasView(
             transitionLastClockAtElapsedMs = 0L
             transitionTimeline = null
         }
-        val duetKey = nextContent.duetLine?.let { "${it.text}@${it.lineStartMs}" }
+        // 并发行自己的内容键(见 [aodDuetContentKey]):主行换行不改变它,只有并发行自己
+        // 换行才换键、并播**它自己的**换行过渡——上一版并发行还在时播预设的退场 → 入场
+        // (同一槽位,无位移段;见 [duetRowTransitionTimeline]),首次出现/None 档回落既有
+        // 180ms 加入淡入(见 [shouldStartDuetRowTransition])。档位取 nextContent.transitionMode
+        // ——与主行同一个已解析字段("Auto" 在映射层按歌词源解析),两行档位由此必然一致。
+        val duetKey = nextContent.duetLine?.let { aodDuetContentKey(it.text, it.lineStartMs) }
         if (duetKey != duetLineKey) {
+            val previousDuetKey = duetLineKey
+            val previousDuetSnapshot = CanvasSnapshot(content, layout, currentRenderStyle)
             duetLineKey = duetKey
-            duetJoinStartedAt = if (duetKey != null) SystemClock.elapsedRealtime() else 0L
+            endDuetRowTransition()
+            if (duetKey == null) {
+                duetJoinStartedAt = 0L
+            } else if (shouldStartDuetRowTransition(
+                    previousDuetKey,
+                    duetKey,
+                    nextContent.transitionMode,
+                    previousDuetSnapshot.layout.rows.any { it.row.duet }
+                )
+            ) {
+                duetExitSnapshot = previousDuetSnapshot
+                duetTransitionTimeline = duetRowTransitionTimeline(
+                    nextContent.transitionMode,
+                    nextContent.lineTransitionSpeed
+                )
+                duetTransitionHighWaterPositionMs = projectedPosition()
+                duetJoinStartedAt = 0L
+            } else {
+                duetJoinStartedAt = SystemClock.elapsedRealtime()
+            }
         }
         this.content = nextContent
         syncArtworkBitmap()
@@ -588,8 +721,9 @@ internal class AodLyricCanvasView(
         val nextGroupStart = startLayout.rows.indexOfFirst { it.row.kind == RowKind.NEXT_LINE }
         val originalIndex = targetLayout.rows.indexOfFirst { it.row.kind == RowKind.ORIGINAL }
         if (nextGroupStart >= 0 && originalIndex >= 0) {
-            val fromAuxRows = startLayout.rows.drop(nextGroupStart + 1)
-            val toAuxRows = targetLayout.rows.drop(originalIndex + 1)
+            // 并发行行不属于主行块(自己独立的时间轴),不参与晋级位移的基线对。
+            val fromAuxRows = startLayout.rows.drop(nextGroupStart + 1).filterNot { it.row.duet }
+            val toAuxRows = targetLayout.rows.drop(originalIndex + 1).filterNot { it.row.duet }
             for ((fromRow, toRow) in fromAuxRows.zip(toAuxRows)) {
                 pairs += fromRow.baseline to toRow.baseline
             }
@@ -1025,9 +1159,17 @@ internal class AodLyricCanvasView(
         // 并发行加入淡入:在淡入窗口内主动续帧(暂停态/低节拍下也能完成淡入),结束后归零。
         if (duetJoinStartedAt != 0L) {
             if (SystemClock.elapsedRealtime() - duetJoinStartedAt < DUET_JOIN_FADE_MS) {
-                scheduleFrame(frame, 16L)
+                scheduleFrame(frame, DUET_ANIMATION_FRAME_MS)
             } else {
                 duetJoinStartedAt = 0L
+            }
+        }
+        // 并发行自己的换行过渡:挂钟走完/位置跳变即结束(静态接管)。窗口内的帧循环由节奏门
+        // 驱动(effectiveCadenceActive 含本过渡,与主行过渡同待遇),不在这里另排帧。
+        if (duetExitSnapshot != null) {
+            val duetClock = duetRowTransitionClock()
+            if (duetClock == null || duetClock.completed || duetClock.interrupted) {
+                endDuetRowTransition()
             }
         }
         if (exitSnapshot != null) {
@@ -1041,6 +1183,14 @@ internal class AodLyricCanvasView(
         val snapshot = exitSnapshot
         if (snapshot == null) {
             drawMetadata(canvas, layout)
+            // 并发行自己的退场层先于当前层绘制(它画在下面):只有并发行自己换行时存在,
+            // 与当前层共用同一槽位列表(退场/入场同槽位)。
+            if (duetExitSnapshot != null) {
+                val duetBaselines = layout.rows.filter { it.row.duet }.map { it.baseline }
+                val duetGroup = beginDuetRowGroup(canvas, layout)
+                drawDuetRowExitLayer(canvas, duetBaselines)
+                canvas.restoreToCount(duetGroup)
+            }
             drawRows(canvas, layout, content, LineTransitionFrame(alpha = 1f))
             return
         }
@@ -1082,27 +1232,35 @@ internal class AodLyricCanvasView(
         } else {
             drawMetadata(canvas, layout)
         }
+        // 并发行有自己独立的时间轴:主行过渡期间它不参与退场/位移/进场(各层的行集都排除
+        // 并发行行,见下),按起点快照的槽位静止画在原地。画在过渡层之下:主行块从它旁边
+        // 移走/进场时从它上面经过,而不是把它一起带走。
+        drawFrozenDuetRows(canvas, snapshot)
         // 参考档位移以行块自身边界为基准(Fade 族 1/4 宽高、Slide 族整宽高),历史档忽略该参数。
         // 宽度取内容框宽(行块横向铺满内容框,等价参考实现 target.getWidth());高度取该层行块
         // 实测高——退场层用旧行块、入场层用新行块,与 ObjectAnimator 在动画起始读取 target
         // 尺寸同序。此前两层共用内容裁剪框高,竖向漂移被放大数倍(真机实测 169px,见
         // [animatedBlockHeightDp])。
-        val blockWidthDp = (ow - padLeft - padRight) / density
+        val blockWidthDp = transitionBlockWidthDp()
         // 段1 退场:离场行组(主行+辅助文字)按退场半段离场;晋级时旧「下一行」不属于
-        // 离场组(内容延续),排除在退场层外。
+        // 离场组(内容延续),排除在退场层外。并发行行不属于任何主行组(自己独立的时间轴),
+        // 按行下标跳过绘制(布局保留——共享缩放 [duetSharedScale] 吃整块行堆叠,含并发行),
+        // 过渡期间由 [drawFrozenDuetRows] 画在原地。
         // 晋级时「下一行组」(下一行及其辅助行)是内容延续组:不随主行组离场,整组改由
         // 原地保持段/晋级层接管(第二行辅助文字的换行动画跟随第二行歌词,
         // owner 2026-10-02 真机反馈:此前辅助行复用 ROMANIZED/TRANSLATED kind 被算进主行离场组)。
         val nextGroupStart = snapshot.layout.rows.indexOfFirst { it.row.kind == RowKind.NEXT_LINE }
-        val exitLayout = if (promoting) {
-            snapshot.layout.copy(rows = if (nextGroupStart < 0) {
+        val exitRows = if (promoting) {
+            if (nextGroupStart < 0) {
                 snapshot.layout.rows
             } else {
                 snapshot.layout.rows.take(nextGroupStart)
-            })
+            }
         } else {
-            snapshot.layout
+            snapshot.layout.rows
         }
+        val exitLayout = snapshot.layout.copy(rows = exitRows)
+        val exitDuetIndices = exitRows.indices.filter { exitRows[it].row.duet }.toSet()
         drawRows(
             canvas,
             exitLayout,
@@ -1111,10 +1269,15 @@ internal class AodLyricCanvasView(
                 transitionMode,
                 exitEased,
                 blockWidthDp,
-                animatedBlockHeightDp(exitLayout, skipOriginal = metadataMorph)
+                animatedBlockHeightDp(
+                    exitLayout,
+                    skipOriginal = metadataMorph,
+                    skipRowIndices = exitDuetIndices
+                )
             ),
             snapshot.renderStyle,
-            skipOriginal = metadataMorph
+            skipOriginal = metadataMorph,
+            skipRowIndices = exitDuetIndices
         )
         if (promoting) {
             // 段2 晋级位移:退场段内旧「下一行」原地保持,位移段开始即由新「主行」层接管
@@ -1144,21 +1307,26 @@ internal class AodLyricCanvasView(
         } else {
             snapshot.layout.rows.size - nextGroupStart - 1
         }
-        val promotedAuxIndices = if (promoting && originalIndex >= 0 && promotedAuxCount > 0) {
-            (originalIndex + 1..(originalIndex + promotedAuxCount).coerceAtMost(layout.rows.size - 1)).toSet()
+        // 入场层的行集:晋级时移除旧主行(由晋级层接管);并发行行按行下标跳过绘制(布局保留,
+        // 共享缩放口径与静止层一致),由 [drawFrozenDuetRows] 画在原地,不入场、不随主行块移动。
+        val enterRows = if (promoting) {
+            layout.rows.filter { it.row.kind != RowKind.ORIGINAL }
         } else {
-            emptySet()
+            layout.rows
         }
-        val enterLayout = if (promoting) {
-            layout.copy(rows = layout.rows.filter { it.row.kind != RowKind.ORIGINAL })
+        // 被晋级的新主行辅助行(内容延续组)布局保留、仅不绘制(由晋级层接管),位移基准按
+        // 实际绘制行计。索引在入场层的行集里算(并发行行另有自己的跳过集,互不影响)。
+        val promotedAuxRows = if (promoting && originalIndex >= 0 && promotedAuxCount > 0) {
+            val from = originalIndex + 1
+            val toExclusive = (from + promotedAuxCount).coerceAtMost(layout.rows.size)
+            if (from < toExclusive) layout.rows.subList(from, toExclusive) else emptyList()
         } else {
-            layout
+            emptyList()
         }
-        // enterLayout 已移除 ORIGINAL,其后行索引整体前移 1(被晋级的新主行辅助行布局保留、
-        // 仅不绘制,位移基准也按实际绘制行计)。
-        val enterSkipIndices = promotedAuxIndices.map { index ->
-            if (index > originalIndex) index - 1 else index
-        }.toSet()
+        val enterSkipIndices = (promotedAuxRows.mapNotNull { aux ->
+            enterRows.indexOfFirst { it === aux }.takeIf { it >= 0 }
+        } + enterRows.indices.filter { enterRows[it].row.duet }).toSet()
+        val enterLayout = layout.copy(rows = enterRows)
         drawRows(
             canvas,
             enterLayout,
@@ -1260,8 +1428,10 @@ internal class AodLyricCanvasView(
         if (nextGroupStart < 0) return
         val originalIndex = layout.rows.indexOfFirst { it.row.kind == RowKind.ORIGINAL }
         if (originalIndex < 0) return
-        val fromAuxRows = snapshot.layout.rows.drop(nextGroupStart + 1)
-        val toAuxRows = layout.rows.drop(originalIndex + 1)
+        // 并发行行不属于主行块(自己独立的时间轴,过渡期间由 [drawFrozenDuetRows] 静止绘制),
+        // 不参与晋级位移的辅助行配对。
+        val fromAuxRows = snapshot.layout.rows.drop(nextGroupStart + 1).filterNot { it.row.duet }
+        val toAuxRows = layout.rows.drop(originalIndex + 1).filterNot { it.row.duet }
         val bright = snapshot.content.secondaryTextBright
         val remain = 1f - frame.translateFraction
         for ((fromRow, toRow) in fromAuxRows.zip(toAuxRows)) {
@@ -1308,36 +1478,14 @@ internal class AodLyricCanvasView(
         if (renderStyle != null) applyRenderStyle(renderStyle)
         content = drawContent
         layout = drawLayout
-        val layer = if (frame.alpha < 1f || frame.translateXDp != 0f ||
-            frame.translateYDp != 0f || frame.scale != 1f ||
-            frame.rotationDeg != 0f || frame.rotationXDeg != 0f || frame.rotationYDeg != 0f
-        ) {
-            val save = canvas.saveLayerAlpha(0f, 0f, ow.toFloat(), oh.toFloat(), (255f * frame.alpha).toInt())
-            canvas.translate(frame.translateXDp * density, frame.translateYDp * density)
-            val pivotX = (padLeft + (ow - padRight)) / 2f
-            val pivotY = (padTop + (oh - padBottom)) / 2f
-            if (frame.scale != 1f) {
-                // 放缩绕内容框中心,保证 Zoom 模式收放不偏离版面锚点。
-                canvas.scale(frame.scale, frame.scale, pivotX, pivotY)
-            }
-            if (frame.rotationDeg != 0f) {
-                // 平面旋转同样绕内容框中心(旋转档)。
-                canvas.rotate(frame.rotationDeg, pivotX, pivotY)
-            }
-            if (frame.rotationXDeg != 0f || frame.rotationYDeg != 0f) {
-                // 翻转档:Camera 透视等价于 View/graphicsLayer 的 rotationX/Y
-                // (Camera 坐标 Y 向上、屏幕 Y 向下,故取负号对齐语义)。
-                val camera = Camera()
-                val matrix = Matrix()
-                camera.rotateX(-frame.rotationXDeg)
-                camera.rotateY(-frame.rotationYDeg)
-                camera.getMatrix(matrix)
-                matrix.preTranslate(-pivotX, -pivotY)
-                matrix.postTranslate(pivotX, pivotY)
-                canvas.concat(matrix)
-            }
-            save
-        } else canvas.save()
+        // 主行层绕内容框中心施加帧变换(Zoom/旋转档的收放不偏离版面锚点);并发行层同式
+        // 但绕并发行行块自身中心(见 [withDuetRowTransition])。
+        val layer = beginTransitionFrameLayer(
+            canvas,
+            frame,
+            (padLeft + (ow - padRight)) / 2f,
+            (padTop + (oh - padBottom)) / 2f
+        )
         // 所有歌词绘制路径(原文/注音/翻译/逐字扫光/发光块)共享这一处逻辑裁剪:
         // 即使整词不可分或动画越界超出其测量宽度,也强制限制在周围 padding 框内,
         // 取代原先逐 drawText 的 clip,成为唯一统一边界。
@@ -1370,6 +1518,9 @@ internal class AodLyricCanvasView(
                 skipOriginal
             )
         } else {
+            // 长间奏倒计时圆点本帧是否生效(与预览同一判据):生效时主行块(主行 + 其辅助行)
+            // 整块让位给圆点,下一行/并发行车道照常绘制。行槽位不重排(布局与自适应高度不变)。
+            val hideMainBlock = interludeDotsFrame() != null
             var rowIndex = 0
             while (rowIndex < drawLayout.rows.size) {
                 val row = drawLayout.rows[rowIndex]
@@ -1379,10 +1530,24 @@ internal class AodLyricCanvasView(
                 }
                 when (row.row.kind) {
                     RowKind.METADATA -> Unit
-                    RowKind.ORIGINAL -> if (!skipOriginal) drawOriginal(canvas, row.baseline)
-                    RowKind.DUET_ORIGINAL ->
-                        if (!skipOriginal) drawDuetOriginal(canvas, row.baseline)
-                    else -> drawText(canvas, row.row, row.baseline)
+                    RowKind.ORIGINAL ->
+                        if (!skipOriginal && !drawInterludeDots(canvas, row.baseline)) {
+                            drawOriginal(canvas, row.baseline)
+                        }
+                    // 圆点占用歌词行槽位时主行的辅助行一并让位(它们是同一行块的内容)。
+                    RowKind.ROMANIZED, RowKind.TRANSLATED -> if (!hideMainBlock) {
+                        withDuetRowTransition(canvas, row.row) {
+                            drawText(canvas, row.row, row.baseline)
+                        }
+                    }
+                    RowKind.DUET_ORIGINAL -> if (!skipOriginal) {
+                        withDuetRowTransition(canvas, row.row) {
+                            drawDuetOriginal(canvas, row.baseline)
+                        }
+                    }
+                    else -> withDuetRowTransition(canvas, row.row) {
+                        drawText(canvas, row.row, row.baseline)
+                    }
                 }
                 rowIndex++
             }
@@ -1401,9 +1566,23 @@ internal class AodLyricCanvasView(
         // 副行(音标/翻译/下一行)静态绘制,与预览的静态 Text 行一致,不参与扫光。
         // 换行分层时入场层只带新到副行(主行由晋级位移层接管),这里按行集内是否有主行分流;
         // 歌曲变更形变时旧层主行由元数据形变接管,按 [skipOriginal] 与逐行路径同义跳过。
-        drawSecondaryRowsStatic(canvas, rows, bright = content.secondaryTextBright)
+        // 长间奏倒计时圆点本帧是否生效(与逐行路径同一判据):生效时主行块(主行 + 其辅助行)
+        // 整块让位给圆点(参考实现的无文本占位行),并发行与下一行车道照常绘制。
+        val interlude = interludeDotsFrame()
+        // 圆点占用歌词行槽位时,只让位**主行自己的辅助行**(ROMANIZED/TRANSLATED)——
+        // 下一行与其辅助行、并发行辅助行不属该块,照常绘制。
+        val staticRows = if (interlude == null) {
+            rows
+        } else {
+            rows.filter {
+                it.row.kind != RowKind.ROMANIZED && it.row.kind != RowKind.TRANSLATED
+            }
+        }
+        drawSecondaryRowsStatic(canvas, staticRows, bright = content.secondaryTextBright)
         val original = rows.firstOrNull { it.row.kind == RowKind.ORIGINAL } ?: return
         if (skipOriginal) return
+        // 长间奏倒计时圆点生效时行槽位改画圆点(与逐行路径同一判据,见 [drawInterludeDots])。
+        if (drawInterludeDots(canvas, original.baseline)) return
         drawOriginalRubyRows(canvas, original.baseline, bright = true)
         // 主行发光统一委托共享渲染核心 LyricGlowRenderer —— 与预览(PreviewAnimatedLyric)
         // 同一份配方:dim 底、光晕、easeInOut 扫光带,杜绝行级同步路径另走一套旧实现。
@@ -1414,9 +1593,12 @@ internal class AodLyricCanvasView(
             lineProgress(),
             effectiveLineSyncFillMode()
         )
-        // 并发行(对唱)在共享行级扫光路径下同样绘制(自带行窗口/词表进度)。
-        rows.firstOrNull { it.row.kind == RowKind.DUET_ORIGINAL }?.let {
-            drawDuetOriginal(canvas, it.baseline)
+        // 并发行(对唱)在共享行级扫光路径下同样绘制(自带行窗口/词表进度),只播自己的
+        // 换行过渡(退场→入场/加入淡入;见 [withDuetRowTransition])。
+        rows.firstOrNull { it.row.kind == RowKind.DUET_ORIGINAL }?.let { duetRow ->
+            withDuetRowTransition(canvas, duetRow.row) {
+                drawDuetOriginal(canvas, duetRow.baseline)
+            }
         }
     }
 
@@ -1427,6 +1609,70 @@ internal class AodLyricCanvasView(
         } else {
             LyricGlowRenderer.FILL_LEFT_TO_RIGHT_WHOLE_BLOCK
         }
+
+    /**
+     * 本帧的长间奏圆点绘制参数(参考 HyperLyric「歌词长间奏显示倒计时圆点」);null = 本帧不画
+     * (无窗口 / 位置未进窗口 / 窗口已走完)。纯读 [content] 与当前投影位置,不落任何状态,
+     * 逐行与共享扫光两条路径共用同一判据(与预览同源)。
+     *
+     * 圆点占**歌词行槽位**(主行块:主行 + 其辅助行):与既有「开场/间奏大元数据」引导的取舍是
+     * 引导优先——大元数据显示期间投影层根本不下发窗口(见 [interludeSpan] 的调用点),圆点
+     * 只在引导结束后按剩余窗口继续,既有元数据行为零改动。
+     */
+    private fun interludeDotsFrame(): InterludeDotsFrame? {
+        if (content.speed <= 0f) return null
+        val window = interludeDotsWindowOf(
+            content.interludeDotsStartMs,
+            content.interludeDotsEndMs
+        ) ?: return null
+        val positionMs = projectedPosition()
+        if (!interludeDotsActive(window, positionMs)) return null
+        val progress = interludeDotsProgress(positionMs, window)
+        // 进度走完(圆点已全部渐隐)即不再占用行槽位:与并发行加入淡入同式,动画自带终止条件。
+        if (progress >= 1f) return null
+        val textSize = originalPaint.textSize
+        if (textSize <= 0f) return null
+        val alignment = viewAlignment(
+            resolveAlignmentMode(content.alignmentMode, content.alignedRight)
+        )
+        return InterludeDotsFrame(
+            progress = progress,
+            startX = alignedStart(
+                textWidth = interludeDotsWidth(textSize, progress),
+                lineAlignment = alignment
+            ),
+            textSize = textSize
+        )
+    }
+
+    /**
+     * 在歌词行槽位画长间奏倒计时圆点;返回 false = 本帧不生效,调用方按原路径绘制该行。
+     * 垂直位置取行块垂直中心([centerY]):圆点以行槽中心为心,与文字行的视觉重心一致
+     * (参考实现取行视图高度的 1/2,同式)。
+     */
+    private fun drawInterludeDots(canvas: Canvas, baseline: Float): Boolean {
+        val frame = interludeDotsFrame() ?: return false
+        val metrics = originalPaint.fontMetrics
+        val centerY = baseline + (metrics.descent + metrics.ascent) / 2f
+        interludeDotsRenderer.draw(
+            canvas = canvas,
+            textSize = frame.textSize,
+            progress = frame.progress,
+            startX = frame.startX,
+            centerY = centerY,
+            // 底色 = 未唱色(参考实现的「白 @128」作用于底色),高亮 = 已唱色。
+            backgroundColorArgb = resolvedPalette.unsungText,
+            highlightColorArgb = resolvedPalette.sungText
+        )
+        return true
+    }
+
+    /** [interludeDotsFrame] 的落点参数:一次算好,两条绘制路径共用(避免两次投影/对齐漂移)。 */
+    private data class InterludeDotsFrame(
+        val progress: Float,
+        val startX: Float,
+        val textSize: Float
+    )
 
     private fun drawSecondaryRowsStatic(
         canvas: Canvas,
@@ -1445,67 +1691,79 @@ internal class AodLyricCanvasView(
                 rowIndex++
                 continue
             }
-            // 辅助文字逐字效果:携带行窗口的辅助行走逐字渲染(自管取色/亮度),不落静态路径。
-            val auxWindow = positioned.row.auxKaraokeWindow
-            if (auxWindow != null) {
-                drawAuxKaraokeRow(canvas, positioned.row, positioned.baseline, auxWindow)
-                rowIndex++
-                continue
-            }
-            // 下一行歌词颜色恒走独立的 nextLineText token(与预览/非行级同步路径同源
-            // secondLineColorArgb):「辅助文字显示第二行歌词」只借辅助文字的亮度档,
-            // 不借「辅助行颜色」,否则"下一行颜色"设置对该形态完全失效。
-            if (positioned.row.kind == RowKind.NEXT_LINE) {
-                val secondaryForm = secondLineRendersAsSecondary(
-                    content.secondaryNextLine,
-                    content.showNextLine,
-                    content.nextLine.isNotBlank(),
-                    hasFirstLineAuxText(
-                        content.secondaryMode,
-                        content.romanized,
-                        content.translated
-                    ),
-                    content.nextLineAux
-                )
-                setTextAlpha(
-                    positioned.row.paint,
-                    if (secondaryForm) {
-                        staticSecondaryTextFactor(bright)
-                    } else {
-                        staticNextLineTextFactor()
-                    },
-                    1f,
-                    secondLineColorArgb(
-                        if (secondaryForm) {
-                            SecondLinePresentation.AS_SECONDARY
-                        } else {
-                            SecondLinePresentation.STANDALONE
-                        },
-                        resolvedPalette
-                    )
-                )
-            } else {
-                setTextAlpha(
-                    positioned.row.paint,
-                    staticSecondaryTextFactor(bright),
-                    1f,
-                    resolvedPalette.secondaryText
-                )
-            }
-            if (!keepShader) positioned.row.paint.shader = null
-            positioned.row.paint.clearShadowLayer()
-            var lineIndex = 0
-            while (lineIndex < positioned.row.lines.size) {
-                val line = positioned.row.lines[lineIndex]
-                canvas.drawText(
-                    line.text,
-                    line.startX,
-                    positioned.baseline + lineIndex * positioned.row.lineHeight,
-                    positioned.row.paint
-                )
-                lineIndex++
+            // 并发行辅助行(含和声走的辅助行车道)只播自己的换行过渡(见 [withDuetRowTransition])。
+            withDuetRowTransition(canvas, positioned.row) {
+                drawSecondaryRowStatic(canvas, positioned, bright, keepShader)
             }
             rowIndex++
+        }
+    }
+
+    /** [drawSecondaryRowsStatic] 的单行主体(并发行行由调用方套自己的过渡层)。 */
+    private fun drawSecondaryRowStatic(
+        canvas: Canvas,
+        positioned: PositionedRow,
+        bright: Boolean,
+        keepShader: Boolean
+    ) {
+        // 辅助文字逐字效果:携带行窗口的辅助行走逐字渲染(自管取色/亮度),不落静态路径。
+        val auxWindow = positioned.row.auxKaraokeWindow
+        if (auxWindow != null) {
+            drawAuxKaraokeRow(canvas, positioned.row, positioned.baseline, auxWindow)
+            return
+        }
+        // 下一行歌词颜色恒走独立的 nextLineText token(与预览/非行级同步路径同源
+        // secondLineColorArgb):「辅助文字显示第二行歌词」只借辅助文字的亮度档,
+        // 不借「辅助行颜色」,否则"下一行颜色"设置对该形态完全失效。
+        if (positioned.row.kind == RowKind.NEXT_LINE) {
+            val secondaryForm = secondLineRendersAsSecondary(
+                content.secondaryNextLine,
+                content.showNextLine,
+                content.nextLine.isNotBlank(),
+                hasFirstLineAuxText(
+                    content.secondaryMode,
+                    content.romanized,
+                    content.translated
+                ),
+                content.nextLineAux
+            )
+            setTextAlpha(
+                positioned.row.paint,
+                if (secondaryForm) {
+                    staticSecondaryTextFactor(bright)
+                } else {
+                    staticNextLineTextFactor()
+                },
+                1f,
+                secondLineColorArgb(
+                    if (secondaryForm) {
+                        SecondLinePresentation.AS_SECONDARY
+                    } else {
+                        SecondLinePresentation.STANDALONE
+                    },
+                    resolvedPalette
+                )
+            )
+        } else {
+            setTextAlpha(
+                positioned.row.paint,
+                staticSecondaryTextFactor(bright),
+                1f,
+                resolvedPalette.secondaryText
+            )
+        }
+        if (!keepShader) positioned.row.paint.shader = null
+        positioned.row.paint.clearShadowLayer()
+        var lineIndex = 0
+        while (lineIndex < positioned.row.lines.size) {
+            val line = positioned.row.lines[lineIndex]
+            canvas.drawText(
+                line.text,
+                line.startX,
+                positioned.baseline + lineIndex * positioned.row.lineHeight,
+                positioned.row.paint
+            )
+            lineIndex++
         }
     }
 
@@ -1518,7 +1776,8 @@ internal class AodLyricCanvasView(
                 layout.original.lineHeight,
                 precedingRuby,
                 line.rubyHeight,
-                layout.original.lineGap
+                layout.original.lineGap,
+                layout.original.baselineOffsets()
             )
             if (line.ruby.isNotEmpty()) drawRuby(canvas, line, lineBaseline, bright)
             precedingRuby += line.rubyHeight
@@ -1642,15 +1901,18 @@ internal class AodLyricCanvasView(
         val baseSp = baseTextSizeSp(forContent.original) * sizeScale
         val typeface = resolveTypeface(forContent.fontFamily, forContent.weight)
         originalPaint.typeface = typeface
+        introArtistPaint.typeface = typeface
         if (forContent.fontFamily != "auto") {
             val regularTypeface = resolveTypeface(forContent.fontFamily, "Regular")
             metadataPaint.typeface = regularTypeface
+            metadataArtistPaint.typeface = regularTypeface
             romanizedPaint.typeface = regularTypeface
             translatedPaint.typeface = Typeface.create(regularTypeface, Typeface.ITALIC)
             nextLinePaint.typeface = regularTypeface
             rubyPaint.typeface = regularTypeface
         } else {
             metadataPaint.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            metadataArtistPaint.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             romanizedPaint.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             translatedPaint.typeface = Typeface.create("sans-serif", Typeface.ITALIC)
             nextLinePaint.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
@@ -1659,15 +1921,25 @@ internal class AodLyricCanvasView(
         originalPaint.textSize = baseSp * scaledDensity
         // 字号公式收口到 AodCanvasTextMetrics 共享纯函数(与预览同源,杜绝两套换算漂移)。
         metadataPaint.textSize = metadataTextSizeSp(forContent.metadataSizePercent) * scaledDensity
-        romanizedPaint.textSize = secondaryReadingTextSizeSp(baseSp) * scaledDensity
-        translatedPaint.textSize = secondaryTranslationTextSizeSp(baseSp) * scaledDensity
+        // 歌手行字号 = 歌名行字号 × 歌手百分比(40..100,见 SurfaceProfile.metadataArtistSizePercent)。
+        metadataArtistPaint.textSize =
+            metadataPaint.textSize * songInfoArtistScale(forContent.metadataArtistSizePercent)
+        // 开场占位的歌手段字号 = 歌词字号 × 歌手百分比(上游 84a0c9ce 项 #2/#3 同式)。
+        introArtistPaint.textSize =
+            originalPaint.textSize * songInfoArtistScale(forContent.metadataArtistSizePercent)
+        romanizedPaint.textSize =
+            secondaryReadingTextSizeSp(baseSp, forContent.secondaryTextSizePercent) * scaledDensity
+        translatedPaint.textSize =
+            secondaryTranslationTextSizeSp(baseSp, forContent.secondaryTextSizePercent) * scaledDensity
         nextLinePaint.textSize = nextLineTextSizeSp() * scaledDensity
         rubyPaint.textSize = rubyTextSizePx(originalPaint.textSize)
     }
 
     private fun captureRenderStyle(): RenderStyleSnapshot = RenderStyleSnapshot(
         metadataPaint = Paint(metadataPaint),
+        metadataArtistPaint = Paint(metadataArtistPaint),
         originalPaint = Paint(originalPaint),
+        introArtistPaint = Paint(introArtistPaint),
         romanizedPaint = Paint(romanizedPaint),
         translatedPaint = Paint(translatedPaint),
         rubyPaint = Paint(rubyPaint),
@@ -1677,7 +1949,9 @@ internal class AodLyricCanvasView(
 
     private fun applyRenderStyle(style: RenderStyleSnapshot) {
         metadataPaint.set(style.metadataPaint)
+        metadataArtistPaint.set(style.metadataArtistPaint)
         originalPaint.set(style.originalPaint)
+        introArtistPaint.set(style.introArtistPaint)
         romanizedPaint.set(style.romanizedPaint)
         translatedPaint.set(style.translatedPaint)
         rubyPaint.set(style.rubyPaint)
@@ -1716,12 +1990,18 @@ internal class AodLyricCanvasView(
                 content.playbackPaused
             ) && artworkBitmap != null
 
-    /** 歌曲信息行基线(锚点感知):底部锚点向上排,顶部锚点向下排(与 drawMetadata 同式)。 */
+    /**
+     * 歌曲信息行基线(锚点感知):底部锚点向上排,顶部锚点向下排(与 drawMetadata 同式)。
+     * 行距按逐行行盒偏移(混合字号时小字歌手段有自己的推进;全同字号逐值等于旧式
+     * index × lineHeight)。
+     */
     private fun metadataLineBaseline(metadata: PositionedRow, index: Int): Float =
         if (content.metadataAnchor == "bottom") {
-            metadata.baseline - (metadata.row.lines.size - 1 - index) * metadata.row.lineHeight
+            val last = metadata.row.lines.size - 1
+            metadata.baseline - (metadata.row.lineBaselineOffset(last) -
+                metadata.row.lineBaselineOffset(index))
         } else {
-            metadata.baseline + index * metadata.row.lineHeight
+            metadata.baseline + metadata.row.lineBaselineOffset(index)
         }
 
     /**
@@ -1756,11 +2036,14 @@ internal class AodLyricCanvasView(
         val metrics = metadata.row.paint.fontMetrics
         // 图片槽与文本块同心中线:文本视觉中线 = 首末行基线中点 + (ascent + descent)/2
         // (纯函数与预览 Row 居中同源;此前这里符号写反,图片整体低于文本约 0.7×字号)。
+        // 混合字号(堆叠歌曲信息)取首行歌名的 ascent 与末行歌手的 descent,与逐行行盒同源。
+        val firstMetrics = metadata.row.paintAt(0).fontMetrics
+        val lastMetrics = metadata.row.paintAt(lines.size - 1).fontMetrics
         val textMiddleY = metadataTextCenterY(
             metadataLineBaseline(metadata, 0),
             metadataLineBaseline(metadata, lines.size - 1),
-            metrics.ascent,
-            metrics.descent
+            firstMetrics.ascent,
+            lastMetrics.descent
         )
         val top = textMiddleY - side / 2f
         return RectF(groupLeft, top, groupLeft + side, top + side)
@@ -1822,8 +2105,6 @@ internal class AodLyricCanvasView(
         canvas.save()
         val metadataClip = lyricClipBounds(padLeft, padTop, ow - padRight, oh - padBottom)
         canvas.clipRect(metadataClip[0], metadataClip[1], metadataClip[2], metadataClip[3])
-        metadata.row.paint.color = resolvedPalette.metadataText
-        metadata.row.paint.alpha = (255f * alpha.coerceIn(0f, 1f)).roundToInt()
         // 歌曲图片画在文本下层、文本块左侧。离场帧(renderStyle!=null)不画旧图:
         // 曲目不变的换行过渡走整帧 alpha=1(见 drawOrientedContent),图片不随行闪。
         if (renderStyle == null) {
@@ -1832,11 +2113,16 @@ internal class AodLyricCanvasView(
         metadata.row.lines.forEachIndexed { index, line ->
             // 底部锚点时行向上排（末行贴近屏幕底），顶部锚点向下排。
             val lineBaseline = metadataLineBaseline(metadata, index)
+            // 逐行 Paint:堆叠式歌曲信息的歌手段用小字号 Paint 画在自己的行盒里
+            // (上游 84a0c9ce 项 #2/#3),歌名行回落整行 Paint。
+            val paint = line.paint ?: metadata.row.paint
+            paint.color = resolvedPalette.metadataText
+            paint.alpha = (255f * alpha.coerceIn(0f, 1f)).roundToInt()
             canvas.drawText(
                 line.text,
                 line.startX,
                 lineBaseline,
-                metadata.row.paint
+                paint
             )
         }
         canvas.restore()
@@ -1863,12 +2149,15 @@ internal class AodLyricCanvasView(
         } ?: return
         val destinationLine = destinationRow.row.lines.singleOrNull() ?: return
         val value = progress.coerceIn(0f, 1f)
+        // 无歌名的堆叠行(只剩歌手段)形变落点取该行自己的小字号 Paint,而不是歌名 Paint
+        // (上游 84a0c9ce 项 #3:落点字号跟随目标行,否则落定瞬间字号跳变)。
+        val destinationPaint = destinationLine.paint ?: currentRenderStyle.metadataPaint
         val paint = Paint(
             if (value < 0.5f) snapshot.renderStyle.originalPaint
-            else currentRenderStyle.metadataPaint
+            else destinationPaint
         ).apply {
             textSize = snapshot.renderStyle.originalPaint.textSize +
-                (currentRenderStyle.metadataPaint.textSize -
+                (destinationPaint.textSize -
                     snapshot.renderStyle.originalPaint.textSize) * value
             color = interpolateAodColor(
                 // 源色取主行实际绘制所用的「已唱颜色」:主行三条渲染路径(静态/扫光块/
@@ -2008,19 +2297,26 @@ internal class AodLyricCanvasView(
                 RowKind.ORIGINAL,
                 content.original,
                 originalPaint,
+                // 混合字号块(堆叠式开场占位)按逐行行盒记账;其余与 originalRowHeight 逐值相等。
                 originalRowHeight(
                     lineHeight,
                     originalLayout.lineCount,
                     originalLayout.rubyHeight,
                     originalLayout.lineGap
-                ),
+                ).let { uniform ->
+                    if (originalLayout.mixedSize) {
+                        originalLayout.stackedHeight + originalLayout.rubyHeight
+                    } else {
+                        uniform
+                    }
+                },
                 ROW_GAP_BEFORE_ORIGINAL_DP * density,
                 emptyList(),
                 lineHeight
             )
         }
-        val showReading = content.secondaryMode == "Transliteration" || content.secondaryMode == "Both"
-        val showTranslation = content.secondaryMode == "Translation" || content.secondaryMode == "Both"
+        val showReading = com.eza.hyperglow.customization.auxShowsReading(content.secondaryMode)
+        val showTranslation = com.eza.hyperglow.customization.auxShowsTranslation(content.secondaryMode)
         // 辅助文字逐字效果(见 SurfaceProfile.secondaryWordKaraoke):第一行辅助行取当前行窗口;
         // 关闭时恒空,行按静态绘制零变化。
         val auxKaraokeWindow = if (content.secondaryWordKaraoke) {
@@ -2029,95 +2325,179 @@ internal class AodLyricCanvasView(
             null
         }
         if (showReading && content.romanized.isNotBlank()) {
-            val lines = transliterationLines(content, originalLayout, availableWidth)
+            // 自适应大小:字号可能被拟合缩小;行用独立 Paint(共享 paint 不得就地改字号)。
+            val readingPaint = fittedSecondaryPaint(
+                content,
+                content.romanized,
+                romanizedPaint,
+                originalLayout.lineCount,
+                availableWidth,
+                translation = false
+            )
+            val lines = transliterationLines(content, originalLayout, availableWidth, readingPaint)
                 ?: wrapSecondaryText(
                     content,
                     content.romanized,
-                    romanizedPaint,
+                    readingPaint,
                     originalLayout.lineCount,
                     availableWidth
                 )
-            rows += rowWithLines(RowKind.ROMANIZED, content.romanized, romanizedPaint, ROW_GAP_BEFORE_SECONDARY_DP * density, lines, auxKaraokeWindow)
+            rows += rowWithLines(RowKind.ROMANIZED, content.romanized, readingPaint, ROW_GAP_BEFORE_SECONDARY_DP * density, lines, auxKaraokeWindow)
         }
         if (showTranslation && content.translated.isNotBlank()) {
+            val translationPaint = fittedSecondaryPaint(
+                content,
+                content.translated,
+                translatedPaint,
+                originalLayout.lineCount,
+                availableWidth,
+                translation = true
+            )
+            // 插件提供逐字翻译词表且本面开启「辅助文字逐字效果」时按真实词窗折行点亮;
+            // 开关关闭时保持原行装配(逐字节不变)。
+            val translatedLines = (if (content.secondaryWordKaraoke) {
+                translatedTimedLines(content, availableWidth, translationPaint)
+            } else {
+                null
+            }) ?: wrapSecondaryText(
+                content,
+                content.translated,
+                translationPaint,
+                originalLayout.lineCount,
+                availableWidth
+            )
             rows += rowWithLines(
                 RowKind.TRANSLATED,
                 content.translated,
-                translatedPaint,
+                translationPaint,
                 ROW_GAP_BEFORE_SECONDARY_DP * density,
-                wrapSecondaryText(
-                    content,
-                    content.translated,
-                    translatedPaint,
-                    originalLayout.lineCount,
-                    availableWidth
-                ),
+                translatedLines,
                 auxKaraokeWindow
             )
         }
         // 对唱并发行(仅息屏内容携带,见 SurfaceProfile.duetConcurrent):主行块(原文+辅助行)
         // 之后同尺寸堆叠并发行块(原文+其辅助行),各画各的词级扫光;并发行在场时取代独立
         // 「下一行」行(与 #82「辅助文字显示第二行歌词」的 anti-dup 同式,防下方拥挤)。
+        // 和声行(harmony,插件行 role=BG 的 x-bg 回声)不走这一档:它常与主行同文,同尺寸
+        // 堆叠出来就是两条一样的大字行(真机 2026-10-07 反馈的错观感);改走辅助行车道,
+        // 与第一行辅助行同规格——参照 HyperLyric 把 x-bg 折进父行 secondary 车道。
         val duet = content.duetLine
+        // 和声行可被显式关掉(多选里取消勾选「和声」,见 SECONDARY_MODE_NO_HARMONY):
+        // 此时整条和声不上屏,且独立「下一行」行按下方 anti-dup 判据恢复(不再被和声挤掉)。
+        val harmonyHidden = duet != null && duet.harmony &&
+            !com.eza.hyperglow.customization.auxHarmonyShown(content.secondaryMode)
         var duetLayout: OriginalLayout? = null
-        if (duet != null && duet.text.isNotBlank()) {
-            val built = buildDuetOriginalLayout(duet, availableWidth)
-            duetLayout = built
-            val duetAuxKaraokeWindow = if (content.secondaryWordKaraoke) {
-                duet.lineStartMs..duet.lineEndMs
-            } else {
-                null
-            }
-            val metrics = originalPaint.fontMetrics
-            val lineHeight = metrics.descent - metrics.ascent + LYRIC_LINE_EXTRA_HEIGHT_DP * density
-            rows += Row(
-                RowKind.DUET_ORIGINAL,
-                duet.text,
-                originalPaint,
-                originalRowHeight(
-                    lineHeight,
-                    built.lineCount,
-                    built.rubyHeight,
-                    built.lineGap
-                ),
-                ROW_GAP_BEFORE_ORIGINAL_DP * density,
-                emptyList(),
-                lineHeight
-            )
-            if (showReading && duet.romanized.isNotBlank()) {
-                rows += rowWithLines(
-                    RowKind.DUET_ROMANIZED,
-                    duet.romanized,
+        if (duet != null && duet.text.isNotBlank() && !harmonyHidden) {
+            if (duet.harmony) {
+                // 复用辅助行装配:同一字号公式/亮度档/「辅助文字逐字效果」路径(行窗口取和声
+                // 自己的,逐字推进与和声同拍);换行档取主行行数——和声多是主行文本的回声。
+                // 和声不受「辅助文字模式」门控,辅助字号设置必须同样覆盖它(见 setContent 注释)。
+                val harmonyPaint = fittedSecondaryPaint(
+                    content,
+                    duet.text,
                     romanizedPaint,
+                    originalLayout.lineCount,
+                    availableWidth,
+                    translation = false
+                )
+                // 逐字效果开启时优先按和声**自己的**真实词窗点亮(插件逐音节下发,见
+                // harmonyTimedLines);词表缺失/重建不出整行文本时返回 null,回落下面的
+                // 行窗均匀合成——即修复前的行为。
+                val harmonyLines = if (content.secondaryWordKaraoke) {
+                    harmonyTimedLines(content, duet, availableWidth, harmonyPaint)
+                } else {
+                    null
+                }
+                rows += rowWithLines(
+                    RowKind.ROMANIZED,
+                    duet.text,
+                    harmonyPaint,
                     ROW_GAP_BEFORE_SECONDARY_DP * density,
-                    wrapSecondaryText(
+                    harmonyLines ?: wrapSecondaryText(
+                        content,
+                        duet.text,
+                        harmonyPaint,
+                        originalLayout.lineCount,
+                        availableWidth
+                    ),
+                    if (content.secondaryWordKaraoke) duet.lineStartMs..duet.lineEndMs else null
+                ).copy(duet = true)
+            } else {
+                val built = buildDuetOriginalLayout(duet, availableWidth)
+                duetLayout = built
+                val duetAuxKaraokeWindow = if (content.secondaryWordKaraoke) {
+                    duet.lineStartMs..duet.lineEndMs
+                } else {
+                    null
+                }
+                val metrics = originalPaint.fontMetrics
+                val lineHeight = metrics.descent - metrics.ascent + LYRIC_LINE_EXTRA_HEIGHT_DP * density
+                rows += Row(
+                    RowKind.DUET_ORIGINAL,
+                    duet.text,
+                    originalPaint,
+                    originalRowHeight(
+                        lineHeight,
+                        built.lineCount,
+                        built.rubyHeight,
+                        built.lineGap
+                    ),
+                    ROW_GAP_BEFORE_ORIGINAL_DP * density,
+                    emptyList(),
+                    lineHeight,
+                    duet = true
+                )
+                if (showReading && duet.romanized.isNotBlank()) {
+                    val duetReadingPaint = fittedSecondaryPaint(
                         content,
                         duet.romanized,
                         romanizedPaint,
                         built.lineCount,
                         availableWidth,
-                        alignmentFor(content, RowKind.DUET_ROMANIZED)
-                    ),
-                    // 并发行辅助行取并发行自己的窗口,逐字推进与并发行主行同拍。
-                    duetAuxKaraokeWindow
-                )
-            }
-            if (showTranslation && duet.translated.isNotBlank()) {
-                rows += rowWithLines(
-                    RowKind.DUET_TRANSLATED,
-                    duet.translated,
-                    translatedPaint,
-                    ROW_GAP_BEFORE_SECONDARY_DP * density,
-                    wrapSecondaryText(
+                        translation = false
+                    )
+                    rows += rowWithLines(
+                        RowKind.DUET_ROMANIZED,
+                        duet.romanized,
+                        duetReadingPaint,
+                        ROW_GAP_BEFORE_SECONDARY_DP * density,
+                        wrapSecondaryText(
+                            content,
+                            duet.romanized,
+                            duetReadingPaint,
+                            built.lineCount,
+                            availableWidth,
+                            alignmentFor(content, RowKind.DUET_ROMANIZED)
+                        ),
+                        // 并发行辅助行取并发行自己的窗口,逐字推进与并发行主行同拍。
+                        duetAuxKaraokeWindow
+                    ).copy(duet = true)
+                }
+                if (showTranslation && duet.translated.isNotBlank()) {
+                    val duetTranslationPaint = fittedSecondaryPaint(
                         content,
                         duet.translated,
                         translatedPaint,
                         built.lineCount,
                         availableWidth,
-                        alignmentFor(content, RowKind.DUET_TRANSLATED)
-                    ),
-                    duetAuxKaraokeWindow
-                )
+                        translation = true
+                    )
+                    rows += rowWithLines(
+                        RowKind.DUET_TRANSLATED,
+                        duet.translated,
+                        duetTranslationPaint,
+                        ROW_GAP_BEFORE_SECONDARY_DP * density,
+                        wrapSecondaryText(
+                            content,
+                            duet.translated,
+                            duetTranslationPaint,
+                            built.lineCount,
+                            availableWidth,
+                            alignmentFor(content, RowKind.DUET_TRANSLATED)
+                        ),
+                        duetAuxKaraokeWindow
+                    ).copy(duet = true)
+                }
             }
         }
         // 下一行歌词呈现与预览同源(secondLinePresentation):「辅助文字显示第二行歌词」
@@ -2126,8 +2506,9 @@ internal class AodLyricCanvasView(
         // 「显示第二行辅助文字」开启时第二行歌词行本身也按辅助文字形态呈现(即使「辅助
         // 文字显示第二行歌词」关闭——此时以「显示下一行歌词」为前提),独立下一行行形态
         // 同样追加其辅助行。颜色恒走「下一行颜色」(secondLineColorArgb),不随形态改用辅助行颜色。
-        // 对唱并发行在场时独立下一行行整体让位(见上)。
-        if (duet == null || duet.text.isBlank()) when (secondLinePresentation(
+        // 对唱并发行在场时独立下一行行整体让位(见上);和声被显式关掉(harmonyHidden)时
+        // 和声不在场,让位规则不适用——下一行行照常呈现。
+        if (harmonyHidden || duet == null || duet.text.isBlank()) when (secondLinePresentation(
             content.secondaryNextLine,
             content.showNextLine,
             content.nextLine.isNotBlank(),
@@ -2137,10 +2518,18 @@ internal class AodLyricCanvasView(
             SecondLinePresentation.AS_SECONDARY -> {
                 // 第二行歌词自身布局先行落定:其辅助行的换行档跟随「第二行实际呈现的行数」,
                 // 而不是主行行数(owner 2026-10-02 真机反馈)。
-                val nextLineLines = wrapSecondaryText(
+                val nextLineSecondaryPaint = fittedSecondaryPaint(
                     content,
                     content.nextLine,
                     romanizedPaint,
+                    originalLayout.lineCount,
+                    availableWidth,
+                    translation = false
+                )
+                val nextLineLines = wrapSecondaryText(
+                    content,
+                    content.nextLine,
+                    nextLineSecondaryPaint,
                     originalLayout.lineCount,
                     availableWidth,
                     alignmentFor(content, RowKind.NEXT_LINE)
@@ -2148,7 +2537,7 @@ internal class AodLyricCanvasView(
                 rows += rowWithLines(
                     RowKind.NEXT_LINE,
                     content.nextLine,
-                    romanizedPaint,
+                    nextLineSecondaryPaint,
                     ROW_GAP_BEFORE_NEXT_LINE_DP * density,
                     nextLineLines
                 )
@@ -2194,6 +2583,7 @@ internal class AodLyricCanvasView(
         nextLineRenderedLineCount: Int,
         availableWidth: Float
     ) {
+        val preferredLines = secondLineAuxPreferredLines(nextLineRenderedLineCount)
         secondLineAuxRows(
             content.nextLineAux,
             content.secondaryMode,
@@ -2201,34 +2591,54 @@ internal class AodLyricCanvasView(
             content.nextLineTranslated
         ).forEach { auxRow ->
             when (auxRow) {
-                SecondLineAuxRow.ROMANIZED -> rows += rowWithLines(
-                    RowKind.ROMANIZED,
-                    content.nextLineRomanized,
-                    romanizedPaint,
-                    ROW_GAP_BEFORE_SECONDARY_DP * density,
-                    wrapSecondaryText(
+                SecondLineAuxRow.ROMANIZED -> {
+                    val rowPaint = fittedSecondaryPaint(
                         content,
                         content.nextLineRomanized,
                         romanizedPaint,
-                        secondLineAuxPreferredLines(nextLineRenderedLineCount),
+                        preferredLines,
                         availableWidth,
-                        alignmentFor(content, RowKind.NEXT_LINE)
+                        translation = false
                     )
-                )
-                SecondLineAuxRow.TRANSLATED -> rows += rowWithLines(
-                    RowKind.TRANSLATED,
-                    content.nextLineTranslated,
-                    translatedPaint,
-                    ROW_GAP_BEFORE_SECONDARY_DP * density,
-                    wrapSecondaryText(
+                    rows += rowWithLines(
+                        RowKind.ROMANIZED,
+                        content.nextLineRomanized,
+                        rowPaint,
+                        ROW_GAP_BEFORE_SECONDARY_DP * density,
+                        wrapSecondaryText(
+                            content,
+                            content.nextLineRomanized,
+                            rowPaint,
+                            preferredLines,
+                            availableWidth,
+                            alignmentFor(content, RowKind.NEXT_LINE)
+                        )
+                    )
+                }
+                SecondLineAuxRow.TRANSLATED -> {
+                    val rowPaint = fittedSecondaryPaint(
                         content,
                         content.nextLineTranslated,
                         translatedPaint,
-                        secondLineAuxPreferredLines(nextLineRenderedLineCount),
+                        preferredLines,
                         availableWidth,
-                        alignmentFor(content, RowKind.NEXT_LINE)
+                        translation = true
                     )
-                )
+                    rows += rowWithLines(
+                        RowKind.TRANSLATED,
+                        content.nextLineTranslated,
+                        rowPaint,
+                        ROW_GAP_BEFORE_SECONDARY_DP * density,
+                        wrapSecondaryText(
+                            content,
+                            content.nextLineTranslated,
+                            rowPaint,
+                            preferredLines,
+                            availableWidth,
+                            alignmentFor(content, RowKind.NEXT_LINE)
+                        )
+                    )
+                }
             }
         }
     }
@@ -2281,9 +2691,55 @@ internal class AodLyricCanvasView(
         lines: List<TextLine>,
         auxKaraokeWindow: LongRange? = null
     ): Row {
-        val metrics = paint.fontMetrics
-        val lineHeight = safeSecondaryLineHeight(metrics.ascent, metrics.descent, metrics.bottom)
-        return Row(kind, text, paint, lineHeight * lines.size, gap, lines, lineHeight, auxKaraokeWindow)
+        // 逐行行盒(上游 84a0c9ce 项 #3):高度按每行自己的 ascent/descent 推进
+        // (上一行 descent + 下一行 ascent),堆叠歌曲信息的小字号歌手段才不被多推一个
+        // 歌名行距;全同字号时逐值等于旧式 lineHeight × 行数,既有呈现零变化。
+        val probe = Row(kind, text, paint, 0f, gap, lines, 0f, auxKaraokeWindow)
+        return probe.copy(
+            height = probe.stackHeight(),
+            lineHeight = probe.uniformLineHeight()
+        )
+    }
+
+    /** 某行实际绘制用的 Paint:堆叠歌曲信息的歌手段携带小字号 Paint,其余行回落整行 Paint。 */
+    private fun Row.paintAt(index: Int): Paint =
+        lines.getOrNull(index)?.paint ?: paint
+
+    private fun Row.ascentAt(index: Int): Float = paintAt(index).fontMetrics.ascent
+
+    /** 行盒底沿:descent 含字体基线下方越界量,与行盒步进同式。 */
+    private fun Row.descentAt(index: Int): Float {
+        val metrics = paintAt(index).fontMetrics
+        return metrics.descent + max(0f, metrics.bottom - metrics.descent)
+    }
+
+    private fun Row.baselineOffsets(): FloatArray =
+        mixedSizeLineBaselineOffsets(
+            FloatArray(lines.size) { ascentAt(it) },
+            FloatArray(lines.size) { descentAt(it) }
+        )
+
+    /** [index] 行基线相对整行首行基线的偏移(行内无行距;全同字号 = index × 统一行高)。 */
+    private fun Row.lineBaselineOffset(index: Int): Float {
+        if (index <= 0) return 0f
+        var offset = 0f
+        for (line in 0 until index) offset += descentAt(line) - ascentAt(line + 1)
+        return offset
+    }
+
+    private fun Row.stackHeight(): Float = mixedSizeLineStackHeight(
+        baselineOffsets(),
+        FloatArray(lines.size) { ascentAt(it) },
+        FloatArray(lines.size) { descentAt(it) }
+    )
+
+    /** 行内最高单行盒(统一字号栈的步进);仅作 legacy 读数的兜底。 */
+    private fun Row.uniformLineHeight(): Float {
+        var tallest = 0f
+        for (index in lines.indices) {
+            tallest = max(tallest, descentAt(index) - ascentAt(index))
+        }
+        return tallest
     }
 
     /**
@@ -2390,22 +2846,19 @@ internal class AodLyricCanvasView(
                 "bottom" -> "bottom"
                 else -> "top"
             }
-            val metadataMetrics = metadata.paint.fontMetrics
+            // 带高按文本块实际绘制高记账:混合字号(堆叠歌曲信息的歌手段)走逐行行盒
+            // (首行 ascent 顶到末行 descent 底),单一行盒会把小字行多推一个歌名行距、
+            // 整块多占高(上游 84a0c9ce 项 #3);全同字号时逐值等于旧式行盒。
             val metadataBounds = metadataLayoutBounds(
                 anchor,
                 oh.toFloat(),
                 padTop.toFloat(),
                 padBottom.toFloat(),
-                metadataMetrics.ascent,
-                metadataMetrics.descent,
+                metadata.ascentAt(0),
+                metadata.descentAt((metadata.lines.size - 1).coerceAtLeast(0)),
                 METADATA_LYRIC_GAP_DP * density,
                 // 带高 = max(文本块高, 图片槽边长):文本块在带内居中,歌词从带沿让出(见纯函数 KDoc)。
-                blockHeight = metadataBlockHeightPx(
-                    metadata.lines.size,
-                    metadata.lineHeight,
-                    metadataMetrics.ascent,
-                    metadataMetrics.descent
-                ),
+                blockHeight = metadata.stackHeight(),
                 bandHeight = if (artworkSlotActive(content)) {
                     artworkSidePx(
                         metadata.paint.textSize,
@@ -2626,16 +3079,19 @@ internal class AodLyricCanvasView(
                         originalLayout.lineHeight,
                         precedingRuby,
                         line.rubyHeight,
-                        originalLayout.lineGap
+                        originalLayout.lineGap,
+                        originalLayout.baselineOffsets()
                     )
                     val lineClipSave = clipOriginalLine(canvas, lineBaseline, line.rubyHeight)
                     if (line.ruby.isNotEmpty()) {
                         drawRuby(canvas, line, lineBaseline)
                     }
-                    originalPaint.shader = null
-                    originalPaint.setShadowLayer(0f, 0f, 0f, 0)
-                    setTextAlpha(originalPaint, 1f, 1f, resolvedPalette.sungText)
-                    drawOriginalText(canvas, line, lineBaseline)
+                    // 堆叠式开场占位:歌手段按自己的小字号 Paint 画在自己的行盒里。
+                    val paint = line.paint ?: originalPaint
+                    paint.shader = null
+                    paint.setShadowLayer(0f, 0f, 0f, 0)
+                    setTextAlpha(paint, 1f, 1f, resolvedPalette.sungText)
+                    drawOriginalText(canvas, line, lineBaseline, paint)
                     if (lineClipSave != -1) canvas.restoreToCount(lineClipSave)
                     precedingRuby += line.rubyHeight
                     lineIndex++
@@ -2671,25 +3127,55 @@ internal class AodLyricCanvasView(
 
     /**
      * 对唱并发行绘制(移植上游 duet/secondLine 呈现,按 CN+ 画布适配):
-     * 复用主行共享发光管线(LyricGlowRenderer),进度取并发行自己的行窗口/词表;
-     * 加入时整块 180ms alpha 淡入,淡入期间按静音态绘制(无发光/扫光,上游 exit-side
-     * muted 同语义);并发行离场随主行换行过渡的整块退场一起消失(数据面退出缓冲已保证
-     * 它不会在对唱中途凭空塌掉),v1 不做独立的并发行退场动画。
+     * 复用主行共享发光管线(LyricGlowRenderer),进度取并发行自己的行窗口/词表。
+     * 进场过渡有两条:首次出现(没有旧内容可退场)按加入淡入整块 180ms alpha,淡入期间
+     * 按静音态绘制(无发光/扫光,上游 exit-side muted 同语义);并发行**自己换行**时播
+     * 预设的退场 → 入场(旧内容由 [drawDuetRowExitLayer] 按退场半段画在同一槽位,新内容
+     * 按入场半段进场),此时不是静音态——与主行入场层同一口径。
      */
     private fun drawDuetOriginal(canvas: Canvas, baseline: Float) {
         val duetLayout = layout.duet ?: return
         val duet = content.duetLine ?: return
-        val alpha = duetJoinAlpha()
-        if (alpha <= 0f) return
-        val layer = if (alpha < 1f) {
-            canvas.saveLayerAlpha(0f, 0f, ow.toFloat(), oh.toFloat(), (255f * alpha).toInt())
-        } else {
-            canvas.save()
+        // 并发行/和声行随**活动行**一起显示(参照 HyperLyric:和声折进父行、随父行在唱就在屏上),
+        // 不做自己的时间窗门控——插件的行窗与生产者上报的位置来自两条时间轴(实测同一句
+        // 5.2s vs 20.5s),用其中一条去卡另一条会把和声整段挡掉。并发行行的槽位只由
+        // buildRows 的装配给出,主行换行过渡不移动它(见 [drawFrozenDuetRows]),这里只负责画。
+        // 诊断探针:并发行真的画出来时记一条(带窗口与文本),供真机判定「和声/对唱行有没有上屏」,
+        // 不依赖掐点抓屏。与 karaoke-probe 同口径(2s 节流、仅诊断日志开启时落盘)。
+        HookLogger.iThrottled("duet-draw", 2_000L, "AodLyricCanvasView") {
+            "Duet draw: pos=${projectedPosition()} window=${duet.lineStartMs}..${duet.lineEndMs} " +
+                "words=${duet.words.size} text=${duet.text.take(24)}"
         }
-        if (alpha < 1f) {
+        // 加入淡入期间按静音态绘制(无发光/扫光,上游 exit-side muted 同语义);透明度由
+        // 行级过渡层施加(见 [withDuetRowTransition]),这里只选绘制形态。
+        if (duetJoinAlpha() < 1f) {
             drawDuetStatic(canvas, duetLayout, baseline)
-        } else {
-            drawOriginalGlowBlock(
+            return
+        }
+        // 渲染路径与主行**同一决策函数**(见 [planDuetRow]):并发行带真实词窗时走词级卡拉OK
+        // (逐词真实时间戳),行级源才落共享扫光块。此前并发行恒走扫光块——整块进度按行窗
+        // 线性铺满,插件行窗若含拖长音(实测「乐鸣东方」末字「方」独占 5.65s)就会在音频
+        // 早已唱到别处之后仍在铺光(owner 2026-10-08:「第二句走的不是真实时间戳」)。
+        val duetPlan = planDuetRow(
+            animationMode = content.animationMode,
+            timed = hasTimedWordWindows(duet.words),
+            lineLevelSync = content.lineLevelSync,
+            lineSyncFillMode = content.lineSyncFillMode,
+            lineStartMs = duet.lineStartMs,
+            lineEndMs = duet.lineEndMs
+        )
+        when (duetPlan.path) {
+            OriginalLinePath.STATIC -> drawDuetStatic(canvas, duetLayout, baseline)
+            OriginalLinePath.WORD_KARAOKE -> drawWordKaraoke(
+                canvas = canvas,
+                baseline = baseline,
+                originalLayout = duetLayout,
+                betterLyrics = content.animationMode == "BetterLyrics",
+                blockStartMs = duet.lineStartMs,
+                blockEndMs = duet.lineEndMs,
+                probeTag = "duet-karaoke-probe"
+            )
+            OriginalLinePath.BLOCK_SWEEP -> drawOriginalGlowBlock(
                 canvas,
                 baseline,
                 duetLayout,
@@ -2699,10 +3185,9 @@ internal class AodLyricCanvasView(
                     duet.lineEndMs,
                     duet.words
                 ),
-                effectiveLineSyncFillMode()
+                duetPlan.fillMode
             )
         }
-        canvas.restoreToCount(layer)
     }
 
     /** 并发行静音态绘制:无发光/扫光/Shader,全亮 sungText(与主行 Minimal 档同式)。 */
@@ -2717,14 +3202,255 @@ internal class AodLyricCanvasView(
                 duetLayout.lineHeight,
                 precedingRuby,
                 line.rubyHeight,
-                duetLayout.lineGap
+                duetLayout.lineGap,
+                duetLayout.baselineOffsets()
             )
-            originalPaint.shader = null
-            originalPaint.setShadowLayer(0f, 0f, 0f, 0)
-            setTextAlpha(originalPaint, 1f, 1f, resolvedPalette.sungText)
-            drawOriginalText(canvas, line, lineBaseline)
+            val paint = line.paint ?: originalPaint
+            paint.shader = null
+            paint.setShadowLayer(0f, 0f, 0f, 0)
+            setTextAlpha(paint, 1f, 1f, resolvedPalette.sungText)
+            drawOriginalText(canvas, line, lineBaseline, paint)
             precedingRuby += line.rubyHeight
             lineIndex++
+        }
+    }
+
+    /**
+     * 过渡帧层:[frame] 的 alpha 走 saveLayerAlpha,位移/绕枢轴缩放/平面旋转/翻转透视逐项
+     * 施加(恒等帧只 save 不建层)。主行层与并发行层共用这一份施加逻辑,枢轴由调用方给出
+     * ——主行绕内容框中心(见 [drawRows]),并发行绕自己的行块中心(见
+     * [withDuetRowTransition])。
+     */
+    private fun beginTransitionFrameLayer(
+        canvas: Canvas,
+        frame: LineTransitionFrame,
+        pivotX: Float,
+        pivotY: Float
+    ): Int {
+        val animated = frame.alpha < 1f || frame.translateXDp != 0f ||
+            frame.translateYDp != 0f || frame.scale != 1f ||
+            frame.rotationDeg != 0f || frame.rotationXDeg != 0f || frame.rotationYDeg != 0f
+        if (!animated) return canvas.save()
+        val save = canvas.saveLayerAlpha(
+            0f,
+            0f,
+            ow.toFloat(),
+            oh.toFloat(),
+            (255f * frame.alpha).toInt()
+        )
+        canvas.translate(frame.translateXDp * density, frame.translateYDp * density)
+        if (frame.scale != 1f) {
+            canvas.scale(frame.scale, frame.scale, pivotX, pivotY)
+        }
+        if (frame.rotationDeg != 0f) {
+            canvas.rotate(frame.rotationDeg, pivotX, pivotY)
+        }
+        if (frame.rotationXDeg != 0f || frame.rotationYDeg != 0f) {
+            // 翻转档:Camera 透视等价于 View/graphicsLayer 的 rotationX/Y
+            // (Camera 坐标 Y 向上、屏幕 Y 向下,故取负号对齐语义)。
+            val camera = Camera()
+            val matrix = Matrix()
+            camera.rotateX(-frame.rotationXDeg)
+            camera.rotateY(-frame.rotationYDeg)
+            camera.getMatrix(matrix)
+            matrix.preTranslate(-pivotX, -pivotY)
+            matrix.postTranslate(pivotX, pivotY)
+            canvas.concat(matrix)
+        }
+        return save
+    }
+
+    /** 换行动画的横向基准(dp):内容框宽(行块横向铺满内容框,等价参考实现 target.getWidth())。 */
+    private fun transitionBlockWidthDp(): Float = (ow - padLeft - padRight) / density
+
+    /**
+     * 并发行行自己的过渡(见 [duetExitSnapshot] / [duetJoinAlpha]):内容键变化后播**它自己**
+     * 的换行半段 —— 预设过渡期间按入场半段施加(退场段内入场进度为 0,新内容不可见,与主行
+     * 入场层同一份配方与缓动),无预设过渡时回落既有加入淡入的整块 alpha。主行换行帧不作用于
+     * 并发行行(见 [drawFrozenDuetRows]):两行各有自己的时间轴。
+     *
+     * 帧变换的枢轴取**并发行行块自身中心**(见 [duetRowBlockPivotY]):主行层绕内容框中心
+     * 缩放会把不在中心的行推离槽位,而并发行必须原地换行。
+     */
+    private inline fun withDuetRowTransition(canvas: Canvas, row: Row, draw: () -> Unit) {
+        if (!row.duet) {
+            draw()
+            return
+        }
+        val frame = duetRowFrame(layout)
+        if (frame.alpha <= 0f) return
+        val layer = beginTransitionFrameLayer(
+            canvas,
+            frame,
+            (padLeft + (ow - padRight)) / 2f,
+            duetRowBlockPivotY(layout)
+        )
+        draw()
+        canvas.restoreToCount(layer)
+    }
+
+    /**
+     * 并发行行块的缩放枢轴 y(px):行盒包围盒中点 —— 并发行自己的过渡绕行块中心收放,
+     * 行块中心不动(主行层绕内容框中心缩放的枢轴对并发行是「别处」,会把整行推离槽位,
+     * 与「并发行不移动」冲突);无行/退化边界回落内容框中心。
+     */
+    private fun duetRowBlockPivotY(state: LayoutState): Float {
+        var top = Float.POSITIVE_INFINITY
+        var bottom = Float.NEGATIVE_INFINITY
+        state.rows.forEach { positioned ->
+            if (!positioned.row.duet) return@forEach
+            val rowTop = positioned.baseline + positioned.row.paint.fontMetrics.ascent
+            if (rowTop < top) top = rowTop
+            val rowBottom = rowTop + positioned.row.height
+            if (rowBottom > bottom) bottom = rowBottom
+        }
+        if (!top.isFinite() || !bottom.isFinite() || bottom <= top) {
+            return (padTop + (oh - padBottom)) / 2f
+        }
+        return (top + bottom) / 2f
+    }
+
+    /** 只含并发行行的布局副本:并发行自己的过渡帧以**并发行行块**为位移基准(见 [animatedBlockHeightDp])。 */
+    private fun duetRowOnly(state: LayoutState): LayoutState =
+        state.copy(rows = state.rows.filter { it.row.duet })
+
+    /**
+     * 并发行行自己的过渡帧:预设过渡期间为入场半段(缓动/时长/配方与主行入场层同一份),
+     * 无预设过渡时为加入淡入的整块 alpha([duetJoinAlpha]);高度取当前并发行行块(入场层
+     * 用新行块,与主行退场/入场各取本层行块同序)。
+     */
+    private fun duetRowFrame(state: LayoutState): LineTransitionFrame {
+        val timeline = duetTransitionTimeline
+        if (duetExitSnapshot == null || timeline == null) {
+            return LineTransitionFrame(alpha = duetJoinAlpha())
+        }
+        val clock = duetRowTransitionClock() ?: return LineTransitionFrame(alpha = 1f)
+        val mode = content.transitionMode
+        return lineTransitionEnterFrame(
+            mode,
+            lineTransitionEnterEasing(mode, clock.enterProgress),
+            transitionBlockWidthDp(),
+            animatedBlockHeightDp(duetRowOnly(state))
+        )
+    }
+
+    /**
+     * 并发行行组的绘制上下文:共享缩放(枢轴取内容框中心,与 [drawRows] 同口径)+ 内容裁剪。
+     * [drawFrozenDuetRows] 与并发行自己的退场层共用同一份 —— 两层在同一坐标系里,
+     * 「退场/入场共用同一槽位」由构造保证。
+     */
+    private fun beginDuetRowGroup(canvas: Canvas, state: LayoutState): Int {
+        val layer = canvas.save()
+        val scale = duetSharedScale(state)
+        if (scale != 1f) {
+            canvas.scale(
+                scale,
+                scale,
+                (padLeft + (ow - padRight)) / 2f,
+                (padTop + (oh - padBottom)) / 2f
+            )
+        }
+        val frameClip = lyricClipBounds(padLeft, padTop, ow - padRight, oh - padBottom)
+        canvas.clipRect(frameClip[0], frameClip[1], frameClip[2], frameClip[3])
+        return layer
+    }
+
+    /** 并发行单行绘制(含和声走的辅助行车道):当前层与退场层共用同一份分流。 */
+    private fun drawDuetRowAt(canvas: Canvas, positioned: PositionedRow, baseline: Float) {
+        if (positioned.row.kind == RowKind.DUET_ORIGINAL) {
+            drawDuetOriginal(canvas, baseline)
+        } else {
+            drawDuetAuxRowStatic(canvas, positioned.row, baseline)
+        }
+    }
+
+    /**
+     * 并发行自己换行的退场层(见 [duetExitSnapshot]):旧并发行行(起点快照的内容/布局/样式)
+     * 按预设退场半段画在**与当前层同一基线**上 —— 并发行不移动,退场/入场共用同一槽位,
+     * 无位移段(见 [duetRowTransitionTimeline]);主行换行不改并发行内容键,本层不出现
+     * (见 [shouldStartDuetRowTransition])。调用方先建立行组上下文([beginDuetRowGroup]:
+     * 共享缩放 + 内容裁剪),本层与当前层由此落在同一坐标系里。
+     */
+    private fun drawDuetRowExitLayer(canvas: Canvas, baselines: List<Float>) {
+        val snapshot = duetExitSnapshot ?: return
+        val timeline = duetTransitionTimeline ?: return
+        val clock = duetRowTransitionClock() ?: return
+        val oldRows = snapshot.layout.rows.filter { it.row.duet }
+        if (oldRows.isEmpty()) return
+        val mode = content.transitionMode
+        val frame = lineTransitionExitFrame(
+            mode,
+            lineTransitionExitEasing(mode, clock.exitProgress),
+            transitionBlockWidthDp(),
+            animatedBlockHeightDp(duetRowOnly(snapshot.layout))
+        )
+        if (frame.alpha <= 0f) return
+        val savedContent = content
+        val savedLayout = layout
+        applyRenderStyle(snapshot.renderStyle)
+        content = snapshot.content
+        layout = snapshot.layout
+        val layer = beginTransitionFrameLayer(
+            canvas,
+            frame,
+            (padLeft + (ow - padRight)) / 2f,
+            duetRowBlockPivotY(snapshot.layout)
+        )
+        oldRows.forEachIndexed { index, positioned ->
+            // 基线一律取当前层的槽位列表(退场/入场同槽位);旧行数多于当前层(旧辅助行)
+            // 时,尾巴用旧布局自己的基线兜底。
+            drawDuetRowAt(canvas, positioned, baselines.getOrNull(index) ?: positioned.baseline)
+        }
+        canvas.restoreToCount(layer)
+        content = savedContent
+        layout = savedLayout
+        applyRenderStyle(currentRenderStyle)
+    }
+
+    /**
+     * 主行过渡期间的并发行静止层(见 [drawOrientedContent]):并发行有自己独立的时间轴,
+     * 不参与主行的退场/位移/进场——过渡期间按过渡起点快照的槽位画在原地,主行层移走/
+     * 淡出/缩放时它不动、不变暗(共享缩放取起点快照,与前一帧口径一致)。
+     * 内容取当前布局(并发行自己的折行与词级进度照常推进);槽位取起点快照而不是新布局
+     * ——新布局是主行换行后的形态,槽位可能已随主行块高变化,用新槽位等于在过渡开始时把
+     * 并发行弹到别处。并发行**自己**换行时,退场层([drawDuetRowExitLayer])先用同一槽位
+     * 列表画旧内容,当前层按入场半段进场——退场/入场同槽位、无位移段。
+     */
+    private fun drawFrozenDuetRows(canvas: Canvas, snapshot: CanvasSnapshot) {
+        val duetRows = layout.rows.filter { it.row.duet }
+        if (duetRows.isEmpty()) return
+        val frozen = frozenDuetBaselines(
+            snapshotBaselines = snapshot.layout.rows.filter { it.row.duet }.map { it.baseline },
+            currentBaselines = duetRows.map { it.baseline }
+        )
+        val layer = beginDuetRowGroup(canvas, snapshot.layout)
+        drawDuetRowExitLayer(canvas, frozen)
+        duetRows.forEachIndexed { index, positioned ->
+            val baseline = frozen[index]
+            withDuetRowTransition(canvas, positioned.row) {
+                drawDuetRowAt(canvas, positioned, baseline)
+            }
+        }
+        canvas.restoreToCount(layer)
+    }
+
+    /** 并发行辅助行(含和声走的辅助行车道)的静态绘制:逐字效果开启时按自己的行窗点亮,否则全亮静态。 */
+    private fun drawDuetAuxRowStatic(canvas: Canvas, row: Row, baseline: Float) {
+        val auxWindow = row.auxKaraokeWindow
+        if (auxWindow != null) {
+            drawAuxKaraokeRow(canvas, row, baseline, auxWindow)
+            return
+        }
+        setTextAlpha(
+            row.paint,
+            staticSecondaryTextFactor(content.secondaryTextBright),
+            1f,
+            resolvedPalette.secondaryText
+        )
+        row.paint.shader = null
+        row.paint.clearShadowLayer()
+        row.lines.forEachIndexed { index, line ->
+            canvas.drawText(line.text, line.startX, baseline + index * row.lineHeight, row.paint)
         }
     }
 
@@ -2766,7 +3492,8 @@ internal class AodLyricCanvasView(
                 originalLayout.lineHeight,
                 precedingRuby,
                 line.rubyHeight,
-                originalLayout.lineGap
+                originalLayout.lineGap,
+                originalLayout.baselineOffsets()
             )
             if (line.ruby.isNotEmpty()) {
                 drawRuby(canvas, line, lineBaseline)
@@ -2776,7 +3503,10 @@ internal class AodLyricCanvasView(
                 left = line.startX,
                 width = line.width,
                 baseline = capturedBaseline,
-                drawText = { c, p -> drawLineTextForGlow(c, line, capturedBaseline, p) }
+                // 混合字号行(堆叠式开场占位的歌手段)以行自己的小字号绘制(见 glowLinePaint)。
+                drawText = { c, p ->
+                    drawLineTextForGlow(c, line, capturedBaseline, glowLinePaint(line, p))
+                }
             )
             precedingRuby += line.rubyHeight
             lineIndex++
@@ -2835,6 +3565,20 @@ internal class AodLyricCanvasView(
     }
 
     /**
+     * 共享扫光块的行绘制 Paint:混合字号行(堆叠式开场占位的歌手段)完整继承渲染核心
+     * 本次施加的颜色/Shader/阴影,仅替换字号与字体 —— 直接把行自己的 Paint 递进去会
+     * 丢掉 dim 底/扫光带的着色状态,照抄渲染核心的 Paint 再改字号才能既小又同步亮灭。
+     */
+    private fun glowLinePaint(line: OriginalLine, rendererPaint: Paint): Paint {
+        val linePaint = line.paint ?: return rendererPaint
+        if (linePaint === rendererPaint) return rendererPaint
+        glowLineScratchPaint.set(rendererPaint)
+        glowLineScratchPaint.textSize = linePaint.textSize
+        glowLineScratchPaint.typeface = linePaint.typeface
+        return glowLineScratchPaint
+    }
+
+    /**
      * 逐字卡拉OK路径（[betterLyrics] 为「BetterLyrics」档）：词级进度/放大/扫光与
      * 未唱下沉、已唱上浮、长音节辉光统一委托共享渲染核心 [LyricWordKaraokeRenderer]
      * （预览同源，杜绝效果漂移）。逐字时间源用真词时间窗;行级源（[betterLyrics] 且
@@ -2847,27 +3591,31 @@ internal class AodLyricCanvasView(
         canvas: Canvas,
         baseline: Float,
         originalLayout: OriginalLayout,
-        betterLyrics: Boolean = false
+        betterLyrics: Boolean = false,
+        blockStartMs: Long = content.lineStartMs,
+        blockEndMs: Long = content.lineEndMs,
+        probeTag: String = "karaoke-probe"
     ) {
         val lines = originalLayout.lines
         val position = projectedPosition()
         val sinkPx = karaokeFloatSinkPx(originalLayout.lineHeight)
         val totalWidth = lines.sumOf { it.width.toDouble() }.toFloat().coerceAtLeast(1f)
-        val blockStartMs = content.lineStartMs
-        val blockEndMs = content.lineEndMs
         val runs = ArrayList<KaraokeWordRun>(8)
         var precedingWidth = 0f
         var precedingRuby = 0f
         var lineIndex = 0
         while (lineIndex < lines.size) {
             val line = lines[lineIndex]
+            // 混合字号行(堆叠式开场占位的歌手段)按行自己的小字号测量与绘制;其余行回落主行 Paint。
+            val linePaint = line.paint ?: originalPaint
             val lineBaseline = originalLineBaseline(
                 baseline,
                 lineIndex,
                 originalLayout.lineHeight,
                 precedingRuby,
                 line.rubyHeight,
-                originalLayout.lineGap
+                originalLayout.lineGap,
+                originalLayout.baselineOffsets()
             )
             val lineClipSave = clipOriginalLine(canvas, lineBaseline, line.rubyHeight)
             if (line.ruby.isNotEmpty()) {
@@ -2905,10 +3653,10 @@ internal class AodLyricCanvasView(
                 for (block in syntheticKaraokeBlocks(line.text)) {
                     while (index < block.first) {
                         val unitEnd = karaokeUnitEnd(line.text, index, block.first)
-                        prefix += originalPaint.measureText(line.text, index, unitEnd)
+                        prefix += linePaint.measureText(line.text, index, unitEnd)
                         index = unitEnd
                     }
-                    val blockWidth = originalPaint.measureText(line.text, block.first, block.last + 1)
+                    val blockWidth = linePaint.measureText(line.text, block.first, block.last + 1)
                     val blockWindow = syntheticCharTimeWindow(
                         blockStartMs,
                         blockEndMs,
@@ -2924,7 +3672,7 @@ internal class AodLyricCanvasView(
                     var charIndex = block.first
                     while (charIndex <= block.last) {
                         val charEnd = karaokeUnitEnd(line.text, charIndex, block.last + 1)
-                        val charWidth = originalPaint.measureText(line.text, charIndex, charEnd)
+                        val charWidth = linePaint.measureText(line.text, charIndex, charEnd)
                         val charWindow = syntheticCharTimeWindow(
                             blockStartMs,
                             blockEndMs,
@@ -2949,21 +3697,22 @@ internal class AodLyricCanvasView(
             }
             if (lineIndex == 0) {
                 // 诊断探针(「BetterLyrics 效果和最简一样」排查):打印词级卡拉OK的全部输入现场值。
+                // 主行与并发行共用本函数,探针标签由调用方给出(并发行走 `duet-karaoke-probe`)。
                 HookLogger.iThrottled(
-                    "karaoke-probe", 2_000L, "AodLyricCanvasView"
+                    probeTag, 2_000L, "AodLyricCanvasView"
                 ) {
                     val firstRun = runs.firstOrNull()
                     val firstWord = line.words.firstOrNull()?.word
-                    "Karaoke probe: pos=$position lStart=${content.lineStartMs} " +
-                        "lEnd=${content.lineEndMs} lineSync=${content.lineLevelSync} " +
-                        "words=${content.words.size} runs=${runs.size} " +
+                    "Karaoke probe: pos=$position lStart=$blockStartMs " +
+                        "lEnd=$blockEndMs lineSync=${content.lineLevelSync} " +
+                        "words=${lines.sumOf { it.words.size }} runs=${runs.size} " +
                         "run0=[${firstRun?.text} played=${firstRun?.playedFraction}] " +
                         "word0=[${firstWord?.startMs}..${firstWord?.endMs}]"
                 }
             }
             LyricWordKaraokeRenderer.draw(
                 canvas = canvas,
-                paint = originalPaint,
+                paint = linePaint,
                 runs = runs,
                 baseline = lineBaseline,
                 sungColor = resolvedPalette.sungText,
@@ -3028,8 +3777,16 @@ internal class AodLyricCanvasView(
         aggregatedVisible = aggregatedVisible && isShown,
         effectiveAlpha = effectiveAlpha(),
         // 圆形封面旋转与行级时间轴/过渡同待遇:驱动帧循环推进旋转角,隐藏即停。
+        // 并发行自己的换行过渡(挂钟驱动)同样要帧循环才走得完,与主行过渡同待遇。
         timedOrTransitionActive = timingEffectActive() || exitSnapshot != null ||
-            artworkSpinActive(),
+            duetExitSnapshot != null || artworkSpinActive() || interludeDotsAnimating(
+                window = interludeDotsWindowOf(
+                    content.interludeDotsStartMs,
+                    content.interludeDotsEndMs
+                ),
+                positionMs = projectedPosition(),
+                speed = content.speed
+            ),
         handoffActive = handoffActive,
         verifiedDozeHost = useDozeHandlerCadence
     )
@@ -3107,6 +3864,20 @@ internal class AodLyricCanvasView(
         content: AodCanvasContent,
         availableWidth: Float
     ): OriginalLayout {
+        // 切歌开场占位(大元数据引导):主行位置显示本面组装的歌曲信息,换行沿用歌曲信息
+        // 口径(上游 amarinne/hyperglow 99ba119 项 #1)——过宽的切片在**歌词字号**下继续换行
+        // 到后续行,而不是把整块缩小到一行;堆叠布局下歌手段按 [introArtistPaint] 的小字号,
+        // 行盒按每行自己的度量推进(84a0c9ce 项 #3)。
+        if (isSongChangeMetadataPlaceholder(
+                content.original,
+                content.metadata,
+                content.lineStartMs,
+                content.lineEndMs,
+                content.words.any { it.endMs > it.startMs }
+            )
+        ) {
+            return buildMetadataIntroLayout(content, availableWidth)
+        }
         // 换行/词行布局统一委托 LyricLayoutEngine(与预览同源,断行一致)。
         val layout = layoutOriginalLines(
             original = content.original,
@@ -3131,6 +3902,75 @@ internal class AodLyricCanvasView(
             // 真实词窗判据(见 hasTimedWordWindows):行级标记不再压过它,渲染路径决策
             // (planOriginalLine / shouldUseSharedLineLevelSweep)与效果余量共用这一位。
             hasTimedWordWindows(content.words)
+        )
+    }
+
+    /**
+     * 切歌开场占位的主行布局(上游 99ba119 项 #1 + 84a0c9ce 项 #2/#3):
+     * `single` 把所有切片并成一行(整行歌词字号);`stacked` 逐片排 —— 第 0 片歌名按
+     * [originalPaint]、其后各片歌手/专辑署名按 [introArtistPaint] 的小字号。
+     * 两种布局下过宽切片都在**歌词字号**下继续换行(上限走歌词行数档),不再整体缩小;
+     * 每行携带自己的 Paint,行盒按每行自己的度量推进(见 [OriginalLayout.lineAscents])。
+     */
+    private fun buildMetadataIntroLayout(
+        content: AodCanvasContent,
+        availableWidth: Float
+    ): OriginalLayout {
+        val pieces = if (content.metadataLayout == METADATA_LAYOUT_SINGLE) {
+            listOf(metadataSingleLineText(content.metadata)).filter { it.isNotBlank() }
+        } else {
+            metadataLineTexts(content.metadata)
+        }
+        val artistIndexes = metadataArtistPieceIndexes(pieces.size)
+        val limit = lyricLayoutLineLimit()
+        val painted = ArrayList<Pair<LyricLayoutTextLine, Paint>>(pieces.size)
+        pieces.forEachIndexed { index, piece ->
+            val paint = if (index in artistIndexes) introArtistPaint else originalPaint
+            layoutMetadataLines(
+                text = piece,
+                metrics = paint.measurePort(),
+                availableWidth = availableWidth,
+                maxLines = limit
+            ).forEach { line -> painted += line to paint }
+        }
+        if (painted.isEmpty()) {
+            val metrics = originalPaint.fontMetrics
+            return OriginalLayout(
+                emptyList(),
+                metrics.descent - metrics.ascent + LYRIC_LINE_EXTRA_HEIGHT_DP * density,
+                LYRIC_LINE_GAP_DP * density,
+                false
+            )
+        }
+        val lines = painted.map { (line, paint) ->
+            val visual = visualExtents(line.text, paint, line.width)
+            OriginalLine(
+                text = line.text,
+                // 开场占位无词表:换行/绘制都按整行文本,逐字合成路径由空词表自然回落。
+                words = emptyList(),
+                width = line.width,
+                startX = alignedStart(line.width, alignment, visual.first, visual.second),
+                charStart = null,
+                charEnd = null,
+                paint = paint.takeUnless { it === originalPaint }
+            )
+        }
+        val metrics = originalPaint.fontMetrics
+        val lineHeight = metrics.descent - metrics.ascent + LYRIC_LINE_EXTRA_HEIGHT_DP * density
+        // 混合字号:逐行 ascent/descent 让歌手段按自己的行盒落在歌名段之下;全同字号
+        // (single 或只有一片)时恒空,保持普通歌词块的统一行盒。
+        val mixed = artistIndexes.isNotEmpty() && lines.size > 1
+        return OriginalLayout(
+            lines,
+            lineHeight,
+            LYRIC_LINE_GAP_DP * density,
+            false,
+            if (mixed) FloatArray(lines.size) { painted[it].second.fontMetrics.ascent }
+            else FloatArray(0),
+            if (mixed) FloatArray(lines.size) {
+                val fm = painted[it].second.fontMetrics
+                fm.descent + max(0f, fm.bottom - fm.descent)
+            } else FloatArray(0)
         )
     }
 
@@ -3189,15 +4029,83 @@ internal class AodLyricCanvasView(
             wordCount
         )
 
+    /**
+     * 翻译行的逐字时间线(插件/歌词源提供的词级译文,见 `PluginLyricField.TRANSLATION_WORDS`)。
+     *
+     * 与音标行 [transliterationLines] 同构:每段自带真实词窗(段文本直接相连——西文词间的
+     * 空格由来源写在片段内,这里不另插分隔符),按宽度均衡折行,折行后各行同样携带
+     * [SecondaryTimedSegment],由 [drawAuxKaraokeRow] 按真实词窗点亮。行文本与
+     * [AodCanvasContent.translated] 逐字符一致(片段重建不出整行译文时整体回落,见
+     * [translatedTimedSegments])。
+     *
+     * 无词级数据(插件没给 / 未装插件 / 该行源无逐字时间)返回 null,调用方回落到
+     * 行窗口 + 行内几何合成——即「辅助文字逐字效果」的历史行为。
+     */
+    private fun translatedTimedLines(
+        content: AodCanvasContent,
+        availableWidth: Float,
+        paint: Paint
+    ): List<TextLine>? {
+        // 逐字段的取舍(片段重建整行译文、空片段剔除、全零窗拒绝)在共享纯函数里,与单测同源。
+        val segments = translatedTimedSegments(
+            content.translationWords,
+            content.translated,
+            paint::measureText
+        ) ?: return null
+        return secondaryTimedVisualRanges(
+            segments,
+            availableWidth,
+            MAX_SECONDARY_LAYOUT_LINES,
+            wrap = content.adaptiveSectioning && content.overflowMode == "Wrap"
+        ).map { range ->
+            val lineSegments = range.map(segments::get)
+            val text = lineSegments.joinToString("") { it.text }
+            val lineWidth = lineSegments.sumOf { it.width.toDouble() }.toFloat()
+            textLine(text, lineWidth, paint).copy(timedSegments = lineSegments)
+        }
+    }
+
+    /**
+     * 和声行(role=BG 的 x-bg 回声,走辅助行车道的 [AodCanvasDuetLine.harmony] 行)的逐字
+     * 时间线:与 [translatedTimedLines] 同构——片段取自和声**自己的**词表
+     * ([AodCanvasDuetLine.words],插件按 AMLL TTML 规范逐音节下发,每音节自带 begin/end),
+     * 按宽度均衡折行,折行后各行携带 [SecondaryTimedSegment],由 [drawAuxKaraokeRow] 的逐字
+     * 字段路径按真实词窗点亮。此前只有行窗均匀合成(整行平摊到每个字),和声拖长音时整行
+     * 抢拍漂移——实测《乐鸣东方》L33 的 x-bg 和声末字「往)」独占 1.98s。
+     *
+     * 行文本与 [AodCanvasDuetLine.text] 逐字符一致(片段重建不出整行文本时返回 null,调用方
+     * 回落到行窗均匀合成——取舍与判据见共享纯函数 [harmonyTimedSegments])。
+     */
+    private fun harmonyTimedLines(
+        content: AodCanvasContent,
+        duet: AodCanvasDuetLine,
+        availableWidth: Float,
+        paint: Paint
+    ): List<TextLine>? {
+        val segments = harmonyTimedSegments(duet.words, duet.text, paint::measureText) ?: return null
+        return secondaryTimedVisualRanges(
+            segments,
+            availableWidth,
+            MAX_SECONDARY_LAYOUT_LINES,
+            wrap = content.adaptiveSectioning && content.overflowMode == "Wrap"
+        ).map { range ->
+            val lineSegments = range.map(segments::get)
+            val text = lineSegments.joinToString("") { it.text }
+            val lineWidth = lineSegments.sumOf { it.width.toDouble() }.toFloat()
+            textLine(text, lineWidth, paint).copy(timedSegments = lineSegments)
+        }
+    }
+
     private fun transliterationLines(
         content: AodCanvasContent,
         originalLayout: OriginalLayout,
-        availableWidth: Float
+        availableWidth: Float,
+        paint: Paint
     ): List<TextLine>? {
         if (originalLayout.lines.isEmpty() || originalLayout.lines.any { it.words.isEmpty() }) return null
         val sourceWords = originalLayout.lines.flatMap { it.words }.map { it.word }
         if (sourceWords.isEmpty()) return null
-        val spaceWidth = romanizedPaint.measureText(" ")
+        val spaceWidth = paint.measureText(" ")
         val timedIndexes = timedRomanizedWordIndexes(sourceWords)
         val segments = timedIndexes.mapIndexed { renderedIndex, sourceIndex ->
             val word = sourceWords[sourceIndex]
@@ -3205,7 +4113,7 @@ internal class AodLyricCanvasView(
             val nextSourceIndex = timedIndexes.getOrNull(renderedIndex + 1)
             SecondaryTimedSegment(
                 text = text,
-                width = romanizedPaint.measureText(text),
+                width = paint.measureText(text),
                 gapAfter = if (nextSourceIndex != null && word.boundaryAfter) spaceWidth else 0f,
                 startMs = word.startMs,
                 endMs = word.endMs
@@ -3228,8 +4136,41 @@ internal class AodLyricCanvasView(
                 }
             }
             val lineWidth = lineSegments.sumOf { (it.width + it.gapAfter).toDouble() }.toFloat()
-            textLine(text, lineWidth, romanizedPaint).copy(timedSegments = lineSegments)
+            textLine(text, lineWidth, paint).copy(timedSegments = lineSegments)
         }
+    }
+
+    /**
+     * 辅助行自适应字号拟合(「自适应大小」开启时,见 SurfaceProfile.secondaryAutoSize):
+     * 装得下恒返回共享 [paint](既有呈现逐像素不变);装不下缩到可读性下限,返回独立 Paint
+     * 副本 —— 共享 paint 为同车道多行共用,就地改字号会污染其他行。关闭开关直接返回共享 paint。
+     * 拟合判据走共享引擎 fittedSecondaryLines(与预览同一份)。
+     */
+    private fun fittedSecondaryPaint(
+        content: AodCanvasContent,
+        text: String,
+        paint: Paint,
+        preferredLines: Int,
+        availableWidth: Float,
+        translation: Boolean
+    ): Paint {
+        if (!content.secondaryAutoSize) return paint
+        // 下限与字号公式同源;baseSp 与 applyContentStyle 同式(同一 content,两处逐值一致)。
+        val baseSp = baseTextSizeSp(content.original) *
+            textSizeModeMultiplier(content.textSizeMode, content.textSizeCustom)
+        val configuredSp = paint.textSize / scaledDensity
+        val fitted = fittedSecondaryLines(
+            text = text,
+            basePaint = paint,
+            configuredSp = configuredSp,
+            floorSp = secondarySizeFloorSp(baseSp, translation),
+            availableWidth = availableWidth,
+            preferredLines = preferredLines,
+            wrap = content.overflowMode == "Wrap",
+            adaptiveSectioning = content.adaptiveSectioning,
+            scaledDensity = scaledDensity
+        )
+        return if (fitted.fittedSp < configuredSp) fitted.paint else paint
     }
 
     private fun wrapSecondaryText(
@@ -3251,8 +4192,14 @@ internal class AodLyricCanvasView(
         ).map { textLine(it.text, it.width, paint, lineAlignment) }
 
     /**
-     * 歌曲信息（歌名/歌手）专用换行：委托 LyricLayoutEngine.layoutMetadataLines
+     * 歌曲信息(歌名/歌手)专用换行:委托 LyricLayoutEngine.layoutMetadataLines
      * (与预览同源,最多 MAX_SECONDARY_LAYOUT_LINES 行);定位 X 按 metadata 对齐解析。
+     *
+     * **布局(上游 99ba119 项 #1)与混合字号(84a0c9ce 项 #2/#3)**:`single` 把所有切片用
+     * 行内中点分隔符并成一行(整行按歌名字号);`stacked` 按硬换行切片逐片测量 —— 第 0 片
+     * 歌名、其后各片歌手/专辑署名按 [metadataArtistPaint] 的小字号测量,每行携带自己的
+     * Paint,行盒才按真实行宽排(见 [Row.lineBaselineOffset] 的逐行行盒)。
+     * 两种布局下过宽的切片都换行到后续行,而不是把整块缩小。
      *
      * 歌曲图片槽:图片显示时文本可用宽先扣掉前置宽度(槽+间距,公式同源
      * AodCanvasTextMetrics),[alignment] 作用于「图片+文本块」整组——图片恒在
@@ -3275,24 +4222,54 @@ internal class AodLyricCanvasView(
         } else {
             0f
         }
-        val lines = layoutMetadataLines(
-            text = text,
-            paint = paint,
-            availableWidth = (availableWidth - leading).coerceAtLeast(1f)
-        )
-        if (leading <= 0f) {
-            return lines.map { textLine(it.text, it.width, paint, lineAlignment) }
-        }
-        val blockWidth = lines.maxOfOrNull { it.width } ?: 0f
-        val groupWidth = leading + blockWidth
-        val groupLeft = alignedStart(groupWidth, lineAlignment, 0f, groupWidth)
-        return lines.map { line ->
-            val inBlock = when (lineAlignment) {
-                Alignment.CENTER -> (blockWidth - line.width) / 2f
-                Alignment.END -> blockWidth - line.width
-                else -> 0f
+        val usable = (availableWidth - leading).coerceAtLeast(1f)
+        val laidOut = if (content.metadataLayout == METADATA_LAYOUT_SINGLE) {
+            val single = metadataSingleLineText(text)
+            if (single.isBlank()) return emptyList()
+            // 单行布局:整行按歌名字号,换行上限按歌词行数档(长歌名继续换行而非缩小整块)。
+            layoutMetadataLines(
+                text = single,
+                metrics = paint.measurePort(),
+                availableWidth = usable,
+                maxLines = lyricLayoutLineLimit()
+            ).map { line -> line to paint }
+        } else {
+            val pieces = metadataLineTexts(text)
+            val artistIndexes = metadataArtistPieceIndexes(pieces.size)
+            layoutMetadataLines(
+                text = text,
+                availableWidth = usable,
+                metricsForPiece = { index ->
+                    (if (index in artistIndexes) metadataArtistPaint else paint).measurePort()
+                },
+                maxLines = MAX_METADATA_LAYOUT_LINES
+            ).map { line ->
+                // 每行携带自己那片的 Paint:歌手段小字号、其余歌名字号。
+                line to if (line.pieceIndex in artistIndexes) metadataArtistPaint else paint
             }
-            TextLine(line.text, line.width, groupLeft + leading + inBlock)
+        }
+        return if (leading <= 0f) {
+            laidOut.map { (line, linePaint) ->
+                val visual = visualExtents(line.text, linePaint, line.width)
+                TextLine(
+                    line.text,
+                    line.width,
+                    alignedStart(line.width, lineAlignment, visual.first, visual.second),
+                    paint = linePaint
+                )
+            }
+        } else {
+            val blockWidth = laidOut.maxOfOrNull { it.first.width } ?: 0f
+            val groupWidth = leading + blockWidth
+            val groupLeft = alignedStart(groupWidth, lineAlignment, 0f, groupWidth)
+            laidOut.map { (line, linePaint) ->
+                val inBlock = when (lineAlignment) {
+                    Alignment.CENTER -> (blockWidth - line.width) / 2f
+                    Alignment.END -> blockWidth - line.width
+                    else -> 0f
+                }
+                TextLine(line.text, line.width, groupLeft + leading + inBlock, paint = linePaint)
+            }
         }
     }
 
@@ -3427,30 +4404,31 @@ internal class AodLyricCanvasView(
         canvas: Canvas,
         line: OriginalLine,
         baseline: Float,
+        paint: Paint = originalPaint,
         glow: Float = 0f
     ) {
         if (line.ruby.isEmpty()) {
-            drawGlowHalo(canvas, line.text, 0, line.text.length, line.startX, baseline, originalPaint, glow)
-            canvas.drawText(line.text, line.startX, baseline, originalPaint)
+            drawGlowHalo(canvas, line.text, 0, line.text.length, line.startX, baseline, paint, glow)
+            canvas.drawText(line.text, line.startX, baseline, paint)
             return
         }
         if (line.textRuns.isEmpty()) {
-            drawGlowHalo(canvas, line.text, 0, line.text.length, line.startX, baseline, originalPaint, glow)
-            canvas.drawText(line.text, line.startX, baseline, originalPaint)
+            drawGlowHalo(canvas, line.text, 0, line.text.length, line.startX, baseline, paint, glow)
+            canvas.drawText(line.text, line.startX, baseline, paint)
             return
         }
         var index = 0
         while (index < line.textRuns.size) {
             val run = line.textRuns[index]
             val runX = line.startX + run.x
-            drawGlowHalo(canvas, line.text, run.start, run.end, runX, baseline, originalPaint, glow)
+            drawGlowHalo(canvas, line.text, run.start, run.end, runX, baseline, paint, glow)
             canvas.drawText(
                 line.text,
                 run.start,
                 run.end,
                 runX,
                 baseline,
-                originalPaint
+                paint
             )
             index++
         }
@@ -3467,11 +4445,13 @@ internal class AodLyricCanvasView(
         var lineIndex = 0
         while (lineIndex < row.lines.size) {
             val line = row.lines[lineIndex]
-            val lineBaseline = baseline + lineIndex * row.lineHeight
+            // 逐行行盒 + 逐行 Paint:堆叠歌曲信息的歌手段用小字号 Paint 画在自己的行盒里。
+            val lineBaseline = baseline + row.lineBaselineOffset(lineIndex)
             if (row.kind == RowKind.METADATA) {
-                row.paint.color = resolvedPalette.metadataText
-                row.paint.alpha = 255
-                canvas.drawText(line.text, line.startX, lineBaseline, row.paint)
+                val paint = line.paint ?: row.paint
+                paint.color = resolvedPalette.metadataText
+                paint.alpha = 255
+                canvas.drawText(line.text, line.startX, lineBaseline, paint)
             } else if (row.kind == RowKind.NEXT_LINE) {
                 drawNextLine(canvas, row.paint, line.text, line.startX, lineBaseline)
             } else {
@@ -3541,10 +4521,14 @@ internal class AodLyricCanvasView(
         safetyInset = if (lineAlignment == Alignment.END) END_EDGE_SAFETY_DP * density else 0f
     )
 
-    private fun projectedPosition(): Long {
-        val elapsed = (SystemClock.elapsedRealtime() - content.sampledAtElapsedMs).coerceAtLeast(0L)
-        return content.positionMs + (elapsed * content.speed).toLong()
-    }
+    // 位置外推与 App 内预览同源:公式单点在 [projectedPositionMs](root.aod),预览实时态
+    // 的扫光/逐字读同一份换算,杜绝两侧各写一套造成「预览与实机不同拍」。
+    private fun projectedPosition(): Long = projectedPositionMs(
+        content.positionMs,
+        content.sampledAtElapsedMs,
+        content.speed,
+        SystemClock.elapsedRealtime()
+    )
 
     /**
      * 过渡时钟采样,两条路径:
@@ -3759,7 +4743,13 @@ internal class AodLyricCanvasView(
          * 辅助行在「辅助文字逐字效果」开启时携带;第二行歌词及其辅助行恒为空(它们的
          * 播放窗口尚未开始,不能借当前行窗口点亮)。
          */
-        val auxKaraokeWindow: LongRange? = null
+        val auxKaraokeWindow: LongRange? = null,
+        /**
+         * 并发行行标记(并发行块各行,含和声走辅助行车道的行):主行换行过渡不带走它们
+         * (见 [drawFrozenDuetRows]),它们只随并发行自己的换行过渡(退场→入场/加入淡入)
+         * 出现/切换。
+         */
+        val duet: Boolean = false
     )
     private data class OriginalLine(
         val text: String,
@@ -3770,13 +4760,17 @@ internal class AodLyricCanvasView(
         val charEnd: Int?,
         val ruby: List<RubyPlacement> = emptyList(),
         val rubyHeight: Float = 0f,
-        val textRuns: List<OriginalTextRun> = emptyList()
+        val textRuns: List<OriginalTextRun> = emptyList(),
+        /** 歌手段的小字号 Paint(仅堆叠式切歌开场占位携带);null = 用整块主行 Paint。 */
+        val paint: Paint? = null
     )
     private data class TextLine(
         val text: String,
         val width: Float,
         val startX: Float,
-        val timedSegments: List<SecondaryTimedSegment> = emptyList()
+        val timedSegments: List<SecondaryTimedSegment> = emptyList(),
+        /** 歌手段的小字号 Paint(仅堆叠式歌曲信息携带);null = 用整行 Paint。 */
+        val paint: Paint? = null
     )
     private data class BaseRun(val x: Float, val width: Float)
     private data class RubyPlacement(
@@ -3811,7 +4805,11 @@ internal class AodLyricCanvasView(
     )
     private data class RenderStyleSnapshot(
         val metadataPaint: Paint,
+        /** 歌手行 Paint(堆叠式歌曲信息的小字号行;见 applyContentStyle)。 */
+        val metadataArtistPaint: Paint,
         val originalPaint: Paint,
+        /** 切歌开场占位的歌手段 Paint(歌词字号 × 歌手百分比)。 */
+        val introArtistPaint: Paint,
         val romanizedPaint: Paint,
         val translatedPaint: Paint,
         val rubyPaint: Paint,
@@ -3824,12 +4822,45 @@ internal class AodLyricCanvasView(
         val lineHeight: Float,
         val lineGap: Float,
         /** 该行是否带真实词窗(见 [hasTimedWordWindows]):渲染路径决策与效果余量共用。 */
-        val timed: Boolean
+        val timed: Boolean,
+        /**
+         * 逐行 ascent/descent:仅混合字号块(堆叠式切歌开场占位:小字号歌手段在歌词字号的
+         * 歌名段之下)携带,行盒按每行自己的字体度量推进;普通歌词块恒空,保持单一行盒
+         * (上游 amarinne/hyperglow 84a0c9ce 项 #3)。
+         */
+        val lineAscents: FloatArray = FloatArray(0),
+        val lineDescents: FloatArray = FloatArray(0)
     ) {
         val lineCount: Int
             get() = lines.size
         val rubyHeight: Float
             get() = lines.sumOf { it.rubyHeight.toDouble() }.toFloat()
+        private val mixedOffsets: FloatArray
+            get() = mixedSizeLineBaselineOffsets(lineAscents, lineDescents, lineGap)
+
+        /** 行集是否携带混合字号(逐行度量),即不能用统一行盒排版。 */
+        val mixedSize: Boolean
+            get() = lineAscents.size == lines.size && lineAscents.isNotEmpty()
+
+        /** [lineIndex] 相对块首行基线的偏移(混合字号按逐行行盒,其余按统一行高 + 行距)。 */
+        fun baselineOffset(lineIndex: Int): Float =
+            if (mixedSize) mixedOffsets[lineIndex.coerceIn(0, lines.size - 1)]
+            else lineIndex * (lineHeight + lineGap)
+
+        /** 逐行基线偏移数组(混合字号非空,其余恒空 → 调用方回落统一行高)。 */
+        fun baselineOffsets(): FloatArray = if (mixedSize) mixedOffsets else FloatArray(0)
+
+        /**
+         * 整块文本高(行距已含)。混合字号 = 首行 ascent 顶到末行 descent 底
+         * ([mixedOffsets] 的步进已含 [lineGap],不再二次计入);统一字号 = 旧式行高 × 行数
+         * + 行距 × (行数 − 1),与 [originalRowHeight] 逐值相等。
+         */
+        val stackedHeight: Float
+            get() = if (mixedSize) {
+                mixedSizeLineStackHeight(mixedOffsets, lineAscents, lineDescents)
+            } else {
+                lineHeight * lines.size + lineGap * (lines.size - 1).coerceAtLeast(0)
+            }
     }
 
     private data class LayoutState(
@@ -3841,6 +4872,10 @@ internal class AodLyricCanvasView(
     companion object {
         /** 对唱并发行加入淡入时长(毫秒);期间静音态绘制,完成恢复共享发光管线。 */
         private const val DUET_JOIN_FADE_MS = 180L
+
+        /** 并发行加入淡入的续帧间隔:≈60Hz 一帧(淡入不在节奏门内,靠自己续帧走完)。 */
+        private const val DUET_ANIMATION_FRAME_MS = 16L
+
 
         /**
          * 同一帧到达窗口(≈60Hz 一帧):两条换行快照的到达间隔不超过它即按同帧计

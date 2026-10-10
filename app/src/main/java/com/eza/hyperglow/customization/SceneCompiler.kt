@@ -175,9 +175,13 @@ object SceneCompiler {
                 easing = profile.transition.easing.takeIf { it in EASINGS } ?: "fast_out_slow_in"
             ),
             alignment = profile.alignment.takeIf { it in ALIGNMENTS } ?: "auto",
-            secondaryMode = profile.secondaryMode.takeIf { it in SECONDARY_MODES } ?: "Main only",
+            secondaryMode = normalizeAuxMode(profile.secondaryMode),
             secondaryTextBright = profile.secondaryTextBright,
             secondaryWordKaraoke = profile.secondaryWordKaraoke,
+            secondaryTextSizePercent = normalizeSecondaryTextSizePercent(
+                profile.secondaryTextSizePercent
+            ),
+            secondaryAutoSize = profile.secondaryAutoSize,
             lyricLineLimit = normalizeLyricLineLimit(profile.lyricLineLimit),
             showNextLine = profile.showNextLine,
             secondaryNextLine = profile.secondaryNextLine,
@@ -186,6 +190,10 @@ object SceneCompiler {
                 supportedWidgets.any { it.type == "metadata" },
             metadataAnchor = if (profile.metadataAnchor == "bottom") "bottom" else "top",
             metadataSizePercent = profile.metadataSizePercent.coerceIn(50, 200),
+            metadataLayout = normalizeMetadataLayout(profile.metadataLayout),
+            metadataArtistSizePercent = normalizeSongInfoArtistSizePercent(
+                profile.metadataArtistSizePercent
+            ),
             metadataAlignment = profile.metadataAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
             nextLineAlignment = profile.nextLineAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
             artworkVisible = profile.artworkVisible,
@@ -196,6 +204,7 @@ object SceneCompiler {
             artworkSizeDp = normalizeArtworkSizeDp(profile.artworkSizeDp),
             duetAlignment = profile.duetAlignment,
             duetConcurrent = profile.duetConcurrent,
+            interludeCountdown = profile.interludeCountdown,
             rubyVisible = profile.rubyVisible,
             weight = profile.weight.takeIf { it in WEIGHTS } ?: "Medium",
             textSize = profile.textSize.takeIf { it in TEXT_SIZES } ?: "normal",
@@ -301,7 +310,8 @@ object SceneCompiler {
     private val TRANSITIONS = setOf("continuity", "crossfade", "none")
     private val EASINGS = setOf("fast_out_slow_in", "linear", "ease_out")
     private val ALIGNMENTS = setOf("auto", "start", "center", "end")
-    private val SECONDARY_MODES = setOf("Main only", "Transliteration", "Translation", "Both")
+    // 辅助文字模式不再是固定档位集合:历史四档 + 多选内容集合,校验即归一
+    // (见 normalizeAuxMode;词表外的值回落「仅主歌词」)。
     private val WEIGHTS = setOf("Regular", "Medium", "Bold")
     private val TEXT_SIZES = setOf("small", "normal", "large", "xlarge", "custom")
     private val FONT_FAMILIES = setOf("noto", "spotify", "apple", "noto-sc", "custom")

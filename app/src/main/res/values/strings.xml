@@ -79,6 +79,8 @@
     <string name="summary_lyric_source_superlyric">Uses the SuperLyric Xposed module, which pushes active lines over Binder.</string>
     <string name="summary_lyric_source_lyricinfo">Uses the LyricInfo Xposed module, reading lyrics injected into MediaSession metadata.</string>
     <string name="setting_filter_non_music_sources">Hide lyrics for video and other non-music audio</string>
+    <string name="setting_hide_credit_lines">Hide non-lyric lines (credits)</string>
+    <string name="summary_hide_credit_lines">Lines such as 作词/作曲/编曲 (lyricist, composer, arranger) are treated as credits rather than lyrics and are hidden while playing. Applies to both AOD and the lock screen.</string>
     <string name="summary_filter_non_music_sources">Identifies the current audio source (the player app and the audio content type it declares). Video apps and other non-music sources will not show lyrics.</string>
     <string name="label_active_source">Active source</string>
     <string name="summary_active_source">%1$s · %2$s</string>
@@ -364,6 +366,11 @@
     <string name="summary_lyric_time_offset">Positive values show lyrics later, negative values earlier (±5 s)</string>
 <string name="setting_duet_concurrent">Show concurrent lines (duet)</string>
 <string name="summary_duet_concurrent">When another sung line overlaps the current line by at least one second, show both lines together, each with its own karaoke timing. Lockscreen and always-on display switch independently.</string>
+    <string name="setting_interlude_countdown">Countdown dots for long interludes</string>
+    <string name="summary_interlude_countdown">When the gap between the current line and the next one lasts at least 4 seconds, show three dots in the lyric row that light up one by one and fade out as the next line approaches. Lockscreen and always-on display switch independently.</string>
+    <string name="setting_secondary_text_size">Auxiliary text size</string>
+    <string name="setting_secondary_auto_size">Adaptive auxiliary text size</string>
+    <string name="summary_secondary_auto_size">Shrink to the readable minimum when the auxiliary text does not fit</string>
     <string name="setting_bright_secondary_text">Bright secondary text</string>
     <string name="setting_secondary_word_karaoke">Word-by-word auxiliary text</string>
     <string name="summary_secondary_word_karaoke">The first line\'s auxiliary text (transliteration/translation) lights up word by word with the lyric; sources without word timing are synthesized from the line window. The second line and its auxiliary text are not affected.</string>
@@ -376,6 +383,10 @@
     <string name="setting_show_next_line">Show next line</string>
     <string name="setting_show_song_info">Show song info</string>
     <string name="choice_song_info_position">Song info position</string>
+    <string name="choice_song_info_layout">Song info layout</string>
+    <string name="option_song_info_layout_stacked">Stacked</string>
+    <string name="option_song_info_layout_single">Single line</string>
+    <string name="setting_song_info_artist_size">Artist line size</string>
     <string name="setting_song_info_size">Song info size</string>
     <string name="setting_song_info_parts">Song info content</string>
     <string name="setting_hide_album_same_as_title">Hide album when it matches the title</string>
@@ -482,6 +493,7 @@
     <string name="option_transliteration">Transliteration</string>
     <string name="option_translation">Translation</string>
     <string name="option_both">Both</string>
+    <string name="option_background_vocal">Harmony</string>
     <string name="option_wrap">Wrap</string>
     <string name="option_clip">Clip</string>
     <string name="option_regular">Regular</string>

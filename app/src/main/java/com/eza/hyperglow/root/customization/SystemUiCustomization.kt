@@ -13,8 +13,11 @@ import com.eza.hyperglow.customization.normalizeCardColor
 import com.eza.hyperglow.customization.normalizeLineTransition
 import com.eza.hyperglow.customization.normalizeLineTransitionSpeed
 import com.eza.hyperglow.customization.normalizeLyricLineLimit
+import com.eza.hyperglow.customization.normalizeMetadataLayout
 import com.eza.hyperglow.customization.normalizeMetadataParts
 import com.eza.hyperglow.customization.normalizeMetadataSeparators
+import com.eza.hyperglow.customization.normalizeSecondaryTextSizePercent
+import com.eza.hyperglow.customization.normalizeSongInfoArtistSizePercent
 import com.eza.hyperglow.aod.normalizePauseLingerMs
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
 import com.eza.hyperglow.root.surface.SurfacePolicyResolver
@@ -72,7 +75,10 @@ internal object SystemUiCustomizationValidator {
                 cardColor = rawLockscreen.cardColor,
                 metadataParts = rawAod.metadataParts,
                 metadataSeparators = rawAod.metadataSeparators,
-                duetMarkers = rawAod.duetMarkers
+                duetMarkers = rawAod.duetMarkers,
+                // 长间奏倒计时圆点:与 linkSurfaces 的其它歌词呈现项同批继承息屏值
+                // (开关只决定「本面画不画圆点」,不牵动快照内容)。
+                interludeCountdown = rawAod.interludeCountdown
             )
         } else {
             rawLockscreen
@@ -142,11 +148,24 @@ internal object SystemUiCustomizationValidator {
                     ?: "fast_out_slow_in"
             ),
             alignment = profile.alignment.takeIf { it in ALIGNMENTS } ?: "auto",
-            secondaryMode = profile.secondaryMode.takeIf { it in SECONDARY_MODES } ?: "Main only",
+            secondaryMode = com.eza.hyperglow.customization.normalizeAuxMode(profile.secondaryMode),
+            // 与 SceneCompiler.compileProfile 同源归一:两处不一致会让 validate 改写字段、
+            // wire 的 hash 校验拒收整份配置(实机表现为设置页正常、实机毫无变化)。
+            secondaryTextSizePercent = normalizeSecondaryTextSizePercent(
+                profile.secondaryTextSizePercent
+            ),
             lyricLineLimit = normalizeLyricLineLimit(profile.lyricLineLimit),
             metadataVisible = profile.metadataVisible && widgets.any { it.type == "metadata" },
             metadataAnchor = if (profile.metadataAnchor == "bottom") "bottom" else "top",
             metadataSizePercent = profile.metadataSizePercent.coerceIn(50, 200),
+            // 与 SceneCompiler.compileProfile 同源归一(未知值回落 stacked);两处不一致
+            // 会让 validate 改写字段、wire 的 hash 校验拒收整份配置。
+            metadataLayout = normalizeMetadataLayout(profile.metadataLayout),
+            // 与 SceneCompiler.compileProfile 同源归一(越界回落默认而非钳制);两处不一致
+            // 会让 validate 改写字段、wire 的 hash 校验拒收整份配置。
+            metadataArtistSizePercent = normalizeSongInfoArtistSizePercent(
+                profile.metadataArtistSizePercent
+            ),
             metadataAlignment = profile.metadataAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
             nextLineAlignment = profile.nextLineAlignment.takeIf { it in ALIGNMENTS } ?: "auto",
             artworkVisible = profile.artworkVisible,
@@ -212,7 +231,8 @@ internal object SystemUiCustomizationValidator {
     private val TRANSITIONS = setOf("continuity", "crossfade", "none")
     private val EASINGS = setOf("fast_out_slow_in", "linear", "ease_out")
     private val ALIGNMENTS = setOf("auto", "start", "center", "end")
-    private val SECONDARY_MODES = setOf("Main only", "Transliteration", "Translation", "Both")
+    // 辅助文字模式不再是固定档位集合:历史四档 + 多选内容集合,校验即归一
+    // (见 com.eza.hyperglow.customization.normalizeAuxMode,与编译侧同一份)。
     private val WEIGHTS = setOf("Regular", "Medium", "Bold")
     private val TEXT_SIZES = setOf("small", "normal", "large", "xlarge", "custom")
     private val FONT_FAMILIES = setOf("noto", "spotify", "apple", "noto-sc", "custom")

@@ -2,10 +2,13 @@ package com.eza.hyperglow.root.aod
 
 import com.eza.hyperglow.customization.ArtworkDisplayConfig
 import com.eza.hyperglow.customization.CompiledSurfaceProfile
+import com.eza.hyperglow.customization.DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT
 import com.eza.hyperglow.customization.METADATA_PARTS_DEFAULT
 import com.eza.hyperglow.customization.METADATA_SEPARATORS_DEFAULT
+import com.eza.hyperglow.customization.SECONDARY_TEXT_SIZE_PERCENT_DEFAULT
 import com.eza.hyperglow.customization.artworkDisplayConfig
 import com.eza.hyperglow.customization.composeSongMetadata
+import com.eza.hyperglow.customization.normalizeMetadataLayout
 import com.eza.hyperglow.customization.resolveLineTransition
 import com.eza.hyperglow.producer.stripDuetMarker
 import com.eza.hyperglow.producer.stripDuetMarkerRun
@@ -44,6 +47,14 @@ internal fun LyricSnapshot.toAodCanvasContent(
     }
     // 本面「识别对唱标记」:开启时隐去行首标记,并取标记识别版分侧;关闭时原样显示、取身份版。
     val duetMarkers = profile?.duetMarkers != false
+    // 长间奏倒计时圆点(per-surface):投影层只携带原始空隙两端,本面开关与「显示下一行」
+    // 延迟映射在此解析(见 interludeDotsWindow)。关闭时窗口为 null,呈现与改动前逐字一致。
+    val interludeDots = interludeDotsWindow(
+        interludeStartMs = interludeStartMs,
+        interludeEndMs = interludeEndMs,
+        enabled = profile?.interludeCountdown != false,
+        showsNextLine = profile?.showNextLine == true || profile?.secondaryNextLine == true
+    )
     // 大元数据引导:主行位置显示本面组装后的歌曲信息(快照下发的是占位符,这里替换)。
     val surfaceOriginal = when {
         largeMetadata -> surfaceMetadata
@@ -82,6 +93,19 @@ internal fun LyricSnapshot.toAodCanvasContent(
             it.sourceEnd
         )
     },
+    // 插件逐字翻译词表:片段文本即译文片段,不参与行首标记剥离(它不来自原文);
+    // 词级数据随快照下发,按面开关(「辅助文字逐字效果」)在渲染侧取用。
+    translationWords = translationWords.map {
+        AodCanvasWord(
+            it.text,
+            it.romanized,
+            it.startMs,
+            it.endMs,
+            it.boundaryAfter,
+            it.sourceStart,
+            it.sourceEnd
+        )
+    },
     ruby = if (profile?.rubyVisible == false) {
         emptyList()
     } else {
@@ -96,6 +120,9 @@ internal fun LyricSnapshot.toAodCanvasContent(
     secondaryMode = profile?.secondaryMode ?: secondaryMode,
     secondaryTextBright = profile?.secondaryTextBright ?: true,
     secondaryWordKaraoke = profile?.secondaryWordKaraoke ?: false,
+    secondaryTextSizePercent = profile?.secondaryTextSizePercent
+        ?: SECONDARY_TEXT_SIZE_PERCENT_DEFAULT,
+    secondaryAutoSize = profile?.secondaryAutoSize ?: true,
     lyricLineLimit = profile?.lyricLineLimit ?: 3,
     animationMode = profile?.animation ?: animationMode,
     glowMode = profile?.glow ?: glowMode,
@@ -118,6 +145,9 @@ internal fun LyricSnapshot.toAodCanvasContent(
     metadataVisible = profile?.metadataVisible ?: metadataVisible,
     metadataAnchor = if ((profile?.metadataAnchor ?: metadataAnchor) == "bottom") "bottom" else "top",
     metadataSizePercent = profile?.metadataSizePercent ?: 100,
+    metadataLayout = normalizeMetadataLayout(profile?.metadataLayout),
+    metadataArtistSizePercent = profile?.metadataArtistSizePercent
+        ?: DEFAULT_SONG_INFO_ARTIST_SIZE_PERCENT,
     adaptiveSectioning = profile?.adaptiveSectioning ?: adaptiveSectioning,
     palette = profile?.palette.orEmpty(),
     showNextLine = profile?.showNextLine ?: false,
@@ -134,7 +164,16 @@ internal fun LyricSnapshot.toAodCanvasContent(
     artworkAdaptiveScale = artwork.adaptiveScale,
     artworkSizeDp = artwork.sizeDp,
     playbackPaused = pauseRetentionEligible,
-    duetLine = if (duet && (profile?.duetConcurrent ?: true)) {
+    interludeDotsStartMs = interludeDots?.first ?: 0L,
+    interludeDotsEndMs = interludeDots?.last ?: 0L,
+    // 并发行门控(实机与预览同源,见 duetLineCarried):同尺寸并发行只认本面对唱开关;
+    // 和声行两段门控——候选携带(对唱开关 ∨ 勾了和声档)且未被多选里的「和声」取消勾选。
+    duetLine = if (duet && duetLineCarried(
+            profile?.duetConcurrent ?: true,
+            duetLine?.harmony == true,
+            profile?.secondaryMode ?: "Main only"
+        )
+    ) {
         duetLine?.let { line ->
             // 本面「识别对唱标记」:同源剥离并发行文本与逐字词表;剥空(纯标记行)整条丢弃。
             val duetText = if (duetMarkers) stripDuetMarker(line.text) else line.text
@@ -150,6 +189,9 @@ internal fun LyricSnapshot.toAodCanvasContent(
                         if (duetMarkers) line.alignedRightMarkers else line.alignedRight,
                         profile?.duetAlignment ?: true
                     ),
+                    // 和声身份原样过面:渲染侧据此走辅助行车道(不按「对唱分侧」门控——
+                    // 它不是演唱者身份,只是回声行的呈现车道)。
+                    harmony = line.harmony,
                     lineStartMs = line.lineStartMs,
                     lineEndMs = line.lineEndMs,
                     words = (if (duetMarkers) stripSurfaceDuetMarkerWords(line.words) else line.words).map {

@@ -78,6 +78,8 @@
     <string name="summary_lyric_source_superlyric">使用 SuperLyric Xposed 模塊，通過 Binder 實時推送當前歌詞行。</string>
     <string name="summary_lyric_source_lyricinfo">使用 LyricInfo Xposed 模塊，讀取注入到媒體會話元數據中的歌詞。</string>
     <string name="setting_filter_non_music_sources">影片等非音樂音訊不顯示歌詞</string>
+    <string name="setting_hide_credit_lines">不顯示非歌詞內容（作詞/作曲等）</string>
+    <string name="summary_hide_credit_lines">把「作詞/作曲/編曲」這類製作名單行當作非歌詞隱藏，不在息屏與鎖屏上顯示；遇到這類行時自動顯示下一句歌詞或播放佔位符。</string>
     <string name="summary_filter_non_music_sources">識別當前音訊源（播放器應用與工作階段宣告的音訊內容類型）：影片、播客等非音樂內容播放時不顯示歌詞。</string>
     <string name="label_active_source">當前歌詞源</string>
     <string name="summary_active_source">%1$s · %2$s</string>
@@ -334,6 +336,11 @@
     <string name="summary_lyric_time_offset">正數延後顯示,負數提前顯示(±5 秒)</string>
 <string name="setting_duet_concurrent">顯示並發歌詞（對唱）</string>
 <string name="summary_duet_concurrent">另一行唱詞與主行播放視窗重疊達到 1 秒時,兩行同時顯示、各畫各的逐字掃光。鎖屏與熄屏各自獨立開關。</string>
+    <string name="setting_interlude_countdown">長間奏顯示倒數圓點</string>
+    <string name="summary_interlude_countdown">當前行與下一行之間的空隙達到 4 秒時,歌詞行位置改畫三個圓點,隨下一行臨近逐點亮起再漸隱。鎖屏與熄屏各自獨立開關。</string>
+    <string name="setting_secondary_text_size">輔助文字大小</string>
+    <string name="setting_secondary_auto_size">輔助文字自適應大小</string>
+    <string name="summary_secondary_auto_size">裝不下時縮小到可讀下限</string>
     <string name="setting_bright_secondary_text">高亮輔助文字</string>
     <string name="setting_secondary_word_karaoke">輔助文字逐字效果</string>
     <string name="summary_secondary_word_karaoke">第一行輔助文字(音標/翻譯)隨歌詞逐字點亮;來源未提供逐字時間時依行視窗合成推進。第二行歌詞及其輔助文字不受影響。</string>
@@ -346,6 +353,10 @@
     <string name="setting_show_next_line">顯示下一行歌詞</string>
     <string name="setting_show_song_info">顯示歌曲信息</string>
     <string name="choice_song_info_position">歌曲信息位置</string>
+    <string name="choice_song_info_layout">歌曲信息版面</string>
+    <string name="option_song_info_layout_stacked">堆疊</string>
+    <string name="option_song_info_layout_single">單行</string>
+    <string name="setting_song_info_artist_size">歌手行大小</string>
     <string name="setting_song_info_size">歌曲信息大小</string>
     <string name="setting_song_info_parts">歌曲信息內容</string>
     <string name="setting_hide_album_same_as_title">專輯與歌名一致時隱藏專輯</string>
@@ -453,6 +464,7 @@
     <string name="option_transliteration">轉寫</string>
     <string name="option_translation">翻譯</string>
     <string name="option_both">兩者</string>
+    <string name="option_background_vocal">和聲</string>
     <string name="option_wrap">換行</string>
     <string name="option_clip">裁切</string>
     <string name="option_regular">常規</string>

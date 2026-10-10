@@ -5,6 +5,7 @@ import android.os.RemoteCallbackList
 import android.os.SystemClock
 import com.eza.hyperglow.AppLog
 import com.eza.hyperglow.customization.CompiledCustomization
+import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.root.customization.CompiledCustomizationBundleCodec
 import kotlin.math.abs
 
@@ -65,10 +66,21 @@ data class AodDisplayState(
     val sampledAtElapsedMs: Long = 0L,
     val speed: Float = 1f,
     val words: List<AodDisplayWord> = emptyList(),
+    /**
+     * 插件提供的逐字翻译词表(词级译文 + 时间窗,见 `PluginLyricField.TRANSLATION_WORDS`):
+     * 翻译辅助行按真实词窗点亮;空表 = 无词级数据,渲染侧回落行窗口合成。
+     */
+    val translationWords: List<AodDisplayWord> = emptyList(),
     val ruby: List<AodDisplayRuby> = emptyList(),
     val layoutGroups: List<AodDisplayLayoutGroup> = emptyList(),
     /** 对唱并发行(仅息屏消费);null = 无并发行或「显示并发歌词(对唱)」已关。 */
     val duetLine: AodDisplayDuetLine? = null,
+    /**
+     * 长间奏窗口(v10,参考 HyperLyric 倒计时圆点):上一行 end .. 下一行 start 的原始空隙
+     * (投影层判定 ≥4s 才携带);0/0 = 无。渲染面按本面开关与「显示下一行」映射解析。
+     */
+    val interludeStartMs: Long = 0L,
+    val interludeEndMs: Long = 0L,
     val weight: String = "Medium",
     val textSizeMode: String = "normal",
     val textSizeCustom: Int = 100,
@@ -136,6 +148,8 @@ data class AodDisplayDuetLine(
     val alignedRight: Boolean = false,
     /** 对唱分侧(标记识别版);由渲染面按本面「识别对唱标记」开关选用。 */
     val alignedRightMarkers: Boolean = false,
+    /** 和声行(插件行 role=BG 的 x-bg 回声):渲染面走辅助行车道,不与对唱同款。 */
+    val harmony: Boolean = false,
     val lineStartMs: Long = 0L,
     val lineEndMs: Long = 0L,
     val words: List<AodDisplayWord> = emptyList()
@@ -438,6 +452,29 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
             )
         }
         .toList()
+    // 插件逐字翻译词表:与 words 同一道钳制(条数上限/时间钳到歌长/文本净化);片段不指向
+    // 原文,source 范围恒 -1(与并发行词表同口径);空文本片段整条丢弃(不贡献译文文本)。
+    val translationWords = state.translationWords.asSequence()
+        .take(AodStateWireLimits.MAX_WORDS)
+        .mapNotNull { word ->
+            val text = word.text.sanitizeUtf16().takeUtf16Prefix(AodStateWireLimits.MAX_LYRIC_CHARS)
+            if (text.isEmpty()) return@mapNotNull null
+            val startMs = word.startMs.coerceAtLeast(0L).let {
+                if (duration > 0L) it.coerceAtMost(duration) else it
+            }
+            word.copy(
+                text = text,
+                romanized = "",
+                startMs = startMs,
+                endMs = word.endMs.coerceAtLeast(startMs).let {
+                    if (duration > 0L) it.coerceAtMost(duration) else it
+                },
+                boundaryAfter = true,
+                sourceStart = -1,
+                sourceEnd = -1
+            )
+        }
+        .toList()
     val ruby = state.ruby.asSequence()
         .take(AodStateWireLimits.MAX_RUBY)
         .mapNotNull { item ->
@@ -469,6 +506,11 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
     // 对唱并发行:文本钳制、时间窗/词级时间钳到歌长、词级 source 范围弃用(画布并发行
     // 不走逐字扫光路径);ruby/layoutGroups v1 不携带。条数超限/文本为空整条丢弃
     // (并发行是可选增强,不应连累主行发布)。
+    HookLogger.iThrottled("duet-bridge", 5_000L, "AodStateBridge") {
+        val d = state.duetLine
+        "Duet bridge: in=${d?.text?.take(16)} inWin=${d?.lineStartMs}..${d?.lineEndMs} " +
+            "duration=$duration out=${d != null && d.text.isNotBlank()}"
+    }
     val duetLine = state.duetLine?.let { line ->
         val duetText = line.text.normalizeAodWireText(AodStateWireLimits.MAX_LYRIC_CHARS)
         if (duetText.isEmpty()) {
@@ -480,6 +522,7 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
                 translated = line.translated.normalizeAodWireText(AodStateWireLimits.MAX_LYRIC_CHARS),
                 alignedRight = line.alignedRight,
                 alignedRightMarkers = line.alignedRightMarkers,
+                harmony = line.harmony,
                 lineStartMs = line.lineStartMs.coerceAtLeast(0L).let {
                     if (duration > 0L) it.coerceAtMost(duration) else it
                 },
@@ -505,7 +548,16 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
             )
         }
     }
-    val (budgetWords, budgetRuby, budgetGroups) = fitAodEnhancementBudget(
+    // 长间奏窗口:两端钳到歌长,半截/退化窗口整体清零(fail-closed:宁可不显示圆点,
+    // 不携带越界或半截窗口让渲染面画出错位的倒计时)。
+    val interludeStartMs = state.interludeStartMs.coerceAtLeast(0L).let {
+        if (duration > 0L) it.coerceAtMost(duration) else it
+    }
+    val interludeEndMs = state.interludeEndMs.coerceAtLeast(0L).let {
+        if (duration > 0L) it.coerceAtMost(duration) else it
+    }
+    val interludeValid = interludeStartMs > 0L && interludeEndMs > interludeStartMs
+    val fitted = fitAodEnhancementBudget(
         baseTexts = listOf(
             original,
             romanized,
@@ -520,6 +572,7 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
         ),
         styleTexts = styleTokens(state),
         words = words,
+        translationWords = translationWords,
         ruby = ruby,
         groups = layoutGroups
     )
@@ -579,9 +632,10 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
         speed = state.speed.takeIf {
             it.isFinite() && it in 0f..AodStateWireLimits.MAX_PLAYBACK_SPEED
         } ?: 1f,
-        words = budgetWords,
-        ruby = budgetRuby,
-        layoutGroups = budgetGroups,
+        words = fitted.words,
+        translationWords = fitted.translationWords,
+        ruby = fitted.ruby,
+        layoutGroups = fitted.groups,
         duetLine = duetLine,
         weight = normalizeAodWeight(state.weight),
         textSizeMode = normalizeAodTextSize(state.textSizeMode),
@@ -597,7 +651,9 @@ internal fun normalizeAodDisplayState(state: AodDisplayState): AodDisplayState {
         alignmentMode = normalizeAodAlignment(state.alignmentMode),
         metadataAnchor = normalizeAodMetadataAnchor(state.metadataAnchor),
         artworkJpeg = artworkJpeg,
-        artworkKey = artworkKey
+        artworkKey = artworkKey,
+        interludeStartMs = if (interludeValid) interludeStartMs else 0L,
+        interludeEndMs = if (interludeValid) interludeEndMs else 0L
     )
 }
 
@@ -675,6 +731,17 @@ private fun AodDisplayState.toWireMessage(
                     sourceEnd = word.sourceEnd
                 )
             },
+            translationWords = translationWords.map { word ->
+                AodStateWireWord(
+                    text = word.text,
+                    romanized = word.romanized,
+                    startMs = word.startMs,
+                    endMs = word.endMs,
+                    boundaryAfter = word.boundaryAfter,
+                    sourceStart = word.sourceStart,
+                    sourceEnd = word.sourceEnd
+                )
+            },
             ruby = ruby.map { item ->
                 AodStateWireRuby(item.start, item.end, item.reading)
             },
@@ -704,6 +771,8 @@ private fun AodDisplayState.toWireMessage(
             adaptiveSectioning = adaptiveSectioning,
             artworkJpeg = ArtworkJpeg(artworkJpeg),
             artworkKey = artworkKey,
+            interludeStartMs = interludeStartMs,
+            interludeEndMs = interludeEndMs,
             duetLine = duetLine?.let { line ->
                 AodStateWireDuetLine(
                     text = line.text,
@@ -711,6 +780,7 @@ private fun AodDisplayState.toWireMessage(
                     translated = line.translated,
                     alignedRight = line.alignedRight,
                     alignedRightMarkers = line.alignedRightMarkers,
+                    harmony = line.harmony,
                     lineStartMs = line.lineStartMs,
                     lineEndMs = line.lineEndMs,
                     words = line.words.map { word ->
@@ -762,21 +832,30 @@ private fun styleTokens(state: AodDisplayState): List<String> = listOf(
 )
 
 /**
- * 增强数据（词/注音/布局组）的聚合文本预算裁剪。
+ * 增强数据（词/逐字翻译词表/注音/布局组）的聚合文本预算裁剪。
  *
  * [AodStateWireCodec] 的 isValidSnapshot 按 UTF-8 字节总额把关
  * （[AodStateWireLimits.MAX_AGGREGATE_TEXT_UTF8_BYTES]），超限直接拒收整包、静默降级为
- * Hidden——整句歌词会因为词级数据超长而整体消失。词/注音/布局组是可选增强（STYLE_GUIDE:
- * 可选内容按序降级），这里按校验侧同一计数顺序（行文本 → 样式 → 词 → 注音 → 布局组）
- * 只装下最长前缀，行文本永远保留；口径与顺序必须与 isValidSnapshot 的 Utf8Budget 一致。
+ * Hidden——整句歌词会因为词级数据超长而整体消失。这些字段都是可选增强（STYLE_GUIDE:
+ * 可选内容按序降级），这里按校验侧同一计数顺序（行文本 → 样式 → 词 → 逐字翻译词 →
+ * 注音 → 布局组）只装下最长前缀，行文本永远保留；口径与顺序必须与 isValidSnapshot 的
+ * Utf8Budget 一致。
  */
+private data class FittedAodEnhancements(
+    val words: List<AodDisplayWord>,
+    val translationWords: List<AodDisplayWord>,
+    val ruby: List<AodDisplayRuby>,
+    val groups: List<AodDisplayLayoutGroup>
+)
+
 private fun fitAodEnhancementBudget(
     baseTexts: List<String>,
     styleTexts: List<String>,
     words: List<AodDisplayWord>,
+    translationWords: List<AodDisplayWord>,
     ruby: List<AodDisplayRuby>,
     groups: List<AodDisplayLayoutGroup>
-): Triple<List<AodDisplayWord>, List<AodDisplayRuby>, List<AodDisplayLayoutGroup>> {
+): FittedAodEnhancements {
     var used = 0
     fun accept(vararg values: String): Boolean {
         var extra = 0
@@ -788,7 +867,8 @@ private fun fitAodEnhancementBudget(
     // 行文本与样式是内容本身，必装（normalizeAodWireText 已压进各自字符上限）。
     for (text in baseTexts + styleTexts) accept(text)
     val keptWords = words.takeWhile { accept(it.text, it.romanized) }
+    val keptTranslationWords = translationWords.takeWhile { accept(it.text, it.romanized) }
     val keptRuby = ruby.takeWhile { accept(it.reading) }
     val keptGroups = groups.takeWhile { accept(it.kind) }
-    return Triple(keptWords, keptRuby, keptGroups)
+    return FittedAodEnhancements(keptWords, keptTranslationWords, keptRuby, keptGroups)
 }
