@@ -146,7 +146,8 @@ X sweep across every visible lyric row. Word/syllable timing remains unchanged.
   Per AOSP `AppsFilterImpl`, the flag is only honored when the declaring package is system-installed,
   so a priv-app/preinstalled install is what it actually serves; it is declared to match upstream and
   changes nothing for a user-installed module.
-- AOD callback accepts only system UID containing `com.android.systemui`.
+- AOD callback accepts only the caller UID resolved from the `com.android.systemui` package; SystemUI
+  is not always uid 1000, so a hardcoded system-UID check would reject valid callbacks.
 - Protocol, sequence, payload size, document identity, row count, word count, timing, and text bounds fail closed. Document pipes use the declared compressed byte count as an exact frame boundary and reject short/truncated frames.
 - Closed producer render-mode strings are normalized once at bridge ingress. Current values are
   preserved, known legacy aliases are canonicalized, unknown values use producer-safe defaults, and
@@ -175,8 +176,10 @@ X sweep across every visible lyric row. Word/syllable timing remains unchanged.
   missing Xiaomi symbols clears output and restores stock AOD placement.
 - Lockscreen lyrics require explicit opt-in and hide for unsupported/custom themes, secondary
   displays, bouncer/auth entry, stale state, or insufficient safe geometry.
-- While visible playback is active, including loading/no-lyrics fallback, a 4-second bounded heartbeat
-  refreshes snapshot freshness.
+- While visible playback is active, including loading/no-lyrics fallback, a bounded heartbeat refreshes
+  snapshot freshness: most beats are scalar keepalive messages on a 1.5-second cadence, and a full
+  snapshot is re-sent on a 4.5-second republish threshold (about 6 seconds on the loading/no-lyrics
+  fallback path).
   It pulses Xiaomi's AOD draw wake lock for 5.5 seconds only when AOD keepalive is enabled.
 - Device-verified `MiuiShowStyleController.smartHide()` and `hideDoze()` policy calls are suppressed
   only during the independent Spotify-playing AOD power session or a bounded playing-state transport
@@ -265,8 +268,11 @@ against arbitrary third-party code in SystemUI applies to plugin code as well.
   location (Android 14 rejects writable dex paths), and loaded through dedicated class loaders
   (`PathClassLoader` / `InMemoryDexClassLoader`).
 - Class-loader delegation is a load boundary, not a security sandbox: host-owned prefixes (`java.`,
-  `android.`, `kotlin.`, `androidx.`, the plugin API contract package) resolve parent-first and
-  everything else resolves child-first, so a plugin cannot shadow host classes.
+  `javax.`, `android.`, `androidx.`, `dalvik.`, `libcore.`, `org.json.`, `org.w3c.`, `org.xml.`,
+  `org.xmlpull.`, and the plugin API contract package) resolve parent-first; everything else —
+  including the `kotlin.` / `kotlinx.` helpers a plugin bundles — resolves child-first, so the
+  plugin's own copies win and it cannot shadow platform or API classes. (Full rule:
+  `docs/PLUGIN_DEVELOPMENT.md` §11.)
 - The plugin API surface is the byte-fingerprinted contract under `plugins/api`; CI fails when the
   contract changes without an explicit fingerprint update.
 - Trust model: a plugin is user-installed input of untrusted origin. Installing it grants it the app
@@ -413,7 +419,7 @@ profile 开关只选择亮色或暗色呈现，从不改变时序节奏。行级
 
 - 生产者端点只接受包含 `com.spotify.music` 的 UID。
 - 应用声明 `forceQueryable`，让 Spotify 无需改动自身 manifest 即可发现本模块的 bridge service 与 provider。包可见性不授予访问权限；两端仍各自校验 caller UID。按 AOSP `AppsFilterImpl` 的实现，该标志只在声明方为系统安装时被读取，因此真正生效的是 priv-app/预装安装；保留该声明是为与上游对齐，对用户安装的模块不改变任何行为。
-- AOD 回调只接受包含 `com.android.systemui` 的系统 UID。
+- AOD 回调只接受由 `com.android.systemui` 包名解析出的调用方 UID；SystemUI 并不总是 uid 1000，硬编码系统 UID 检查会拒绝正常调用。
 - 协议、序列号、载荷大小、文档标识、行数、词数、时序与文本边界一律 fail closed。文档管道以声明的压缩字节数作为精确的帧边界，并拒绝过短/截断的帧。
 - 封闭的生产者渲染模式字符串会在 bridge 入口处一次性归一化。当前值原样保留，已知的遗留别名
   转换为规范形式，未知值使用对生产者安全的默认值，自定义文字大小会在状态进入 projection/渲染
@@ -438,8 +444,9 @@ profile 开关只选择亮色或暗色呈现，从不改变时序节奏。行级
   Binder 死亡、surface 脱离或 Xiaomi 符号缺失都会清除输出并恢复原生 AOD 摆放。
 - 锁屏歌词需要显式开启，并在遇到不受支持/自定义主题、副屏、bouncer/鉴权入口、过期状态或安全
   几何不足时隐藏。
-- 当可见播放处于活跃状态（包括加载中/无歌词回退）时，一个间隔 4 秒的受限心跳会刷新 snapshot
-  的新鲜度。
+- 当可见播放处于活跃状态（包括加载中/无歌词回退）时，受限心跳会刷新 snapshot 的新鲜度：心跳
+  多为 1.5 秒一拍的纯标量 keepalive，snapshot 年龄超过 4.5 秒重发门槛时则改发全量快照
+  （加载中/无歌词回退路径下约 6 秒）。
   仅在启用 AOD keepalive 时，它才会为 Xiaomi 的 AOD 绘制 wake lock 发放 5.5 秒的脉冲。
 - 仅在独立的 Spotify 播放期 AOD 电源会话或受限的播放状态传输宽限期间，设备已验证的
   `MiuiShowStyleController.smartHide()` 与 `hideDoze()` 策略调用才会被抑制。每个播放中的歌曲
@@ -510,8 +517,11 @@ AOD 宿主容器以及锁屏控制器/宿主/几何接缝；未知 profile 仍�
 - 安装与加载分阶段进行：插件包先做结构性校验（`PluginManifest`：id 格式、对宿主的 API 版本、
   入口点、设置 schema），写入只读位置（Android 14 拒绝可写 dex 路径），再经专用类加载器
   （`PathClassLoader` / `InMemoryDexClassLoader`）加载。
-- 类加载器委派是加载边界，不是安全沙箱：宿主拥有的前缀（`java.`、`android.`、`kotlin.`、
-  `androidx.`、插件 API 契约包）按双亲优先解析，其余按子优先解析，因此插件无法遮蔽宿主类。
+- 类加载器委派是加载边界，不是安全沙箱：宿主拥有的前缀（`java.`、`javax.`、`android.`、
+  `androidx.`、`dalvik.`、`libcore.`、`org.json.`、`org.w3c.`、`org.xml.`、`org.xmlpull.`、
+  插件 API 契约包）按双亲优先解析；其余——**包括插件自带的 `kotlin.` / `kotlinx.` 副本**——
+  按子优先解析：插件自己的副本胜出，插件无法遮蔽平台类或 API 类。（完整规则见
+  `docs/PLUGIN_DEVELOPMENT.md` §11。）
 - 插件 API 面是 `plugins/api` 下带字节指纹的契约；契约变更而没有显式更新指纹时，CI 会失败。
 - 信任模型：插件是用户自行安装的不可信来源输入。安装它所授予的是 app 进程自身的能力——没有
   SystemUI 访问权、没有 root、没有 Xposed hook。manifest 校验仅是结构性的；当前没有加密的

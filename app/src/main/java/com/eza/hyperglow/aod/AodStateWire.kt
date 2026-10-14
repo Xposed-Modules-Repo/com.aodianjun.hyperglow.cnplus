@@ -921,6 +921,10 @@ internal object AodStateWireCodec {
         ) return false
         val styles = listOf(
             snapshot.burnInPattern,
+            // aodRotationMode 在编码体里同样按样式串写入,解码侧走 readStyleString(budget)
+            // 计入同一个聚合预算;这里漏计会让「编码通过、解码拒收」——差值 4~9 字节
+            // (portrait/landscape/auto),刚好压线的包会静默丢失。
+            snapshot.aodRotationMode,
             snapshot.weight,
             snapshot.textSizeMode,
             snapshot.secondaryMode,
@@ -1184,9 +1188,6 @@ internal object AodStateWireBundleCodec {
         putBoolean(KEY_PAUSE_RETENTION_ELIGIBLE, envelope.pauseRetentionEligible)
         envelope.body?.let { putByteArray(KEY_BODY, it) }
     }
-
-    fun snapshotFromBundle(bundle: Bundle): AodStateWireMessage? =
-        AodStateWireCodec.decode(envelopeFromBundle(bundle))
 
     /**
      * 抽出信封与解码分离,使被拒时能报出闸门名。Bundle 仍在这里解成自有标量/字节

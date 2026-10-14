@@ -115,6 +115,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish debug APK to GitHub Release
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -149,7 +150,7 @@ jobs:
             gh release upload "$TAG" "$apk" --repo "$GITHUB_REPOSITORY" --clobber || true
           done
           echo "Debug release assets:" && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name'
+            --json assets --jq '.assets[].name' || true
 
   # 发布用 release 变体: R8 压缩体积更小。若配置了 SIGNING_* secrets 则正式签名,
   # 否则构建未签名 APK(需自行补签)。产物上传到正式 Release(如 v0.3.65)。
@@ -186,10 +187,14 @@ jobs:
         run: chmod +x ./gradlew
 
       # 插件 ZIP = manifest.json + classes.dex(d8 取自 SDK build-tools)。
-      # 这一步在 PR 上也会执行:它是插件打包管线唯一的自动化验证(主 CI 只构建 :app)。
+      # 这一步在 PR 上也会执行:它是插件打包管线唯一的自动化验证;紧随其后的
+      # check-plugin-dex.py 校验 dex 自包含性(kotlin-stdlib 已自带、未捆绑插件 API)。
       # amll-ttml / ai-translation / ai-translation-words 的单元测试一并在此运行(PLUGIN_RELEASE_CONVENTIONS §7:单测是发布前必过门禁)。
       - name: Build plugin ZIPs
         run: ./gradlew :plugins:lyricfetch:pluginZip :plugins:scriptconvert:pluginZip :plugins:amll-ttml:test :plugins:amll-ttml:pluginZip :plugins:ai-translation:test :plugins:ai-translation:pluginZip :plugins:ai-translation-words:test :plugins:ai-translation-words:pluginZip --console=plain
+
+      - name: Verify plugin DEX self-containment
+        run: python3 plugins/check-plugin-dex.py plugins/*/build/distributions/hyperglow-*-plugin.zip
 
       - name: Upload plugin ZIPs (artifact)
         uses: actions/upload-artifact@v6
@@ -247,6 +252,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
+    needs: build
     if: github.ref == 'refs/heads/main'
     environment: release
     steps:
