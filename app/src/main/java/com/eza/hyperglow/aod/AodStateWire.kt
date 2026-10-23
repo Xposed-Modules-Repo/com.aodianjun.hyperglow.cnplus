@@ -187,7 +187,25 @@ internal data class AodStateWireSnapshot(
      * 不透明传递策略原语。
      */
     val interludeStartMs: Long = 0L,
-    val interludeEndMs: Long = 0L
+    val interludeEndMs: Long = 0L,
+    /**
+     * 纯音乐曲目标记(v11,参考 HyperLyric「无歌词/纯音乐歌词行为」):整首歌词只有
+     * 「纯音乐请欣赏」标记。渲染面按本面 noLyricsBehavior 决定保持原标记/替换歌曲信息/
+     * 交还系统默认;纯布尔,不进聚合文本预算。
+     */
+    val pureMusic: Boolean = false,
+    /**
+     * 真无歌词曲目标记(v12,与 v11 的 pureMusic 同链路):producer `lyricKind == NONE`,
+     * 整首没有任何歌词行。渲染面按本面 noLyricsBehavior 决定保持原占位/替换歌曲信息/
+     * 交还系统默认;纯布尔,不进聚合文本预算。纯音乐标记行是 LINE,不会落进本标记。
+     */
+    val noLyrics: Boolean = false,
+    /**
+     * 尾奏上下文(v12,与 noLyrics 同链路):最后一句歌词结束后 producer 已清行、投影层
+     * 补回最后一行,或最后一行仍在且没有下一行。**不表示延迟已到点**;渲染面按本面
+     * tailTimeoutDelaySeconds 用 `tailTimeoutActive` 计算。纯布尔,不进聚合文本预算。
+     */
+    val tailEligible: Boolean = false
 )
 
 internal sealed interface AodStateWireMessage {
@@ -198,6 +216,8 @@ internal sealed interface AodStateWireMessage {
     val wakeSignal: Long
     val playbackActive: Boolean
     val pauseRetentionEligible: Boolean
+    /** 有限时长保活已到点；消费侧据此停掉绘制唤醒/AOD 重唤醒（默认 false = 未知/未到点）。 */
+    val keepAliveExpired: Boolean
 
     data class Snapshot(
         override val revision: Long,
@@ -207,6 +227,7 @@ internal sealed interface AodStateWireMessage {
         override val wakeSignal: Long,
         override val playbackActive: Boolean = false,
         override val pauseRetentionEligible: Boolean = false,
+        override val keepAliveExpired: Boolean = false,
         val value: AodStateWireSnapshot
     ) : AodStateWireMessage
 
@@ -217,7 +238,8 @@ internal sealed interface AodStateWireMessage {
         override val keepAlive: Boolean,
         override val wakeSignal: Long,
         override val playbackActive: Boolean = false,
-        override val pauseRetentionEligible: Boolean = false
+        override val pauseRetentionEligible: Boolean = false,
+        override val keepAliveExpired: Boolean = false
     ) : AodStateWireMessage
 
     data class KeepAlive(
@@ -227,7 +249,8 @@ internal sealed interface AodStateWireMessage {
         override val keepAlive: Boolean,
         override val wakeSignal: Long,
         override val playbackActive: Boolean = false,
-        override val pauseRetentionEligible: Boolean = false
+        override val pauseRetentionEligible: Boolean = false,
+        override val keepAliveExpired: Boolean = false
     ) : AodStateWireMessage
 }
 
@@ -241,7 +264,8 @@ internal data class AodStateWireEnvelope(
     val wakeSignal: Long,
     val body: ByteArray?,
     val playbackActive: Boolean = false,
-    val pauseRetentionEligible: Boolean = false
+    val pauseRetentionEligible: Boolean = false,
+    val keepAliveExpired: Boolean = false
 )
 
 /**
@@ -280,7 +304,8 @@ internal object AodStateWireCodec {
                     wakeSignal = message.wakeSignal,
                     body = body,
                     playbackActive = message.playbackActive,
-                    pauseRetentionEligible = message.pauseRetentionEligible
+                    pauseRetentionEligible = message.pauseRetentionEligible,
+                    keepAliveExpired = message.keepAliveExpired
                 )
             }
             is AodStateWireMessage.Hidden -> AodStateWireEnvelope(
@@ -293,7 +318,8 @@ internal object AodStateWireCodec {
                 wakeSignal = message.wakeSignal,
                 body = null,
                 playbackActive = message.playbackActive,
-                pauseRetentionEligible = message.pauseRetentionEligible
+                pauseRetentionEligible = message.pauseRetentionEligible,
+                keepAliveExpired = message.keepAliveExpired
             )
             is AodStateWireMessage.KeepAlive -> AodStateWireEnvelope(
                 protocol = AodStateWireContract.PROTOCOL_VERSION,
@@ -305,7 +331,8 @@ internal object AodStateWireCodec {
                 wakeSignal = message.wakeSignal,
                 body = null,
                 playbackActive = message.playbackActive,
-                pauseRetentionEligible = message.pauseRetentionEligible
+                pauseRetentionEligible = message.pauseRetentionEligible,
+                keepAliveExpired = message.keepAliveExpired
             )
         }
     }
@@ -347,6 +374,7 @@ internal object AodStateWireCodec {
                         wakeSignal = envelope.wakeSignal,
                         playbackActive = envelope.playbackActive,
                         pauseRetentionEligible = envelope.pauseRetentionEligible,
+                        keepAliveExpired = envelope.keepAliveExpired,
                         value = snapshot
                     )
                 )
@@ -359,7 +387,8 @@ internal object AodStateWireCodec {
                     keepAlive = envelope.keepAlive,
                     wakeSignal = envelope.wakeSignal,
                     playbackActive = envelope.playbackActive,
-                    pauseRetentionEligible = envelope.pauseRetentionEligible
+                    pauseRetentionEligible = envelope.pauseRetentionEligible,
+                    keepAliveExpired = envelope.keepAliveExpired
                 )
             )
             AodStateWireContract.KIND_KEEPALIVE -> AodStateWireDecodeOutcome.Decoded(
@@ -370,7 +399,8 @@ internal object AodStateWireCodec {
                     keepAlive = envelope.keepAlive,
                     wakeSignal = envelope.wakeSignal,
                     playbackActive = envelope.playbackActive,
-                    pauseRetentionEligible = envelope.pauseRetentionEligible
+                    pauseRetentionEligible = envelope.pauseRetentionEligible,
+                    keepAliveExpired = envelope.keepAliveExpired
                 )
             )
             else -> AodStateWireDecodeOutcome.Rejected("unknown_kind")
@@ -505,6 +535,12 @@ internal object AodStateWireCodec {
                 // v10:长间奏窗口(原始空隙两端;0/0 = 无)。
                 output.writeLong(snapshot.interludeStartMs)
                 output.writeLong(snapshot.interludeEndMs)
+                // v11:纯音乐曲目标记(纯布尔,不进聚合文本预算)。
+                output.writeStrictBoolean(snapshot.pureMusic)
+                // v12:真无歌词曲目标记(纯布尔,不进聚合文本预算)。
+                output.writeStrictBoolean(snapshot.noLyrics)
+                // v12:尾奏上下文(纯布尔,不进聚合文本预算)。
+                output.writeStrictBoolean(snapshot.tailEligible)
             }
             bytes.toByteArray().takeIf {
                 it.isNotEmpty() && it.size <= AodStateWireLimits.MAX_ENCODED_BODY_BYTES
@@ -714,6 +750,12 @@ internal object AodStateWireCodec {
             // v10:长间奏窗口(原始空隙两端;0/0 = 无)。
             val interludeStartMs = input.readLong()
             val interludeEndMs = input.readLong()
+            // v11:纯音乐曲目标记(纯布尔)。
+            val pureMusic = input.readStrictBoolean() ?: return null
+            // v12:真无歌词曲目标记(纯布尔)。
+            val noLyrics = input.readStrictBoolean() ?: return null
+            // v12:尾奏上下文(纯布尔)。
+            val tailEligible = input.readStrictBoolean() ?: return null
             if (input.available() != 0) return null
             AodStateWireSnapshot(
                 trackGeneration = trackGeneration,
@@ -747,6 +789,9 @@ internal object AodStateWireCodec {
                 artist = artist,
                 album = album,
                 largeMetadata = largeMetadata,
+                pureMusic = pureMusic,
+                noLyrics = noLyrics,
+                tailEligible = tailEligible,
                 alignedRight = alignedRight,
                 alignedRightMarkers = alignedRightMarkers,
                 lineLevelSync = lineLevelSync,
@@ -1081,9 +1126,12 @@ internal object AodStateWireCodec {
      *  v7:metadata 区追加原始 title/artist/album + largeMetadata + 标记识别版分侧(主行与并发行),
      *  让渲染面按本面「歌曲信息内容」/「识别对唱标记」独立组装与选侧(per-surface);
      *  v6:样式区追加 aodLandscapeFullscreenSafeMarginPercent(横屏全屏化安全边界);
+     *  v11:整体尾部追加纯音乐曲目标记(pureMusic,纯布尔,不进聚合文本预算);
+     *  v12:pureMusic 之后追加真无歌词曲目标记(noLyrics,纯布尔,不进聚合文本预算),
+     *  并追加尾奏上下文(tailEligible,纯布尔,同链路);
      *  v5:行文本区追加 nextLineRomanized/nextLineTranslated(下一行辅助文字);
      *  v4:对照尾部追加对唱并发行(duetLine,存在性+载荷);v3 追加歌曲图片帧。 */
-    private const val BODY_VERSION = 10
+    private const val BODY_VERSION = 12
     private const val MAX_UTF8_BYTES_PER_UTF16_CHAR = 4
 }
 
@@ -1186,6 +1234,7 @@ internal object AodStateWireBundleCodec {
         putLong(KEY_WAKE_SIGNAL, envelope.wakeSignal)
         putBoolean(KEY_PLAYBACK_ACTIVE, envelope.playbackActive)
         putBoolean(KEY_PAUSE_RETENTION_ELIGIBLE, envelope.pauseRetentionEligible)
+        putBoolean(KEY_KEEP_ALIVE_EXPIRED, envelope.keepAliveExpired)
         envelope.body?.let { putByteArray(KEY_BODY, it) }
     }
 
@@ -1209,7 +1258,8 @@ internal object AodStateWireBundleCodec {
                 null
             },
             playbackActive = bundle.getBoolean(KEY_PLAYBACK_ACTIVE, false),
-            pauseRetentionEligible = bundle.getBoolean(KEY_PAUSE_RETENTION_ELIGIBLE, false)
+            pauseRetentionEligible = bundle.getBoolean(KEY_PAUSE_RETENTION_ELIGIBLE, false),
+            keepAliveExpired = bundle.getBoolean(KEY_KEEP_ALIVE_EXPIRED, false)
         )
         return envelope
     }
@@ -1223,5 +1273,6 @@ internal object AodStateWireBundleCodec {
     private const val KEY_WAKE_SIGNAL = "wakeSignal"
     private const val KEY_PLAYBACK_ACTIVE = "playbackActive"
     private const val KEY_PAUSE_RETENTION_ELIGIBLE = "pauseRetentionEligible"
+    private const val KEY_KEEP_ALIVE_EXPIRED = "keepAliveExpired"
     private const val KEY_BODY = "stateBody"
 }

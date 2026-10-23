@@ -18,6 +18,7 @@ import com.eza.hyperglow.customization.normalizeMetadataParts
 import com.eza.hyperglow.customization.normalizeMetadataSeparators
 import com.eza.hyperglow.customization.normalizeSecondaryTextSizePercent
 import com.eza.hyperglow.customization.normalizeSongInfoArtistSizePercent
+import com.eza.hyperglow.customization.normalizeWordEffectSpec
 import com.eza.hyperglow.aod.normalizePauseLingerMs
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
 import com.eza.hyperglow.root.surface.SurfacePolicyResolver
@@ -78,7 +79,12 @@ internal object SystemUiCustomizationValidator {
                 duetMarkers = rawAod.duetMarkers,
                 // 长间奏倒计时圆点:与 linkSurfaces 的其它歌词呈现项同批继承息屏值
                 // (开关只决定「本面画不画圆点」,不牵动快照内容)。
-                interludeCountdown = rawAod.interludeCountdown
+                interludeCountdown = rawAod.interludeCountdown,
+                // 无歌词/纯音乐歌词行为:同为歌词呈现项,linkSurfaces 下继承息屏值。
+                noLyricsBehavior = rawAod.noLyricsBehavior,
+                // 尾奏超时行为/延迟:同为歌词呈现项,linkSurfaces 下继承息屏值。
+                tailTimeoutBehavior = rawAod.tailTimeoutBehavior,
+                tailTimeoutDelaySeconds = rawAod.tailTimeoutDelaySeconds
             )
         } else {
             rawLockscreen
@@ -185,11 +191,27 @@ internal object SystemUiCustomizationValidator {
                 profile.animation in ANIMATIONS -> profile.animation
                 else -> "Gradient"
             },
+            // 与 SceneCompiler.compileProfile 同源归一:两处不一致会让 validate 改写字段、
+            // 配置 hash 校验拒收整份配置。
+            wordEffect = normalizeWordEffectSpec(profile.wordEffect),
             glow = if (profile.glow == "On") "On" else "Off",
             lineSyncFillMode = normalizeLineSyncFillMode(profile.lineSyncFillMode),
             overflow = if (profile.overflow == "Clip") "Clip" else "Wrap",
             lineTransition = normalizeLineTransition(profile.lineTransition),
             lineTransitionSpeed = normalizeLineTransitionSpeed(profile.lineTransitionSpeed),
+            // 与 SceneCompiler.compileProfile 同源归一(未知值回落 keep);两处不一致会让
+            // validate 改写字段、wire 的 hash 校验拒收整份配置。
+            noLyricsBehavior = com.eza.hyperglow.customization.normalizeNoLyricsBehavior(
+                profile.noLyricsBehavior
+            ),
+            // 与 SceneCompiler.compileProfile 同源归一(非法行为回落 keep、延迟钳 0-30)。
+            tailTimeoutBehavior = com.eza.hyperglow.customization.normalizeTailTimeoutBehavior(
+                profile.tailTimeoutBehavior
+            ),
+            tailTimeoutDelaySeconds =
+                com.eza.hyperglow.customization.normalizeTailTimeoutDelaySeconds(
+                    profile.tailTimeoutDelaySeconds
+                ),
             backgroundStyle = if (!aod && profile.backgroundStyle == "card") "card" else "none",
             cardAlpha = normalizeCardAlpha(profile.cardAlpha),
             cardColor = normalizeCardColor(profile.cardColor),

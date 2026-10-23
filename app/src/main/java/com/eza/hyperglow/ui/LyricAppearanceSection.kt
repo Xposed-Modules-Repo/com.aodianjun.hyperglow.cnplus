@@ -1,7 +1,9 @@
 package com.eza.hyperglow.ui
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.annotation.StringRes
@@ -50,12 +52,22 @@ import androidx.compose.ui.graphics.toArgb
 import com.eza.hyperglow.customization.CustomFontContract
 import com.eza.hyperglow.customization.CustomFontEntry
 import com.eza.hyperglow.customization.CustomFontStore
+import com.eza.hyperglow.customization.WordEffectPackStore
+import com.eza.hyperglow.customization.WordEffectSpec
 import com.eza.hyperglow.customization.CustomizationDocument
 import com.eza.hyperglow.customization.CustomizationEditorState
 import com.eza.hyperglow.customization.CustomizationRepository
 import com.eza.hyperglow.customization.LyricTimeOffset
 import com.eza.hyperglow.customization.LINE_TRANSITION_MODES
 import com.eza.hyperglow.customization.LINE_TRANSITION_SPEEDS
+import com.eza.hyperglow.customization.NO_LYRICS_BEHAVIORS
+import com.eza.hyperglow.customization.NO_LYRICS_BEHAVIOR_KEEP
+import com.eza.hyperglow.customization.normalizeNoLyricsBehavior
+import com.eza.hyperglow.customization.TAIL_TIMEOUT_BEHAVIORS
+import com.eza.hyperglow.customization.TAIL_TIMEOUT_DELAY_SECONDS_MAX
+import com.eza.hyperglow.customization.TAIL_TIMEOUT_DELAY_SECONDS_MIN
+import com.eza.hyperglow.customization.normalizeTailTimeoutBehavior
+import com.eza.hyperglow.customization.normalizeTailTimeoutDelaySeconds
 import com.eza.hyperglow.customization.METADATA_PART_ALBUM
 import com.eza.hyperglow.customization.METADATA_PART_ARTIST
 import com.eza.hyperglow.customization.METADATA_PART_TITLE
@@ -284,6 +296,46 @@ internal fun LyricAppearanceSection(
         ).show()
     }
 
+    // 已导入的单词效果包清单:导入即落盘,选择器按导入顺序列出;选中时整份规格写入本面 profile,
+    // 因此删包/换设备后已选效果仍可渲染(与自定义字体同式:一次导入可含多条,互不覆盖)。
+    var wordEffects by remember { mutableStateOf(WordEffectPackStore.list(context)) }
+    // 展示名取规格自带 name(导入时已归一),选择器摘要与实机同源。
+    val wordEffectNames = remember(wordEffects) {
+        wordEffects.associate { it.id to it.name }
+    }
+    val effectImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: android.net.Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val bytes = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                input.readNBytes(WordEffectPackStore.MAX_PACK_BYTES + 1)
+            }
+        }.getOrNull()
+        val result = bytes?.let {
+            WordEffectPackStore.import(context, it, queryDisplayName(context, uri) ?: "")
+        }
+        if (result != null && result.ok) {
+            wordEffects = WordEffectPackStore.list(context)
+            // 默认选中最后一条导入项:用户刚导入的包立即在预览里可见。
+            updateSelected { it.copy(wordEffect = result.imported.last()) }
+            Toast.makeText(
+                context,
+                context.getString(
+                    R.string.toast_word_effect_imported,
+                    result.imported.size
+                ),
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            Toast.makeText(
+                context,
+                context.getString(R.string.toast_word_effect_invalid),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     val selectedProfile = editorState.document.profiles[editorState.selectedSurface] ?: SurfaceProfile()
     // per-surface 内容项(歌曲信息内容/分隔符/识别对唱标记):本面未显式设置(null)时继承文档级
     // 默认值(与 SceneCompiler.withDocumentDefaults 同口径)。读取用有效值,写入落到本面,改一面
@@ -422,6 +474,57 @@ internal fun LyricAppearanceSection(
                     { enabled -> updateSelected { it.copy(interludeCountdown = enabled) } },
                     stringResource(R.string.setting_interlude_countdown),
                     summary = stringResource(R.string.summary_interlude_countdown)
+                )
+                // 无歌词/纯音乐歌词行为(per-surface):整首只有「纯音乐请欣赏」标记的纯音乐曲目,
+                // 该标记行的呈现方式——保持原标记 / 替换为歌曲信息 / 交还系统默认。息屏与锁屏各自独立。
+                AodChoiceRow(AodChoiceKind.NO_LYRICS_BEHAVIOR, selectedProfile.noLyricsBehavior) {
+                    openChoice(
+                        AodChoiceKind.NO_LYRICS_BEHAVIOR,
+                        NO_LYRICS_BEHAVIORS,
+                        selectedProfile.noLyricsBehavior
+                    ) { value ->
+                        updateSelected {
+                            it.copy(noLyricsBehavior = normalizeNoLyricsBehavior(value))
+                        }
+                    }
+                }
+                // 尾奏超时行为(per-surface):最后一句歌词结束后延迟 N 秒,再决定保留最后一行
+                // / 替换为歌曲信息 / 交还系统默认。纯音乐/真无歌词由上一项优先接管。
+                AodChoiceRow(
+                    AodChoiceKind.TAIL_TIMEOUT_BEHAVIOR,
+                    selectedProfile.tailTimeoutBehavior
+                ) {
+                    openChoice(
+                        AodChoiceKind.TAIL_TIMEOUT_BEHAVIOR,
+                        TAIL_TIMEOUT_BEHAVIORS,
+                        selectedProfile.tailTimeoutBehavior
+                    ) { value ->
+                        updateSelected {
+                            it.copy(tailTimeoutBehavior = normalizeTailTimeoutBehavior(value))
+                        }
+                    }
+                }
+                // 尾奏超时延迟(0-30 秒,默认 3;只有 begin 的行额外 +5s,见投影层策略)。
+                SliderPreference(
+                    value = selectedProfile.tailTimeoutDelaySeconds.toFloat(),
+                    onValueChange = { raw ->
+                        updateSelected {
+                            it.copy(
+                                tailTimeoutDelaySeconds = normalizeTailTimeoutDelaySeconds(
+                                    raw.roundToInt()
+                                )
+                            )
+                        }
+                    },
+                    title = stringResource(R.string.setting_tail_timeout_delay),
+                    summary = stringResource(R.string.summary_tail_timeout_delay),
+                    valueText = stringResource(
+                        R.string.value_tail_timeout_delay_seconds,
+                        selectedProfile.tailTimeoutDelaySeconds
+                    ),
+                    valueRange = TAIL_TIMEOUT_DELAY_SECONDS_MIN.toFloat()..
+                        TAIL_TIMEOUT_DELAY_SECONDS_MAX.toFloat(),
+                    steps = TAIL_TIMEOUT_DELAY_SECONDS_MAX - TAIL_TIMEOUT_DELAY_SECONDS_MIN - 1
                 )
                 // 识别对唱标记(per-surface):标记是内容级解释,息屏与锁屏各自独立生效,
                 // 改本面不影响另一面。本面未显式设置时以文档级值作有效值。
@@ -842,8 +945,64 @@ internal fun LyricAppearanceSection(
                         AodChoiceKind.WORD_ANIMATION,
                         listOf("Minimal", "Gradient", "BetterLyrics"),
                         selectedProfile.animation
-                    ) { value -> updateSelected { it.copy(animation = value) } }
+                    ) { value ->
+                        // 选内置档 = 退出自定义效果;否则效果会继续覆盖内置档,用户以为设置没生效。
+                        updateSelected { it.copy(animation = value, wordEffect = null) }
+                    }
                 }
+                // 自定义单词效果包:选择器第一项固定为「关闭」,其后按导入顺序列出效果 id;
+                // 选中即把整份规格写进本面(渲染器/预览直接消费,不依赖包文件仍在)。
+                val currentEffect = selectedProfile.wordEffect
+                val effectChoices = remember(wordEffects, currentEffect) {
+                    buildList {
+                        add("none")
+                        wordEffects.forEach { if (it.id !in this) add(it.id) }
+                        // 当前效果已被删包时仍列出,保证可见可关(与字体选择器的当前项兜底同式)。
+                        if (currentEffect != null && currentEffect.id !in this) {
+                            add(currentEffect.id)
+                        }
+                    }
+                }
+                val effectNames = remember(wordEffectNames, currentEffect) {
+                    if (currentEffect == null) {
+                        wordEffectNames
+                    } else {
+                        wordEffectNames + (currentEffect.id to currentEffect.name)
+                    }
+                }
+                AodChoiceRow(
+                    AodChoiceKind.WORD_EFFECT,
+                    currentEffect?.id ?: "none",
+                    customEffectNames = effectNames
+                ) {
+                    openChoice(
+                        AodChoiceKind.WORD_EFFECT,
+                        effectChoices,
+                        currentEffect?.id ?: "none"
+                    ) { value ->
+                        if (value == "none") {
+                            updateSelected { it.copy(wordEffect = null) }
+                        } else {
+                            val spec = wordEffects.firstOrNull { it.id == value }
+                                ?: currentEffect?.takeIf { it.id == value }
+                            if (spec != null) updateSelected { it.copy(wordEffect = spec) }
+                        }
+                    }
+                }
+                ArrowPreference(
+                    title = stringResource(R.string.action_import_word_effect_pack),
+                    onClick = {
+                        effectImportLauncher.launch(
+                            arrayOf("application/json", "text/plain", "*/*")
+                        )
+                    }
+                )
+                // 在线编辑器:浏览器里调好效果 → 导出 .hgwordanim.json → 回到上一行导入。
+                ArrowPreference(
+                    title = stringResource(R.string.action_open_word_effect_studio),
+                    summary = stringResource(R.string.summary_word_effect_studio),
+                    onClick = { openWordEffectStudio(context) }
+                )
                 AodChoiceRow(AodChoiceKind.GLOW, selectedProfile.glow) {
                     openChoice(AodChoiceKind.GLOW, listOf("Off", "On"), selectedProfile.glow) { value ->
                         updateSelected { it.copy(glow = value) }
@@ -1213,7 +1372,12 @@ internal fun LyricAppearanceSection(
                 Column {
                     selected.values.forEach { value ->
                         RadioButtonPreference(
-                            choiceDisplayLabel(context, selected.kind, value),
+                            choiceDisplayLabel(
+                                context,
+                                selected.kind,
+                                value,
+                                customEffectNames = wordEffectNames
+                            ),
                             selected.current == value,
                             {
                                 selected.onSelect(value)
@@ -1636,6 +1800,21 @@ private fun demoWordSpans(text: String): List<IntRange> {
     return spans
 }
 
+/** Word Effect Studio:纯静态网页编辑器,导出 .hgwordanim.json 后回到设置页导入。 */
+private const val WORD_EFFECT_STUDIO_URL = "https://aodianjun.github.io/word-effect-studio/"
+
+private fun openWordEffectStudio(context: Context) {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(WORD_EFFECT_STUDIO_URL))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }.onFailure {
+        Toast.makeText(
+            context,
+            R.string.toast_word_effect_studio_unavailable,
+            Toast.LENGTH_LONG
+        ).show()
+    }
+}
+
 /** SAF 文档选择器里取原始文件名,作为字体展示名;取不到时由存储层回落到 id。 */
 private fun queryDisplayName(
     context: android.content.Context,
@@ -1733,12 +1912,13 @@ private fun AodChoiceRow(
     kind: AodChoiceKind,
     value: String,
     customFontNames: Map<String, String> = emptyMap(),
+    customEffectNames: Map<String, String> = emptyMap(),
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
     ArrowPreference(
         title = stringResource(kind.titleRes),
-        summary = choiceDisplayLabel(context, kind, value, customFontNames),
+        summary = choiceDisplayLabel(context, kind, value, customFontNames, customEffectNames),
         onClick = onClick
     )
 }
@@ -1894,7 +2074,8 @@ private fun choiceDisplayLabel(
     context: android.content.Context,
     kind: AodChoiceKind,
     value: String,
-    customFontNames: Map<String, String> = emptyMap()
+    customFontNames: Map<String, String> = emptyMap(),
+    customEffectNames: Map<String, String> = emptyMap()
 ): String = when (kind) {
     AodChoiceKind.POSITION -> context.getString(when (value) {
         "below_stock_clock" -> R.string.option_below_clock
@@ -2040,6 +2221,18 @@ private fun choiceDisplayLabel(
     AodChoiceKind.LONG_LINES -> context.getString(
         if (value == "Clip") R.string.option_clip else R.string.option_wrap
     )
+    // 无歌词/纯音乐歌词行为(per-surface):整首只有「纯音乐请欣赏」标记时的呈现方式。
+    AodChoiceKind.NO_LYRICS_BEHAVIOR -> context.getString(when (value) {
+        "music_info" -> R.string.option_no_lyrics_behavior_music_info
+        "restore_default" -> R.string.option_no_lyrics_behavior_restore_default
+        else -> R.string.option_no_lyrics_behavior_keep
+    })
+    // 尾奏超时行为(per-surface):最后一句结束后延迟窗口到期时的三态。
+    AodChoiceKind.TAIL_TIMEOUT_BEHAVIOR -> context.getString(when (value) {
+        "music_info" -> R.string.option_tail_timeout_behavior_music_info
+        "restore_default" -> R.string.option_tail_timeout_behavior_restore_default
+        else -> R.string.option_tail_timeout_behavior_keep
+    })
     AodChoiceKind.TEXT_WEIGHT -> context.getString(when (value) {
         "Regular" -> R.string.option_regular
         "Bold" -> R.string.option_bold
@@ -2057,6 +2250,12 @@ private fun choiceDisplayLabel(
         "BetterLyrics" -> R.string.option_betterlyrics
         else -> R.string.option_gradient
     })
+    AodChoiceKind.WORD_EFFECT -> if (value == "none") {
+        context.getString(R.string.option_word_effect_none)
+    } else {
+        // 效果包展示名优先,取不到(历史 id)回落原 id,保证可见可改。
+        customEffectNames[value] ?: value
+    }
     AodChoiceKind.GLOW -> context.getString(
         if (value == "On") R.string.option_on else R.string.option_off
     )
@@ -2079,6 +2278,8 @@ private enum class AodChoiceKind(@param:StringRes val titleRes: Int) {
     SECOND_LINE_ALIGNMENT(R.string.choice_second_line_alignment),
     SECONDARY_TEXT(R.string.choice_secondary_text),
     LONG_LINES(R.string.choice_long_lines),
+    NO_LYRICS_BEHAVIOR(R.string.setting_no_lyrics_behavior),
+    TAIL_TIMEOUT_BEHAVIOR(R.string.setting_tail_timeout_behavior),
     LYRIC_LINES(R.string.choice_lyric_lines),
     SONG_INFO_POSITION(R.string.choice_song_info_position),
     SONG_INFO_LAYOUT(R.string.choice_song_info_layout),
@@ -2088,6 +2289,7 @@ private enum class AodChoiceKind(@param:StringRes val titleRes: Int) {
     TEXT_SIZE(R.string.choice_text_size),
     FONT(R.string.choice_font),
     WORD_ANIMATION(R.string.choice_word_animation),
+    WORD_EFFECT(R.string.choice_word_effect),
     GLOW(R.string.choice_glow),
     LINE_PROGRESS(R.string.choice_line_progress_effect),
     LINE_TRANSITION(R.string.choice_line_transition),

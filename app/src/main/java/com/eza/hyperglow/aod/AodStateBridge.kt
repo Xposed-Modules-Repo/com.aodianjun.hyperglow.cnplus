@@ -19,6 +19,11 @@ data class AodDisplayState(
     val aodEnabled: Boolean = true,
     val lockscreenEnabled: Boolean = false,
     val keepAlive: Boolean = false,
+    /**
+     * 有限时长保活已到点（见 [AodPowerSessionDecision.keepAliveExpired]）。渲染面据此停掉
+     * 绘制唤醒与 AOD 重唤醒；与 [keepAlive]=false 的普通「本拍无请求」区分。
+     */
+    val keepAliveExpired: Boolean = false,
     val positionFollowingEnabled: Boolean = false,
     val burnInPattern: String = "static_bottom",
     val burnInIntervalMs: Long = 60_000L,
@@ -55,6 +60,24 @@ data class AodDisplayState(
      * 由渲染面替换 [original] 的占位符(见 root/aod/LyricCanvasMapper)。
      */
     val largeMetadata: Boolean = false,
+    /**
+     * 纯音乐曲目(整首歌词只有「纯音乐请欣赏」标记,见 producer.PureMusicLyrics):渲染面
+     * 按本面「无歌词/纯音乐歌词行为」在保持原标记/替换为歌曲信息/交还系统默认间选择。
+     */
+    val pureMusic: Boolean = false,
+    /**
+     * 真无歌词曲目(producer `lyricKind == NONE`,整首没有任何歌词行):渲染面按本面
+     * 「无歌词/纯音乐歌词行为」在保持原占位/替换为歌曲信息/交还系统默认间选择。
+     * 纯音乐标记行是 LINE,不会落进本标记。
+     */
+    val noLyrics: Boolean = false,
+    /**
+     * 尾奏上下文:最后一句歌词结束后 producer 已清行、投影层补回最后一行,或最后一行仍在
+     * 且没有下一行。**不表示延迟已到点**——渲染面按本面
+     * [com.eza.hyperglow.customization.SurfaceProfile.tailTimeoutDelaySeconds] 计算
+     * `tailTimeoutActive` 后再解释 keep/music_info/restore_default 三态。
+     */
+    val tailEligible: Boolean = false,
     /** 对唱分侧(元数据身份版);标记识别版见 [alignedRightMarkers],由渲染面按本面开关选用。 */
     val alignedRight: Boolean = false,
     /** 对唱分侧(标记识别版);「识别对唱标记」开启的面取本值,否则取 [alignedRight]。 */
@@ -300,6 +323,7 @@ object AodStateBridge {
             userId = current.userId,
             updatedAtElapsedMs = updatedAt,
             keepAlive = current.keepAlive,
+            keepAliveExpired = current.keepAliveExpired,
             wakeSignal = current.wakeSignal,
             playbackActive = current.playbackActive,
             pauseRetentionEligible = current.pauseRetentionEligible
@@ -408,6 +432,7 @@ internal fun encodeNormalizedAodStatePublication(
             userId = state.userId,
             updatedAtElapsedMs = updatedAtElapsedMs,
             keepAlive = false,
+            keepAliveExpired = state.keepAliveExpired,
             wakeSignal = state.wakeSignal,
             playbackActive = state.playbackActive,
             pauseRetentionEligible = state.pauseRetentionEligible
@@ -700,6 +725,7 @@ private fun AodDisplayState.toWireMessage(
         userId = userId,
         updatedAtElapsedMs = updatedAtElapsedMs,
         keepAlive = keepAlive,
+        keepAliveExpired = keepAliveExpired,
         wakeSignal = wakeSignal,
         playbackActive = playbackActive,
         pauseRetentionEligible = pauseRetentionEligible
@@ -710,6 +736,7 @@ private fun AodDisplayState.toWireMessage(
         userId = userId,
         updatedAtElapsedMs = updatedAtElapsedMs,
         keepAlive = keepAlive,
+        keepAliveExpired = keepAliveExpired,
         wakeSignal = wakeSignal,
         playbackActive = playbackActive,
         pauseRetentionEligible = pauseRetentionEligible,
@@ -745,6 +772,9 @@ private fun AodDisplayState.toWireMessage(
             artist = artist,
             album = album,
             largeMetadata = largeMetadata,
+            pureMusic = pureMusic,
+            noLyrics = noLyrics,
+            tailEligible = tailEligible,
             alignedRight = alignedRight,
             alignedRightMarkers = alignedRightMarkers,
             lineLevelSync = lineLevelSync,

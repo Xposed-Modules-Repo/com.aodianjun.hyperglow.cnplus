@@ -316,6 +316,9 @@ object CustomizationRepository {
         duetAlignment = duetAlignment,
         duetConcurrent = duetConcurrent,
         interludeCountdown = interludeCountdown,
+        noLyricsBehavior = noLyricsBehavior,
+        tailTimeoutBehavior = tailTimeoutBehavior,
+        tailTimeoutDelaySeconds = tailTimeoutDelaySeconds,
         // per-surface 内容项:携带本面已解析值,canonicalize 往返不丢失按面独立性。
         metadataParts = metadataParts,
         metadataSeparators = metadataSeparators,
@@ -327,6 +330,8 @@ object CustomizationRepository {
         textSizeCustom = textSizeCustom,
         fontFamily = fontFamily,
         animation = animation,
+        // 自定义单词效果:canonicalize 逐字段重建时必须带上,否则保存/加载/导出会静默丢失。
+        wordEffect = wordEffect,
         glow = glow,
         lineSyncFillMode = lineSyncFillMode,
         overflow = overflow,

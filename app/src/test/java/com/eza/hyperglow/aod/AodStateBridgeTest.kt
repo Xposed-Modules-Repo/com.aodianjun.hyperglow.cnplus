@@ -48,6 +48,27 @@ class AodStateBridgeTest {
     }
 
     @Test
+    fun keepAliveExpiryEdgeForcesPublishAndSurvivesEncode() {
+        val last = state().copy(keepAlive = false, keepAliveExpired = false)
+
+        // 到点是语义边沿：位置连续也必须重发，否则 SystemUI 侧拿不到停续期的信号。
+        val expired = last.copy(
+            keepAliveExpired = true,
+            positionMs = 1_100L,
+            sampledAtElapsedMs = 1_100L
+        )
+        assertTrue(shouldRepublish(last, expired))
+
+        val publication = encodeNormalizedAodStatePublication(
+            normalizeAodDisplayState(expired),
+            revision = 11L,
+            updatedAtElapsedMs = 12L
+        )
+        assertTrue(publication.message.keepAliveExpired)
+        assertEquals(publication.message, AodStateWireCodec.decode(publication.envelope))
+    }
+
+    @Test
     fun adaptiveSectioningDefaultsOnAndChangesRepublishState() {
         val last = state()
 
@@ -68,6 +89,40 @@ class AodStateBridgeTest {
         val paused = AodDisplayState(visible = false, pauseRetentionEligible = true)
 
         assertTrue(shouldRepublish(paused, paused.copy(pauseRetentionEligible = false)))
+    }
+
+    @Test
+    fun noLyricsFlagSurvivesNormalizedPublication() {
+        // AodDisplayState -> normalize -> wire 全链路:真无歌词标记必须活到渲染端,
+        // 且与 pureMusic 一样参与重发判定(状态字段变化即重发)。
+        val last = state()
+        assertTrue(shouldRepublish(last, last.copy(noLyrics = true)))
+
+        val publication = encodeNormalizedAodStatePublication(
+            normalizeAodDisplayState(last.copy(noLyrics = true)),
+            revision = 9L,
+            updatedAtElapsedMs = 10L
+        )
+        val message = publication.message as AodStateWireMessage.Snapshot
+        assertTrue(message.value.noLyrics)
+        assertFalse(message.value.pureMusic)
+        assertEquals(publication.message, AodStateWireCodec.decode(publication.envelope))
+    }
+
+    @Test
+    fun tailEligibleFlagSurvivesNormalizedPublication() {
+        // 尾奏上下文标记与 noLyrics 同链路:归一化/编码后仍为真,且参与重发判定。
+        val last = state()
+        assertTrue(shouldRepublish(last, last.copy(tailEligible = true)))
+
+        val publication = encodeNormalizedAodStatePublication(
+            normalizeAodDisplayState(last.copy(tailEligible = true)),
+            revision = 10L,
+            updatedAtElapsedMs = 11L
+        )
+        val message = publication.message as AodStateWireMessage.Snapshot
+        assertTrue(message.value.tailEligible)
+        assertEquals(publication.message, AodStateWireCodec.decode(publication.envelope))
     }
 
     @Test

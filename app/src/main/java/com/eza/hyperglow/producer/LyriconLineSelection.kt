@@ -46,6 +46,35 @@ internal fun LyriconLyricProducer.advanceExtrapolation(now: Long, reason: String
     }
     if (lastRealPositionClockMs < 0L) return
     val sinceRealMs = now - lastRealPositionClockMs
+    // 熄屏后网易云停止写共享内存：先用播放器 MediaSession 的位置兜底（第二位置源），
+    // 只接受前进且不越歌长的值；拿不到再走墙钟外推。
+    if (sinceRealMs >= LyriconLyricProducer.STALE_POSITION_THRESHOLD_MS) {
+        val recovered = probeMediaSessionPosition(now)
+        if (recovered != null) {
+            lastRealPositionMs = recovered
+            lastRealPositionClockMs = now
+            lastRealPositionUpdateMs = now
+            currentPositionMs = recovered
+            extrapolating = false
+            positionUnknown = false
+            heldAtSongEndStale = false
+            songEndCleared = false
+            AppLog.i(
+                "LyriconLyricProducer",
+                "position recovered via MediaSession: pos=${recovered}ms"
+            )
+            return
+        }
+        if (now - lastPositionHealthLogMs >= LyriconLyricProducer.POSITION_HEALTH_LOG_MS) {
+            lastPositionHealthLogMs = now
+            AppLog.w(
+                "LyriconLyricProducer",
+                "position health: pos=$currentPositionMs lastReal=$lastRealPositionMs " +
+                    "stale=${sinceRealMs / 1000}s extrapolating=$extrapolating " +
+                    "duration=${currentSong?.duration ?: 0L}ms"
+            )
+        }
+    }
     val duration = currentSong?.duration ?: 0L
     val projected = lastRealPositionMs + sinceRealMs
     // 歌尾稳定钳制(issue #9):外推一旦越过歌曲时长,位置直接钳到 duration 并保持,
@@ -53,7 +82,26 @@ internal fun LyriconLyricProducer.advanceExtrapolation(now: Long, reason: String
     // 统一处理且只处理一次。否则每个 stalled 回调都会重走
     // "越界→清空→占位" 重建循环:60Hz 日志刷屏 + extrapolating 每帧反复翻转。
     if (duration > 0L && projected >= duration) {
+        // 位置源已停写时，外推撞到歌尾不等于真的播完：保持最后真实位置（当前行不消失），
+        // 等真实位置/第二位置源回来再对齐。只有真实位置在流动时越界才按播完处理。
+        if (sinceRealMs > LyriconLyricProducer.STALE_POSITION_THRESHOLD_MS &&
+            lastRealPositionMs > 0L &&
+            !songEndCleared
+        ) {
+            currentPositionMs = lastRealPositionMs
+            if (!heldAtSongEndStale) {
+                heldAtSongEndStale = true
+                AppLog.w(
+                    "LyriconLyricProducer",
+                    "position stale at song end; holding last real=${lastRealPositionMs}ms " +
+                        "(writer dead, not a real song end)"
+                )
+            }
+            return
+        }
         currentPositionMs = duration
+        songEndCleared = true
+        heldAtSongEndStale = false
         return
     }
     if (sinceRealMs > LyriconLyricProducer.MAX_EXTRAPOLATION_MS) {
@@ -192,10 +240,20 @@ internal fun LyriconLyricProducer.recomputeAndEmit() {
         emit()
         return
     }
-    // 最后一句歌词唱完后（position 越过其 end，歌曲进入尾奏/纯器乐段落），清空活动行
-    // 让投影显示 🎶 占位，而不是把最后一句滞留到歌曲结束。TimingNavigator 选择的是
+    // 最后一句歌词唱完后（position 越过全歌最晚结束点，歌曲进入尾奏/纯器乐段落），清空
+    // 活动行让投影显示 🎶 占位，而不是把最后一句滞留到歌曲结束。TimingNavigator 选择的是
     // 「最后一条 begin <= pos」的行，不检查 end，所以这里显式兜住结尾。
-    if (idx == nav.source.size - 1 && displayPos >= nav.source[idx].end) {
+    //
+    // 判据不能只看最后一行：对唱/重叠行里靠前的一行可能比按 begin 排序的最后一行结束得
+    // 更晚（上游 HyperLyric 7.9 fdeb94f），只看最后一行会在它还在唱时提前清行。
+    // [maxLineEndMs] 在 onSongChanged 重建行表时预计算（60Hz 路径只读缓存，不扫全表）；
+    // 没有合法 end（end > begin）时退回「最后一行 end」的旧判据。
+    val tailEnded = if (maxLineEndMs >= 0L) {
+        displayPos >= maxLineEndMs
+    } else {
+        idx == nav.source.size - 1 && displayPos >= nav.source[idx].end
+    }
+    if (tailEnded) {
         if (currentLineIndex != -1) {
             currentLineIndex = -1
             cachedWords = null

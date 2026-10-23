@@ -219,6 +219,11 @@ object SceneCompiler {
             duetAlignment = profile.duetAlignment,
             duetConcurrent = profile.duetConcurrent,
             interludeCountdown = profile.interludeCountdown,
+            noLyricsBehavior = normalizeNoLyricsBehavior(profile.noLyricsBehavior),
+            tailTimeoutBehavior = normalizeTailTimeoutBehavior(profile.tailTimeoutBehavior),
+            tailTimeoutDelaySeconds = normalizeTailTimeoutDelaySeconds(
+                profile.tailTimeoutDelaySeconds
+            ),
             rubyVisible = profile.rubyVisible,
             weight = profile.weight.takeIf { it in WEIGHTS } ?: "Medium",
             textSize = profile.textSize.takeIf { it in TEXT_SIZES } ?: "normal",
@@ -232,6 +237,8 @@ object SceneCompiler {
                 profile.animation in ANIMATIONS -> profile.animation
                 else -> "Gradient"
             },
+            // 自定义效果随配置 JSON 下发;非法规格静默丢弃并回落内置档,不阻断整份配置。
+            wordEffect = normalizeWordEffectSpec(profile.wordEffect),
             glow = if (profile.glow == "On") "On" else "Off",
             lineSyncFillMode = normalizeLineSyncFillMode(profile.lineSyncFillMode),
             overflow = if (profile.overflow == "Clip") "Clip" else "Wrap",
@@ -282,7 +289,7 @@ object SceneCompiler {
         is JsonPrimitive -> element.contentOrNull?.let(::containsUnsafeSchemaValue) == true
     }
 
-    private fun containsUnsafeSchemaValue(value: String): Boolean {
+    internal fun containsUnsafeSchemaValue(value: String): Boolean {
         val trimmed = value.trim()
         val lower = trimmed.lowercase()
         return value.indexOf('\u0000') >= 0 ||

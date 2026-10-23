@@ -142,6 +142,15 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
             noSongDropLogged = false
             generation.incrementAndGet()
             val lyrics = current.lyrics
+            // 尾奏清行判据随行表一起预计算(60Hz 选行路径不扫全表):取所有合法 end
+            // (end > begin)的最大值。对唱重叠时靠前的一行可能比最后一行结束得更晚,
+            // 只看最后一行会提前清行(上游 HyperLyric 7.9 fdeb94f)。seek 不改变行表,
+            // 无需重算;-1 表示没有合法 end,清行退回「最后一行 end」旧语义。
+            // 先于 navigator 发布,避免位置线程看到新行表却读到旧缓存。
+            maxLineEndMs = lyrics.orEmpty()
+                .asSequence()
+                .filter { it.end > it.begin }
+                .maxOfOrNull { it.end } ?: -1L
             navigator = if (!lyrics.isNullOrEmpty()) {
                 TimingNavigator(lyrics.toTypedArray())
             } else {
@@ -177,6 +186,8 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                 lastRealPositionClockMs = clock()
                 extrapolating = false
                 positionUnknown = false
+                heldAtSongEndStale = false
+                songEndCleared = false
                 pauseStaleRejectMs = -1L
                 // Close the post-song-change plausibility gate (issue #11) for an in-session
                 // change (the song starts from 0): the next real position must be plausible for a
@@ -454,6 +465,8 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                 // A real value also means the position source is alive again: clear the
                 // unknown-position marker so recomputeAndEmit re-selects the active line.
                 positionUnknown = false
+                heldAtSongEndStale = false
+                songEndCleared = false
                 if (wasExtrapolating && !monotonicResume) {
                     extrapolating = false
                     AppLog.i(

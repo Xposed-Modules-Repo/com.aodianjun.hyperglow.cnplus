@@ -93,10 +93,16 @@ jobs:
 
       - name: Upload debug APK (artifact)
         uses: actions/upload-artifact@v6
+        # 制品额度（500MB）耗尽时上传必然失败，但这只是 run 内传递/人工下载的辅助产物，
+        # 不应把已完成编译与单测的构建判红、并连带跳过 release job。失败降级为 warning。
+        continue-on-error: true
         with:
           name: hyperglow-debug-${{ matrix.variant }}
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
+          # 制品仅用于同一 run 内 build → publish-debug 传递 APK（以及人工下载）;
+          # Actions 制品额度仅 500MB,历史调试包曾堆到数十 GB 导致上传全部失败,故压到最短保留期。
+          retention-days: 1
 
   # 汇总两个 debug 变体并发布为预发行 release。必须独立 job:矩阵两个变体并行,
   # 若各自 delete+create+upload 会互相覆盖(后删的删掉先传的 APK),导致缺一个变体。
@@ -109,6 +115,8 @@ jobs:
 
       - name: Download debug APKs
         uses: actions/download-artifact@v4
+        # 上传因制品额度耗尽而降级时这里必然拿不到 artifact；由下一步的守卫决定跳过。
+        continue-on-error: true
         with:
           path: apks
           pattern: hyperglow-debug-*
@@ -120,6 +128,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 制品额度耗尽时 artifact 上传/下载均降级，run 内拿不到 APK；此时保留现有
+          # debug release 不动（绝不删旧建空），等额度恢复后的下一次构建再刷新。
+          if ! ls apks/*.apk >/dev/null 2>&1; then
+            echo "::notice::No debug APK artifacts available (artifact storage quota hit); skipping debug release refresh."
+            exit 0
+          fi
           # 稳定的 debug release:每次构建都删除旧 release 再重建,确保发布时间刷新
           TAG="debug"
           # 从本次 commit 生成 release 简介(标题行 + 正文,若为空则给占位说明)
@@ -198,10 +212,15 @@ jobs:
 
       - name: Upload plugin ZIPs (artifact)
         uses: actions/upload-artifact@v6
+        # 制品额度耗尽时上传必然失败，但这只是人工下载的辅助产物（release 发布直接用
+        # 本地构建的 ZIP），不应判红，失败降级为 warning。
+        continue-on-error: true
         with:
           name: hyperglow-plugins
           path: plugins/*/build/distributions/hyperglow-*-plugin.zip
           if-no-files-found: error
+          # 同 build job:制品只用于 run 内传递/人工下载,压到最短保留期以省额度。
+          retention-days: 1
 
       - name: Publish plugin ZIPs to rolling pre-release
         if: github.ref == 'refs/heads/main'
@@ -329,12 +348,17 @@ jobs:
 
       - name: Upload APKs (artifact)
         uses: actions/upload-artifact@v6
+        # 制品额度耗尽时上传必然失败，但正式发布用的是本地 APK（下一步直接 gh release
+        # upload），不应因这份冗余副本判红；失败降级为 warning。
+        continue-on-error: true
         with:
           name: hyperglow-version
           path: |
             ${{ env.RELEASE_APK }}
             ${{ env.DEBUG_APK }}
           if-no-files-found: error
+          # 同 build job:制品只用于 run 内传递/人工下载,压到最短保留期以省额度。
+          retention-days: 1
 
       - name: Publish APKs and update release notes
         # 上传到正式发布 tag(默认取版本号,如 v0.3.65;可用 RELEASE_TAG 覆盖),
