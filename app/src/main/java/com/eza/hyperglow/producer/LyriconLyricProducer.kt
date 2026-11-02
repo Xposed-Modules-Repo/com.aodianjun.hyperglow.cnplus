@@ -63,6 +63,58 @@ internal data class MediaSessionPosition(
     val speed: Float
 )
 
+/** 陈旧冲刷样本的处置：采纳 / 进入观察 / 继续忽略（冲刷追赶中）。 */
+internal enum class StaleFlushAction { HONOR, ARM, REJECT }
+
+/**
+ * 陈旧冲刷判定（纯函数）。
+ *
+ * 场景 A（2026-10-24 实测）：外推中（写端沉默 ≥3s）送来落后 ~20s 的首值，随后 20ms 内
+ * 把缓冲位置冲完回到当前——旧行为把它当真实回跳，歌词倒回 20s 再快进重放。
+ *
+ * 场景 B（2026-10-24 Lyricon 实测）：MediaSession 兜底刚把基准恢复到真实位置（如 181s），
+ * 写端醒来送来冻结残留值（如 30s，落后 150s）——此刻 extrapolating=false 且沉默仅几十 ms，
+ * 场景 A 的前置条件不成立，残留值把正确基准立刻冲掉，歌词掉回开头反复。因此：
+ * 值落后最后真实基准 ≥[STALE_FLUSH_BEHIND_BASE_MS] 时无条件进入本判定。
+ *
+ * 判定链：
+ * 1. 值不落后于最后真实基准 → 采纳（前进交给既有 monotonicResume/采信路径）。
+ * 2. 落后幅度 < [STALE_FLUSH_BEHIND_BASE_MS] 且（未外推 或 沉默 <3s）→ 采纳
+ *    （短暂停更的小幅落后由既有 300ms 容差处理；大幅落后才需要观察）。
+ * 3. 首个进入判定的落后值 → 观察（忽略本拍，记下观察位）。
+ * 4. 后续值较观察位一拍跨进 ≥[STALE_FLUSH_RACE_STEP_MS] → 缓冲冲刷在追赶，继续忽略，
+ *    直到值追上「基准 − 容差」为止（期间基准可能被 MediaSession 兜底推进）。
+ * 5. 后续值较观察位只小幅前进（正常 60Hz 节奏）→ 真 seek 的新基准，采纳（仅延迟一拍）。
+ */
+internal fun classifyStaleFlushSample(
+    extrapolating: Boolean,
+    realPosition: Long,
+    lastRealBaseMs: Long,
+    sinceRealMs: Long,
+    pendingValueMs: Long
+): StaleFlushAction {
+    val farBehindBase = lastRealBaseMs - realPosition >=
+        LyriconLyricProducer.STALE_FLUSH_BEHIND_BASE_MS
+    val guardEngaged = extrapolating &&
+        sinceRealMs >= LyriconLyricProducer.STALE_FLUSH_MIN_SILENCE_MS
+    if (realPosition >= lastRealBaseMs) return StaleFlushAction.HONOR
+    if (!farBehindBase && !guardEngaged) return StaleFlushAction.HONOR
+    // 进入观察/冲刷判定后，追上「基准 − 容差」即视为写端恢复正常时间线。
+    if (pendingValueMs != Long.MIN_VALUE &&
+        realPosition >= lastRealBaseMs - LyriconLyricProducer.STALE_FLUSH_BEHIND_BASE_MS
+    ) return StaleFlushAction.HONOR
+    if (pendingValueMs == Long.MIN_VALUE) return StaleFlushAction.ARM
+    return when {
+        // 与观察位完全相同：写端仍冻结在该残留值上，继续按住显示。
+        realPosition == pendingValueMs -> StaleFlushAction.REJECT
+        // 一拍跨进 ≥1.5s：缓冲冲刷在追赶，继续忽略。
+        realPosition - pendingValueMs >=
+            LyriconLyricProducer.STALE_FLUSH_RACE_STEP_MS -> StaleFlushAction.REJECT
+        // 正常 60Hz 节奏的小幅前进：真 seek 的新基准，采纳。
+        else -> StaleFlushAction.HONOR
+    }
+}
+
 class LyriconLyricProducer(
     internal val clock: () -> Long = SystemClock::elapsedRealtime
 ) : LyricProducer {
@@ -157,6 +209,22 @@ class LyriconLyricProducer(
     internal var activePlayerPlaybackStateReader: (String) -> Int? = { readActivePlayerPlaybackState(it) }
 
     /**
+     * 查询 [packageName] 的 MediaSession 当前是否仍注册/存活。用于区分「会话在、播放态为空」
+     * （网易云停止态，按 STOPPED 处理）与「会话已消失」（读不到，不得误判为停止）。
+     * 看门狗协程内调用：无通知使用权时 getActiveSessions 会抛 SecurityException，必须吞掉。
+     */
+    private fun hasSessionFor(packageName: String): Boolean {
+        val manager = mediaSessionManager ?: return false
+        val component = notificationListenerComponent ?: return false
+        return runCatching {
+            manager.getActiveSessions(component).any { it.packageName == packageName }
+        }.getOrDefault(false)
+    }
+
+    /** JVM 单测用的缝，默认走真实 MediaSessionManager。 */
+    internal var sessionExistsReader: (String) -> Boolean = { hasSessionFor(it) }
+
+    /**
      * 第二位置源读取缝：播放器 MediaSession 的 position（共享内存停写时兜底）。
      * 单测可替换本缝，避免依赖真实 MediaSessionManager。
      */
@@ -240,6 +308,12 @@ class LyriconLyricProducer(
 
     /** 已按「真实播完」清过行：后续停更不得把最后一行重新顶回来（避免占位↔歌词闪烁）。 */
     @Volatile internal var songEndCleared: Boolean = false
+
+    /**
+     * 陈旧冲刷判定的观察位：外推中收到落后于最后真实基准的首值时记下它，
+     * 用下一拍的跨进步长区分「缓冲冲刷追赶」（继续忽略）与「真 seek 新基准」（采纳）。
+     */
+    @Volatile internal var staleFlushPendingValueMs: Long = Long.MIN_VALUE
 
     /** 第二位置源（播放器 MediaSession）探测节流与健康度日志节流。 */
     @Volatile internal var lastMediaSessionProbeMs: Long = 0L
@@ -483,6 +557,7 @@ class LyriconLyricProducer(
         positionUnknown = false
         heldAtSongEndStale = false
         songEndCleared = false
+        staleFlushPendingValueMs = Long.MIN_VALUE
         previousSongLastPositionMs = -1L
         seekRejectPositionMs = -1L
         seekClockMs = 0L
@@ -528,7 +603,10 @@ class LyriconLyricProducer(
             stoppedStreak = 0
             return
         }
-        val state = activePlayerPlaybackStateReader(pkg) ?: return
+        // 会话存在但播放态为空（网易云停止后清空 state）按 STOPPED 处理；
+        // 完全查不到会话时保持旧行为，避免把「查不到」误判成「已停止」。
+        val state = activePlayerPlaybackStateReader(pkg)
+        if (state == null && !sessionExistsReader(pkg)) return
         if (classifyActivePlayerPlayback(state) == ActivePlayerPlayback.STOPPED) {
             if (++stoppedStreak >= STOP_CONFIRMATIONS) {
                 stopConverged = true
@@ -598,8 +676,9 @@ class LyriconLyricProducer(
     }
 
     /**
-     * 共享内存位置停写后的第二位置源探测（1s 节流）：只接受「比最后真实位置更靠前且不越歌长」
-     * 的 MediaSession 值，避免把冻结的旧值当新位置把歌词拉回去。
+     * 共享内存位置停写后的第二位置源探测（1s 节流）：把 MediaSession 位置按倍速推算到
+     * 当前时刻后，只接受「比最后真实位置更靠前且不越歌长」的值——直接用原始
+     * `playbackState.position` 会按播放器的更新延迟把歌词回卷（息屏时间戳滞后的根因）。
      */
     internal fun probeMediaSessionPosition(now: Long): Long? {
         if (now - lastMediaSessionProbeMs < MEDIA_SESSION_POSITION_PROBE_MS) return null
@@ -607,10 +686,18 @@ class LyriconLyricProducer(
         val pkg = sessionQueryPackage(activePlayerPackage, activeProviderPackage) ?: return null
         val sample = mediaSessionPositionReader(pkg) ?: return null
         val duration = currentSong?.duration ?: 0L
-        if (sample.positionMs < 0L) return null
-        if (duration > 0L && sample.positionMs > duration + 2_000L) return null
-        if (sample.positionMs <= lastRealPositionMs) return null
-        return sample.positionMs
+        // playbackState.position 是 lastPositionUpdateTime 那一刻的值，播放器常隔几秒才
+        // 更新一次；按倍速推算到当前时刻再比较/重锚。
+        val projected = if (sample.lastUpdateElapsedMs in 0..now) {
+            sample.positionMs +
+                ((now - sample.lastUpdateElapsedMs) * sample.speed.coerceAtLeast(0f)).toLong()
+        } else {
+            sample.positionMs
+        }
+        if (projected < 0L) return null
+        if (duration > 0L && projected > duration + 2_000L) return null
+        if (projected <= lastRealPositionMs) return null
+        return projected
     }
 
     /**
@@ -622,22 +709,18 @@ class LyriconLyricProducer(
     internal fun refreshSessionPlaying() {
         val pkg = sessionQueryPackage(activePlayerPackage, activeProviderPackage)
         val state = if (pkg != null) activePlayerPlaybackStateReader(pkg) else null
-        sessionPlayingObserved = when {
-            state != null -> classifyActivePlayerPlayback(state) == ActivePlayerPlayback.PLAYING
-            currentSong != null -> anySessionPlaying()
-            else -> null
-        }
-    }
-
-    /** True when any active MediaSession is playing (bounded fallback for [refreshSessionPlaying]). */
-    private fun anySessionPlaying(): Boolean {
-        val manager = mediaSessionManager ?: return false
-        val component = notificationListenerComponent ?: return false
-        return runCatching {
-            manager.getActiveSessions(component).any {
-                classifyActivePlayerPlayback(it.playbackState?.state) == ActivePlayerPlayback.PLAYING
-            }
-        }.getOrDefault(false)
+        // 会话存在性只在播放态未知时才查询，避免每次轮询多一次 binder 往返。
+        val queriedSessionExists = state == null && pkg != null && sessionExistsReader(pkg)
+        // 回落语义收紧：只有「与当前曲目同名」的在播会话才算在播，
+        // 不再让无关残留会话（如 B 站 state=PLAYING）影响结论。
+        val sameTitlePlaying = state == null && !queriedSessionExists && currentSong != null &&
+            anySessionActiveFor(currentSong?.name)
+        sessionPlayingObserved = resolveSessionPlayingObserved(
+            state = state,
+            queriedSessionExists = queriedSessionExists,
+            hasSong = currentSong != null,
+            sameTitlePlaying = sameTitlePlaying
+        )
     }
 
     /**
@@ -657,6 +740,7 @@ class LyriconLyricProducer(
             // 回调链彻底停发时（onPositionChanged 不再来），advanceExtrapolation 永远不会
             // 被调用——第二位置源必须由看门狗主动驱动，否则只剩外推/卡死。
             maybeRecoverPositionFromMediaSession()
+            maybeMarkPausedWhenStaleExtrapolating()
             maybeResubscribeOnPositionSilence()
             maybeResubscribeOnSongFeed()
         }
@@ -681,11 +765,37 @@ class LyriconLyricProducer(
         positionUnknown = false
         heldAtSongEndStale = false
         songEndCleared = false
+        staleFlushPendingValueMs = Long.MIN_VALUE
         recomputeAndEmit()
         AppLog.i(
             "LyriconLyricProducer",
             "position recovered via MediaSession (watchdog): pos=${recovered}ms"
         )
+    }
+
+    /**
+     * 陈旧播放态死循环的自愈（2026-10-23 真机 80 分钟实证）：写端停更后 SDK 仍以 60Hz
+     * 重发同一停更值，生产者每次都发新鲜状态，`playing=true` 永远不被推翻——无限期保活下
+     * AOD 常亮、位置钉死造成「卡在一个字内反复」。写入端死透（外推/歌尾保持中）且
+     * MediaSession 明确报告未播放时，把生产者标记为暂停，交给既有暂停驻留/停止检测链路。
+     */
+    private fun maybeMarkPausedWhenStaleExtrapolating() {
+        if (!isPlayingState) return
+        if (!extrapolating && !heldAtSongEndStale) return
+        if (sessionPlayingObserved != false) return
+        // 注意判据用「最后真实位置时刻」而不是「最后回调时刻」：写端停更后 SDK 仍以
+        // 60Hz 重发同一停更值，回调一直是新鲜的，只有真实位置时钟暴露停更。
+        val now = clock()
+        if (lastRealPositionClockMs < 0L ||
+            now - lastRealPositionClockMs < STALE_POSITION_THRESHOLD_MS
+        ) return
+        isPlayingState = false
+        AppLog.w(
+            "LyriconLyricProducer",
+            "MediaSession not playing while position stale; marking paused " +
+                "(pos=${currentPositionMs}ms staleForMs=${now - lastRealPositionClockMs})"
+        )
+        recomputeAndEmit()
     }
 
     /**
@@ -1012,6 +1122,25 @@ class LyriconLyricProducer(
         internal const val FULL_REBUILD_COOLDOWN_MS = 60_000L
 
         /**
+         * 陈旧冲刷判定：写端沉默超过该时长后收到的落后值才进入观察（短暂停更交给
+         * 既有的 300ms monotonicResume 容差，不启用本判定）。
+         */
+        internal const val STALE_FLUSH_MIN_SILENCE_MS = 3_000L
+
+        /**
+         * 冲刷追赶的单拍跨进阈值：观察位之后的值一拍跨进 ≥1.5s（缓冲位置按写入间隔
+         * ~2-3s 压缩在毫秒级送达）视为冲刷在追赶；正常 60Hz 节奏一拍只前进 ~17ms。
+         */
+        internal const val STALE_FLUSH_RACE_STEP_MS = 1_500L
+
+        /**
+         * 值落后最后真实基准 ≥ 该幅度时无条件进入冲刷判定（不看外推状态/沉默时长）：
+         * MediaSession 兜底刚把基准恢复到真实位置时，写端送来的冻结残留值落后可达
+         * 分钟级，必须拒收（2026-10-24 Lyricon 实测落后 150s）。
+         */
+        internal const val STALE_FLUSH_BEHIND_BASE_MS = 5_000L
+
+        /**
          * issue #64:位置通道活跃但歌曲数据长期缺席(半死)时,强制重建订阅前的缺席阈值。
          * 正常切歌/(重)连补发的 onSongChanged 在数秒内到达;播放中 30s 无歌且位置值仍在
          * 推进即异常。必须明显大于正常切歌间隙,并大于 [PROVIDER_SYNC_GRACE_MS]。
@@ -1093,4 +1222,19 @@ class LyriconLyricProducer(
             font = "spotify"
         )
     }
+}
+
+/**
+ * 纯函数：便于 JVM 单测覆盖真值表，不依赖 Android 运行时。
+ */
+internal fun resolveSessionPlayingObserved(
+    state: Int?,
+    queriedSessionExists: Boolean,
+    hasSong: Boolean,
+    sameTitlePlaying: Boolean
+): Boolean? = when {
+    state != null -> classifyActivePlayerPlayback(state) == ActivePlayerPlayback.PLAYING
+    queriedSessionExists -> false // 会话在、播放态空 = 该播放器没在播
+    hasSong -> sameTitlePlaying // 会话查不到：只认同名在播会话
+    else -> null // 无歌、无信息：保持未知，不误触发
 }

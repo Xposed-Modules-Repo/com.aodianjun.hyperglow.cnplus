@@ -926,10 +926,17 @@ class LyriconLyricProducerTest {
         assertEquals(6_000L + 100_000L, state.positionMs)
 
         // Real position eventually resumes (screen-on) → extrapolation stops, real value wins.
+        // 陈旧冲刷判定：沉默 ≥3s 后的首个落后值先观察一拍（保持外推显示），
+        // 下一拍按正常节奏小幅前进即确认为真 seek/回跳并采纳（仅延迟一拍）。
         clockValue = 10_000L + 100_500L
         producer.playerListener.onPositionChanged(3_000L) // line 1 [3500,5000]? no → 3000 is line 0 end/line1 gap
         state = producer.state.value!!
-        assertEquals(3_000L, state.positionMs)
+        assertEquals(106_000L, state.positionMs) // 观察拍：保持上一外推显示，不倒回也不推进
+
+        clockValue = 10_000L + 100_517L
+        producer.playerListener.onPositionChanged(3_017L) // 正常 60Hz 节奏 → 真 seek，采纳
+        state = producer.state.value!!
+        assertEquals(3_017L, state.positionMs)
     }
 
     @Test
@@ -2367,6 +2374,110 @@ class LyriconLyricProducerTest {
         assertEquals(true, producer.sessionPlayingObserved)
     }
 
+    @Test
+    fun resolveSessionPlaying_truthTable() {
+        // 3.2 真值表逐行覆盖：state 非空时只看分类；state 空但会话在 → false；
+        // 会话查不到时有歌只认同名在播，无歌保持未知。
+        assertEquals(true, resolveSessionPlayingObserved(MediaPlayback.PLAYING, false, false, false))
+        assertEquals(false, resolveSessionPlayingObserved(MediaPlayback.STOPPED, true, true, true))
+        assertEquals(false, resolveSessionPlayingObserved(MediaPlayback.PAUSED, false, true, true))
+        assertEquals(false, resolveSessionPlayingObserved(null, true, true, true))
+        assertEquals(true, resolveSessionPlayingObserved(null, false, true, true))
+        assertEquals(false, resolveSessionPlayingObserved(null, false, true, false))
+        assertNull(resolveSessionPlayingObserved(null, false, false, false))
+        assertNull(resolveSessionPlayingObserved(null, false, false, true))
+    }
+
+    @Test
+    fun stopDetection_clearsWhenSessionExistsButStateNull() {
+        // 网易云停止态：会话仍 active、metadata 保留、playbackState 变 null。旧实现
+        // `?: return` 让 stoppedStreak 永远不累加；会话存在时应按 STOPPED 处理并在
+        // STOP_CONFIRMATIONS 次后清曲目。
+        val producer = LyriconLyricProducer { 0L }
+        producer.activeProviderPackage = "io.github.proify.lyricon.cmprovider"
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong())
+        producer.activePlayerPlaybackStateReader = { null }
+        producer.sessionExistsReader = { true }
+
+        repeat(LyriconLyricProducer.STOP_CONFIRMATIONS) {
+            producer.maybeClearOnStoppedPlayer()
+        }
+
+        assertNull("session exists but state=null must clear the stale track", producer.state.value)
+        assertNull(producer.currentSong)
+    }
+
+    @Test
+    fun stopDetection_noClearWhenSessionMissingAndStateNull() {
+        // 读不到 ≠ 已停止：会话查不到时保持旧行为，不能误清曲目（小米 hide 不可逆）。
+        val producer = LyriconLyricProducer { 0L }
+        producer.activeProviderPackage = "io.github.proify.lyricon.cmprovider"
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong())
+        producer.activePlayerPlaybackStateReader = { null }
+        producer.sessionExistsReader = { false }
+
+        repeat(LyriconLyricProducer.STOP_CONFIRMATIONS + 1) {
+            producer.maybeClearOnStoppedPlayer()
+        }
+
+        assertNotNull(producer.state.value)
+        assertNotNull(producer.currentSong)
+    }
+
+    @Test
+    fun sessionPlayingObservation_falseWhenSessionExistsButStateNull() {
+        val producer = LyriconLyricProducer { 0L }
+        producer.activeProviderPackage = "io.github.proify.lyricon.cmprovider"
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong())
+        producer.activePlayerPlaybackStateReader = { null }
+        producer.sessionExistsReader = { true }
+
+        producer.refreshSessionPlaying()
+
+        assertEquals(false, producer.sessionPlayingObserved)
+    }
+
+    @Test
+    fun sessionPlayingObservation_ignoresUnrelatedPlayingSession() {
+        // 查询包名的会话不存在、存在无关残留会话（B 站 state=PLAYING）时，旧实现
+        // anySessionPlaying() 会把它当在播；收紧后只认同名在播 → false。
+        // JVM 没有真实 MediaSessionManager，anySessionActiveFor 返回 false，
+        // 正好覆盖「无关会话不参与」的判定。
+        val producer = LyriconLyricProducer { 0L }
+        producer.activeProviderPackage = "io.github.proify.lyricon.cmprovider"
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong())
+        producer.activePlayerPlaybackStateReader = { null }
+        producer.sessionExistsReader = { false }
+
+        producer.refreshSessionPlaying()
+
+        assertEquals(false, producer.sessionPlayingObserved)
+    }
+
+    @Test
+    fun sessionPlayingObservation_skipsSessionExistenceWhenStateKnown() {
+        // 会话存在性查询只在 state 未知时发生，避免每轮多一次 binder 往返。
+        val producer = LyriconLyricProducer { 0L }
+        producer.activeProviderPackage = "io.github.proify.lyricon.cmprovider"
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong())
+        var sessionQueries = 0
+        producer.activePlayerPlaybackStateReader = { MediaPlayback.PLAYING }
+        producer.sessionExistsReader = {
+            sessionQueries++
+            false
+        }
+
+        producer.refreshSessionPlaying()
+
+        assertEquals(0, sessionQueries)
+        assertEquals(true, producer.sessionPlayingObserved)
+    }
+
     // --- 2.12 sequence/generation 原子性(并发入口上的编号) ---
 
     @Test
@@ -2417,12 +2528,101 @@ class LyriconLyricProducerTest {
 
         assertEquals(10_000L, fallbackProducer.probeMediaSessionPosition(1_000L))
 
-        // 冻结/回退值不接受（否则会把歌词拉回去）。
+        // 冻结/回退值不接受（否则会把歌词拉回去）：
+        // 位置 4000 停在 3000ms 时刻、now=3000（无外推余量），仍 <= lastReal(5000)。
         fallbackProducer.lastMediaSessionProbeMs = 0L
         fallbackProducer.mediaSessionPositionReader = {
-            MediaSessionPosition(positionMs = 4_000L, lastUpdateElapsedMs = 1_000L, speed = 1f)
+            MediaSessionPosition(positionMs = 4_000L, lastUpdateElapsedMs = 3_000L, speed = 1f)
         }
         assertNull(fallbackProducer.probeMediaSessionPosition(3_000L))
+
+        // 播放器延迟更新 playbackState 时按倍速推算到当前时刻：
+        // 原始 8000ms 停在 1000ms 时刻，now=6000 → 8000+5000=13000ms。
+        // 不推算的话 8000 <= lastReal(10000) 会被拒，歌词按更新延迟回卷
+        //（息屏时间戳滞后的根因）。
+        fallbackProducer.lastMediaSessionProbeMs = 0L
+        fallbackProducer.lastRealPositionMs = 10_000L
+        fallbackProducer.mediaSessionPositionReader = {
+            MediaSessionPosition(positionMs = 8_000L, lastUpdateElapsedMs = 1_000L, speed = 1f)
+        }
+        assertEquals(13_000L, fallbackProducer.probeMediaSessionPosition(6_000L))
+    }
+
+    @Test
+    fun staleFlushSampleIsHeldThenIgnoredWhileRacingButHonoredOnSeekCadence() {
+        // 2026-10-24 实测：写端沉默 ~20s 后送来落后 ~20s 的首值（91000 基准收到 72000），
+        // 随后 20ms 内按写入间隔大步冲完 → 旧行为把它当真实回跳，歌词倒回 20s 再快进重放。
+        // 值不落后于基准 / 落后幅度 <5s 且（未外推或短沉默）→ 采纳。
+        assertEquals(
+            StaleFlushAction.HONOR,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 92_000L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 20_000L, pendingValueMs = Long.MIN_VALUE
+            )
+        )
+        assertEquals(
+            StaleFlushAction.HONOR,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 90_900L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 1_000L, pendingValueMs = Long.MIN_VALUE
+            )
+        )
+        assertEquals(
+            StaleFlushAction.HONOR,
+            classifyStaleFlushSample(
+                extrapolating = false, realPosition = 88_000L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 100L, pendingValueMs = Long.MIN_VALUE
+            )
+        )
+        // 外推 + 沉默 ≥3s + 首个落后值 → 进入观察（忽略本拍）。
+        assertEquals(
+            StaleFlushAction.ARM,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 72_000L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 20_000L, pendingValueMs = Long.MIN_VALUE
+            )
+        )
+        // 场景 B（Lyricon 实测）：MediaSession 兜底刚把基准恢复到真实位置（如 181s），
+        // 写端醒来送来冻结残留（30s，落后 150s）——即使未外推、沉默仅几十 ms，
+        // 落后 ≥5s 也必须进入判定。
+        assertEquals(
+            StaleFlushAction.ARM,
+            classifyStaleFlushSample(
+                extrapolating = false, realPosition = 30_805L, lastRealBaseMs = 181_103L,
+                sinceRealMs = 50L, pendingValueMs = Long.MIN_VALUE
+            )
+        )
+        // 与观察位完全相同的重复值：写端仍冻结，继续按住显示（不得当 seek 采纳）。
+        assertEquals(
+            StaleFlushAction.REJECT,
+            classifyStaleFlushSample(
+                extrapolating = false, realPosition = 30_805L, lastRealBaseMs = 181_103L,
+                sinceRealMs = 60L, pendingValueMs = 30_805L
+            )
+        )
+        // 观察后一拍跨进 ≥1.5s → 冲刷追赶，继续忽略；直到追上「基准 −5s」才采纳。
+        assertEquals(
+            StaleFlushAction.REJECT,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 74_610L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 20_000L, pendingValueMs = 72_000L
+            )
+        )
+        assertEquals(
+            StaleFlushAction.HONOR,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 91_200L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 20_000L, pendingValueMs = 88_980L
+            )
+        )
+        // 观察后只按正常节奏小幅前进（~17ms）→ 真 seek 的新基准，采纳（仅延迟一拍）。
+        assertEquals(
+            StaleFlushAction.HONOR,
+            classifyStaleFlushSample(
+                extrapolating = true, realPosition = 72_017L, lastRealBaseMs = 91_000L,
+                sinceRealMs = 20_000L, pendingValueMs = 72_000L
+            )
+        )
     }
 
     private fun markerDuetSong(): Song = Song(
