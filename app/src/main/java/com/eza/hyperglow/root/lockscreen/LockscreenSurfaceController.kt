@@ -15,6 +15,8 @@ import com.eza.hyperglow.customization.CompiledCustomization
 import com.eza.hyperglow.customization.CompiledSurfaceProfile
 import com.eza.hyperglow.customization.SceneCompiler
 import com.eza.hyperglow.customization.metadataExpectedExtraLines
+import com.eza.hyperglow.customization.spectrumWidgetHeightDp
+import com.eza.hyperglow.aod.SpectrumFrame
 import com.eza.hyperglow.root.aod.AodLyricCanvasView
 import com.eza.hyperglow.root.aod.AodCanvasVerticalAlignment
 import com.eza.hyperglow.root.aod.artworkSideDp
@@ -49,6 +51,7 @@ import com.eza.hyperglow.root.surface.PlacementEngine
 import com.eza.hyperglow.root.surface.PlacementEnvironment
 import com.eza.hyperglow.root.surface.PlacementRect
 import com.eza.hyperglow.root.surface.WidgetMeasurement
+import com.eza.hyperglow.root.utils.PlatformVersion
 import java.lang.ref.WeakReference
 import java.lang.reflect.Method
 import kotlin.math.roundToInt
@@ -58,6 +61,13 @@ internal const val MIN_VISIBLE_ALPHA = 0.01f
 private const val MAX_NOTIFICATION_TRACE_CHILDREN = 6
 
 private const val VISIBILITY_DIAGNOSTIC_INTERVAL_MS = 2_000L
+
+/** 锚点探针最短间隔:进出锁屏时几何会连续变化,只按秒采样,避免刷屏。 */
+private const val OS4_ANCHOR_PROBE_INTERVAL_MS = 1_000L
+
+/** 非 OS4 上布局算式与可见底边的容差;超过才认为是测量口径漂移。 */
+private const val CLOCK_ANCHOR_MISMATCH_TOLERANCE_DP = 32f
+private const val MEDIA_ANCHOR_MISMATCH_TOLERANCE_DP = 32f
 
 private const val NOTIFICATION_TRACE_INTERVAL_MS = 1_000L
 
@@ -101,6 +111,9 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
     private var lastCardBackgroundStyle: String? = null
     private var lastCardAlpha: Int = -1
     private var lastCardColor: String? = null
+    private var lastOs4ClockProbe: String? = null
+    private var lastOs4MediaProbe: String? = null
+    private var lastOs4ProbeAt = 0L
     private var sceneRole = LinkageSceneRole.INACTIVE
     private var handoffActive = false
     private var transitionFailedHidden = false
@@ -210,7 +223,12 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             }
             SystemUiLyricProjectionRuntime.projection.attach(this, candidateRoot.context)
             SystemUiLyricProjectionRuntime.projection.reportCapabilities()
-            HookLogger.i(TAG, "Lockscreen surface attached")
+            HookLogger.i(
+                TAG,
+                "Lockscreen surface attached os4=${PlatformVersion.isHyperOs4OrNewer} " +
+                    "sdk=${android.os.Build.VERSION.SDK_INT} " +
+                    "osName=${PlatformVersion.rawVersionName ?: "-"}"
+            )
             SurfaceEvidence.once("lockscreen_surface_attached")
         }
     }
@@ -250,6 +268,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
 
     override fun onLyricSnapshot(snapshot: LyricSnapshot) {
         val resolvedSnapshot = LinkageTransitionCoordinator.resolveSnapshot(snapshot)
+        lyricCanvas?.setPlaybackActive(resolvedSnapshot.playbackActive)
         latestSnapshot = resolvedSnapshot
         if (resolvedSnapshot.visible) {
             lastVisibleSnapshot = resolvedSnapshot
@@ -284,6 +303,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
     }
 
     override fun onLyricKeepAlive(signal: LyricKeepAliveSignal) {
+        lyricCanvas?.setPlaybackActive(signal.playbackActive)
         latestSnapshot = latestSnapshot?.copy(
             updatedAtElapsedMs = signal.updatedAtElapsedMs,
             playbackActive = signal.playbackActive,
@@ -291,6 +311,10 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         )
         latestSnapshot?.let(::scheduleFreshnessExpiry)
         requestRefresh()
+    }
+
+    override fun onSpectrum(frame: SpectrumFrame) {
+        lyricCanvas?.setSpectrum(frame)
     }
 
     override fun onLyricProjectionDisconnected() {
@@ -303,6 +327,8 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         runtimeProfile = null
         lastRenderedProfile = null
         cancelFreshnessExpiry()
+        lyricCanvas?.setPlaybackActive(false)
+        lyricCanvas?.clearSpectrum()
         hideSurface()
     }
 
@@ -313,6 +339,8 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         retentionAnchor = null
         cancelPauseLingerExpiry()
         cancelFreshnessExpiry()
+        lyricCanvas?.setPlaybackActive(false)
+        lyricCanvas?.clearSpectrum()
         hideSurface()
     }
 
@@ -467,10 +495,13 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         val baseVisible = eligibleSnapshot != null && shouldShowLockscreen(visibilityInputs)
             // 无歌词内容(纯音乐标记行或真无歌词) RESTORE_DEFAULT(per-surface):本面「交还
             // 系统默认」——不显示 CN+ 歌词卡片(含卡片背景/进度条),整块交还系统锁屏默认内容。
+            // 纯音乐识别接管例外:本面改画配置文本(有内容可画),不交还。
             && !(eligibleSnapshot != null && (shouldReleaseStockForNoContent(
                 pureMusic = eligibleSnapshot.pureMusic,
                 noLyrics = eligibleSnapshot.noLyrics,
-                noLyricsBehavior = lockscreenProfile.noLyricsBehavior
+                noLyricsBehavior = lockscreenProfile.noLyricsBehavior,
+                pureMusicTextOverride = eligibleSnapshot.pureMusic &&
+                    lockscreenProfile.pureMusicDisplay
             ) || shouldReleaseStockForTailTimeout(
                 tailActive = tailActive,
                 tailTimeoutBehavior = lockscreenProfile.tailTimeoutBehavior
@@ -489,8 +520,12 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         val visible = baseVisible && anchorReady
         val stack = readField(controller, "notificationStackScrollLayout") as? ViewGroup
         val header = stack?.let { findMediaHeader(it, requireVisible = true) }
-        val reservePx = if (visible) layoutResult?.notificationReservePx ?: 0 else 0
-        LyricReserveState.update(stack, header, reservePx)
+        LyricReserveState.update(
+            stack,
+            header,
+            if (visible) layoutResult?.mediaHeaderOffsetPx ?: 0 else 0,
+            if (visible) layoutResult?.notificationOffsetPx ?: 0 else 0
+        )
         directSurface.keepScreenOn = shouldKeepLockscreenAwake(
             enabled = customization?.lockscreenKeepAwake == true,
             visible = visible,
@@ -605,19 +640,75 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         }
         val avoidsNotifications = profile.collisionPolicy == "avoid"
         val bottomReserve = (BOTTOM_RESERVE_DP * density).roundToInt()
-        val mediaHeaderBottom = resolveVisibleMediaHeaderBottom(controller, host)
-        val pinnedBelowMediaHeader = mediaHeaderBottom != null
+        val fontScale = host.resources.displayMetrics.scaledDensity / density.coerceAtLeast(0.1f)
+        val placementMode = com.eza.hyperglow.aod.normalizeLockscreenCardPlacement(
+            customization?.lockscreenCardPlacement
+        )
+        val aboveMedia = placementMode == "above_media"
+        val belowMedia = placementMode == "below_media"
+        // 旧布尔值兼容:新字段仍是 clock 且旧开关为 true 时按「下方」处理。
+        val reserveEnabled = belowMedia ||
+            (placementMode == "clock" && customization?.lockscreenReserveBelowMediaCard == true)
+        val mediaHeaderTop = if (aboveMedia || reserveEnabled) {
+            resolveVisibleMediaHeaderTop(controller, host)
+        } else {
+            null
+        }
+        val mediaHeaderBottom = if (reserveEnabled || aboveMedia) {
+            resolveVisibleMediaHeaderBottom(controller, host)
+        } else {
+            null
+        }
+        val pinnedBelowMediaHeader = reserveEnabled && mediaHeaderBottom != null
         val mediaCardGap = (MEDIA_CARD_GAP_DP * density).roundToInt()
-        val freeRegion = if (mediaHeaderBottom != null) {
-            val top = (mediaHeaderBottom + mediaCardGap).coerceIn(0, host.height)
-            PlacementRect(
+        // lyricLineLimit=0 时估算值是 +∞:先按屏高收敛,避免 Int 溢出成负数。
+        val estimatedSceneHeightPx = estimatedLockscreenSceneHeight(profile, density, fontScale)
+            .coerceAtMost(host.height.toFloat())
+            .roundToInt()
+        // 上方模式:用设置估算高度给媒体卡一次性让位(稳定值,不随当前行数抖动),
+        // 实际空间不足时按剩余空间收紧;卡片在该区域底部向上生长。
+        val aboveShiftPx = if (aboveMedia && mediaHeaderTop != null) {
+            val requested = estimatedSceneHeightPx + mediaCardGap
+            val available = (mediaHeaderTop - (clockBottom + margin) -
+                mediaCardGap - estimatedSceneHeightPx).coerceAtLeast(0)
+            minOf(requested, available)
+        } else {
+            0
+        }
+        // 下方模式:媒体卡也要上移,把「卡片高度 + 间距」从卡下腾出来;上移量用估算值,
+        // 歌词行数变化只改通知位移,不再推动媒体卡。
+        val belowShiftPx = if (pinnedBelowMediaHeader && mediaHeaderTop != null) {
+            val requested = estimatedSceneHeightPx + mediaCardGap
+            val available = (mediaHeaderTop - (clockBottom + margin)).coerceAtLeast(0)
+            minOf(requested, available)
+        } else {
+            0
+        }
+        val shiftedMediaTop = if (aboveMedia && mediaHeaderTop != null) {
+            (mediaHeaderTop - aboveShiftPx).coerceAtLeast(clockBottom + margin)
+        } else {
+            null
+        }
+        val freeRegion = when {
+            shiftedMediaTop != null -> PlacementRect(
                 0f,
-                top.toFloat(),
+                (clockBottom + margin).toFloat(),
                 host.width.toFloat(),
-                (host.height - bottomReserve).toFloat()
+                (shiftedMediaTop - mediaCardGap)
+                    .coerceAtLeast(clockBottom + margin)
+                    .toFloat()
             )
-        } else if (avoidsNotifications) {
-            lockscreenCardRegionAfterNotifications(
+            pinnedBelowMediaHeader -> {
+                val top = (mediaHeaderBottom - belowShiftPx + mediaCardGap)
+                    .coerceIn(0, host.height)
+                PlacementRect(
+                    0f,
+                    top.toFloat(),
+                    host.width.toFloat(),
+                    (host.height - bottomReserve).toFloat()
+                )
+            }
+            avoidsNotifications -> lockscreenCardRegionAfterNotifications(
                 host.width,
                 host.height,
                 clockBottom,
@@ -626,8 +717,7 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 bottomReserve,
                 notificationBounds
             )
-        } else {
-            largestLockscreenFreeRegion(
+            else -> largestLockscreenFreeRegion(
                 host.width,
                 host.height,
                 clockBottom,
@@ -649,7 +739,14 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         } else {
             0f
         }
-        val fontScale = host.resources.displayMetrics.scaledDensity / density.coerceAtLeast(0.1f)
+        val spectrumHeight = if (profile.spectrum.enabled &&
+            !profile.spectrum.background &&
+            profile.widgets.any { it.type == "spectrum" }
+        ) {
+            spectrumWidgetHeightDp(profile.spectrum.heightPercent) * density
+        } else {
+            0f
+        }
         // 自适应卡片高度:宽度与高度无关,先按放置宽(卡片样式取通知宽)定内容宽,再实测内容
         // 自然堆叠高;「高度」设置仍是上限,设置估算只兜底无内容/未测量时。
         val placementWidth = freeRegion.width * placementWidthFraction
@@ -713,22 +810,28 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             when (widget.type) {
                 "lyrics" -> WidgetMeasurement(
                     widget,
-                    (desiredHeight - metadataHeight - progressHeightWithGap)
+                    (desiredHeight - metadataHeight - progressHeightWithGap - spectrumHeight)
                         .coerceAtLeast(MIN_HEIGHT_DP * density)
                 )
                 "metadata" -> WidgetMeasurement(widget, metadataHeight)
                 "media_progress" -> WidgetMeasurement(widget, progressHeightWithGap)
+                "spectrum" -> WidgetMeasurement(widget, spectrumHeight)
                 else -> null
             }
         }
-        val placementProfile = if (avoidsNotifications || pinnedBelowMediaHeader) {
-            profile.copy(
+        val placementProfile = when {
+            // 上方模式:卡片贴住预留区底部(媒体卡上方),高度变化向上生长。
+            aboveMedia -> profile.copy(
+                anchor = "screen_bottom_safe",
+                maxHeightFraction = 1f,
+                widthFraction = placementWidthFraction
+            )
+            avoidsNotifications || pinnedBelowMediaHeader -> profile.copy(
                 anchor = "below_stock_clock",
                 maxHeightFraction = 1f,
                 widthFraction = placementWidthFraction
             )
-        } else {
-            profile.copy(widthFraction = placementWidthFraction)
+            else -> profile.copy(widthFraction = placementWidthFraction)
         }
         val placement = PlacementEngine.resolve(
             placementProfile,
@@ -763,14 +866,21 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             layoutDiagnostic = "invalid-rect=$rect"
             return null
         }
-        val notificationReservePx = if (pinnedBelowMediaHeader) {
-            mediaCardGap + rect.height + notificationGap
-        } else {
-            0
+        val mediaHeaderOffsetPx = when {
+            aboveMedia -> -aboveShiftPx
+            pinnedBelowMediaHeader -> -belowShiftPx
+            else -> 0
+        }
+        val notificationOffsetPx = when {
+            aboveMedia -> -aboveShiftPx
+            pinnedBelowMediaHeader ->
+                -belowShiftPx + mediaCardGap + rect.height + notificationGap
+            else -> 0
         }
         layoutDiagnostic =
             "rect=$rect clock=$clockBottom media=${mediaHeaderBottom ?: "none"} " +
-            "pin=$pinnedBelowMediaHeader reserve=$notificationReservePx " +
+            "mode=$placementMode pin=$pinnedBelowMediaHeader " +
+            "headerOffset=$mediaHeaderOffsetPx childOffset=$notificationOffsetPx " +
             "notification=${notificationBounds ?: "none"} free=$freeRegion"
         val progressEnabled = "media_progress" in visibleTypes
         val progressHeight = if (progressEnabled) (PROGRESS_HEIGHT_DP * density).roundToInt() else 0
@@ -800,7 +910,8 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
             renderProfile,
             progressEnabled,
             mediaHeaderBottom,
-            notificationReservePx
+            mediaHeaderOffsetPx,
+            notificationOffsetPx
         )
     }
 
@@ -849,16 +960,45 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
                 "com.android.systemui"
             )
         )
-        return preferredLockscreenClockBottom(
+        val visible = listOf(
+            visibleBottomInHost(host, clockView),
+            visibleBottomInHost(host, clockContainer),
+            visibleBottomInHost(host, foregroundClockContainer)
+        )
+        val resolved = preferredLockscreenClockBottom(
             host.height,
             preferred,
-            listOf(
-                direct,
-                visibleBottomInHost(host, clockView),
-                visibleBottomInHost(host, clockContainer),
-                visibleBottomInHost(host, foregroundClockContainer)
-            )
+            listOf(direct) + visible
         )
+        val density = host.resources.displayMetrics.density
+        val tolerance = if (PlatformVersion.isHyperOs4OrNewer) {
+            0
+        } else {
+            (CLOCK_ANCHOR_MISMATCH_TOLERANCE_DP * density).roundToInt()
+        }
+        val chosen = adaptiveLockscreenClockBottom(resolved, visible, tolerance)
+        logAnchorProbe(
+            "clock",
+            "preferred=$preferred direct=$direct visible=$visible resolved=$resolved " +
+                "os4=${PlatformVersion.isHyperOs4OrNewer} chosen=$chosen",
+            always = chosen != resolved
+        )
+        return chosen
+    }
+
+    /**
+     * 锚点采样:把「布局算式值」和「可见边界值」同时打进日志,便于下次现场日志直接核对
+     * 补偿量是否命中,而不是只看到一个最终 top。OS3 只在真正发生补偿时输出。
+     */
+    private fun logAnchorProbe(kind: String, probe: String, always: Boolean = false) {
+        if (!always && !PlatformVersion.isHyperOs4OrNewer) return
+        val previous = if (kind == "clock") lastOs4ClockProbe else lastOs4MediaProbe
+        if (probe == previous) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastOs4ProbeAt < OS4_ANCHOR_PROBE_INTERVAL_MS) return
+        if (kind == "clock") lastOs4ClockProbe = probe else lastOs4MediaProbe = probe
+        lastOs4ProbeAt = now
+        HookLogger.i(TAG, "anchor probe $kind $probe")
     }
 
     private fun resolveNotificationBounds(
@@ -1088,19 +1228,55 @@ internal object LockscreenSurfaceController : SystemUiLyricSubscriber, LinkageSu
         return (visible.bottom - hostLocation[1]).coerceIn(0, host.height)
     }
 
+    /**
+     * 媒体卡可见顶边(host 坐标)。上方模式用它算让位量;可见矩形拿不到时返回 null,
+     * 该帧退回旧布局,而不是把卡片放到未知位置。
+     */
+    private fun resolveVisibleMediaHeaderTop(controller: Any?, host: ViewGroup): Int? {
+        val stack = readField(controller, "notificationStackScrollLayout") as? ViewGroup
+            ?: return null
+        val header = findMediaHeader(stack, requireVisible = true) ?: return null
+        val visible = Rect()
+        if (!header.getGlobalVisibleRect(visible)) return null
+        val hostLocation = IntArray(2)
+        host.getLocationInWindow(hostLocation)
+        return (visible.top - hostLocation[1] - LyricReserveState.currentHeaderOffsetPx())
+            .coerceIn(0, host.height)
+    }
+
     private fun resolveVisibleMediaHeaderBottom(controller: Any?, host: ViewGroup): Int? {
         val stack = readField(controller, "notificationStackScrollLayout") as? ViewGroup
             ?: return null
         val header = findMediaHeader(stack, requireVisible = true) ?: return null
+        // 媒体卡自身可能已被上一帧的占位位移顶上去:测量时扣掉,始终回到原厂位置。
+        val appliedHeaderOffset = LyricReserveState.currentHeaderOffsetPx()
         val position = stableLayoutPositionInHost(host, header)
-        if (position != null && header.height > 0) {
+        val layoutBottom = if (position != null && header.height > 0) {
             val parentTranslation = (header.parent as? View)?.translationY ?: 0f
-            return (position.second + header.translationY + parentTranslation + header.height)
+            (position.second - appliedHeaderOffset + header.translationY +
+                parentTranslation + header.height)
                 .roundToInt()
                 .coerceIn(0, host.height)
                 .takeIf { it > 0 }
+        } else {
+            null
         }
-        return visibleBottomInHost(host, header).takeIf { it > 0 }
+        val visibleBottom = (visibleBottomInHost(host, header) - appliedHeaderOffset)
+            .coerceIn(0, host.height)
+        val density = host.resources.displayMetrics.density
+        val tolerance = if (PlatformVersion.isHyperOs4OrNewer) {
+            0
+        } else {
+            (MEDIA_ANCHOR_MISMATCH_TOLERANCE_DP * density).roundToInt()
+        }
+        val chosen = adaptiveMediaHeaderBottom(layoutBottom, visibleBottom, tolerance)
+        logAnchorProbe(
+            "media",
+            "layout=$layoutBottom visible=$visibleBottom class=${header.javaClass.name} " +
+                "os4=${PlatformVersion.isHyperOs4OrNewer} chosen=$chosen",
+            always = chosen != layoutBottom
+        )
+        return chosen
     }
 
     private fun findMediaHeader(stack: ViewGroup, requireVisible: Boolean): View? {

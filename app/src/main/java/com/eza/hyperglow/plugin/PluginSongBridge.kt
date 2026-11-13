@@ -39,6 +39,10 @@ object PluginSongBridge {
     /** 和声行角色值(与 amll-ttml 的 TtmlMapper.ROLE_BG 同一约定)。 */
     internal const val ROLE_BG = "BG"
 
+    /** 行首角色前缀:不参与「仅叹词不同」的宽松行身份匹配(它们区分声部)。 */
+    private val ROLE_PREFIXES =
+        setOf("对唱", "伴唱", "合唱", "合声", "和声", "男声", "女声", "童声", "主唱")
+
     fun fromDocument(document: SpicyBridgeDocument, state: LyricProducerState): PluginSong =
         PluginSong(
             id = state.trackUri.ifEmpty { null },
@@ -173,14 +177,41 @@ object PluginSongBridge {
         } else {
             null
         }
-        val active = activeRowByText(identityRows, state.line, state.positionMs)
+        val activeByText = activeRowByText(identityRows, state.line, state.positionMs)
+        val activeByLooseText = if (activeByText == null) {
+            activeRowByLooseText(identityRows, state.line, state.positionMs)
+        } else {
+            null
+        }
+        // 仅叹词不同(生产者的 `咚咚 …` vs TTML 的 `哈啊 …`):保留生产者的措辞,
+        // 只取插件行的时间窗;词表也不覆盖(词表文本与生产者措辞不同字形)。
+        val keepProducerText = activeByText == null && activeByLooseText != null
+        val active = activeByText
+            ?: activeByLooseText
             ?: selectActiveRow(identityRows, state.positionMs)
             ?: mainFallback
             ?: return state
 
         var enriched = state
         if (PluginLyricField.TEXT in patched.changedLyricFields) {
-            enriched = enriched.copy(line = keepUnlessBlank(active.text, enriched.line))
+            if (keepProducerText) {
+                enriched = enriched.copy(
+                    lineStartMs = active.begin,
+                    lineEndMs = active.end
+                )
+            } else {
+                val pluginText = keepUnlessBlank(active.text, enriched.line)
+                // 行窗必须跟着**实际选中的插件行**走:并发段里主行被钉在另一声部的行上,
+                // 生产者下发的 lineStartMs/lineEndMs 却属于它自己的当前句(另一声部)。
+                // 无逐词窗口的行按行窗做扫光,继续沿用生产者的窗口会让主行在整段并发里
+                // 停在 0/1(真机「并发的时候卡住不动」)。
+                val windowFromPlugin = !active.text.isNullOrBlank() && pluginText == active.text
+                enriched = enriched.copy(
+                    line = pluginText,
+                    lineStartMs = if (windowFromPlugin) active.begin else enriched.lineStartMs,
+                    lineEndMs = if (windowFromPlugin) active.end else enriched.lineEndMs
+                )
+            }
         }
         if (PluginLyricField.TRANSLATION in patched.changedLyricFields ||
             PluginLyricField.TRANSLATION_WORDS in patched.changedLyricFields
@@ -205,7 +236,7 @@ object PluginSongBridge {
                 alignedRightMarkers = active.isAlignedRight
             )
         }
-        if (PluginLyricField.WORDS in patched.changedLyricFields) {
+        if (PluginLyricField.WORDS in patched.changedLyricFields && !keepProducerText) {
             val patchedWords = active.words?.map { word ->
                 LyricWord(
                     text = word.text.orEmpty(),
@@ -298,10 +329,45 @@ object PluginSongBridge {
             HookLogger.iThrottled("duet-attach", 5_000L, "PluginSongBridge") {
                 val bg = rows.count(::isHarmonyRow)
                 val acc = accompanimentRowIndex(rows, rows.indexOf(active))
+                val primaryAt = voiceSlotRowIndexAt(
+                    rows, slots, VOICE_SLOT_PRIMARY, state.positionMs
+                )
+                val secondaryAt = voiceSlotRowIndexAt(
+                    rows, slots, VOICE_SLOT_SECONDARY, state.positionMs
+                )
+                val concurrentNow = hasSecondVoice && primaryAt >= 0 && secondaryAt >= 0
+                // 诊断:活动行与对面声部是否**本来就共享窗口**(真对唱)。concurrent 为 false
+                // 时,若 pairIdx 仍 >= 0,说明是「位置采样落在空隙」把并发判丢了;pairIdx=-1
+                // 才是真的没有并发段。
+                val activeIdx = rows.indexOf(active)
+                val activeRow = rows.getOrNull(activeIdx)
+                val activeSlot = slots.getOrNull(activeIdx)
+                val pairIdx = if (activeRow != null && activeSlot != null) {
+                    rows.indices.firstOrNull { index ->
+                        val slot = slots.getOrNull(index)
+                        index != activeIdx && slot != null && slot != activeSlot &&
+                            !rows[index].text.isNullOrBlank() &&
+                            minOf(activeRow.end, rows[index].end) -
+                            maxOf(activeRow.begin, rows[index].begin) >=
+                            MIN_CONCURRENT_OVERLAP_MS
+                    } ?: -1
+                } else {
+                    -1
+                }
+                val duetIdx = when {
+                    acc >= 0 -> acc
+                    concurrentNow -> secondaryAt
+                    else -> -1
+                }
                 val pick = if (acc >= 0) rows[acc].text?.take(20) else "(none)"
                 "Duet attach: rows=${rows.size} bg=$bg twoVoice=$hasSecondVoice " +
-                    "active=${active.text?.take(16)} primaryIdx=${rows.indexOf(active)} " +
-                    "accIdx=$acc pick=$pick"
+                    "pos=${state.positionMs} pAt=$primaryAt sAt=$secondaryAt " +
+                    "concurrent=$concurrentNow pairIdx=$pairIdx " +
+                    "aWin=${activeRow?.begin}..${activeRow?.end} " +
+                    "active=${active.text?.take(16)} primaryIdx=$activeIdx " +
+                    "accIdx=$acc pick=$pick duetIdx=$duetIdx " +
+                    "pairText=${rows.getOrNull(pairIdx)?.text?.take(16)} " +
+                    "duet=${rows.getOrNull(duetIdx)?.text?.take(16)}"
             }
             val accompanimentIndex = accompanimentRowIndex(rows, primaryIndex)
             val duetIndex = when {
@@ -329,8 +395,13 @@ object PluginSongBridge {
             val duetRow = rows.getOrNull(duetIndex)
             enriched = enriched.copy(
                 duetLine = duetRow?.let { row ->
+                    val rowText = row.text.orEmpty()
+                    // 生产者当前句与并发行只差首两字叹词(`咚咚…` vs `哈啊…`)时,
+                    // 并发行沿用生产者的措辞;词表文本仍是 TTML 的字形,一并弃用,
+                    // 让这一行走行级扫光(否则会画出与文本不符的字)。
+                    val producerText = sameLineIgnoringInterjection(state.line, rowText)
                     LyricDuetLine(
-                        text = row.text.orEmpty(),
+                        text = if (producerText) keepUnlessBlank(state.line, rowText) else rowText,
                         romanized = row.roma.orEmpty(),
                         translated = effectiveTranslation(row).orEmpty(),
                         alignedRight = row.isAlignedRight,
@@ -341,15 +412,19 @@ object PluginSongBridge {
                         harmony = isHarmonyRow(row),
                         lineStartMs = row.begin,
                         lineEndMs = row.end,
-                        words = row.words?.map { word ->
-                            LyricWord(
-                                text = word.text.orEmpty(),
-                                romanized = "",
-                                startMs = word.begin,
-                                endMs = word.end,
-                                boundaryAfter = true
-                            )
-                        }.orEmpty()
+                        words = if (producerText) {
+                            emptyList()
+                        } else {
+                            row.words?.map { word ->
+                                LyricWord(
+                                    text = word.text.orEmpty(),
+                                    romanized = "",
+                                    startMs = word.begin,
+                                    endMs = word.end,
+                                    boundaryAfter = true
+                                )
+                            }.orEmpty()
+                        }
                     )
                 }
             )
@@ -408,6 +483,38 @@ object PluginSongBridge {
         if (needle.isEmpty()) return null
         val matches = rows.filter {
             !isHarmonyRow(it) && normalizeLyricText(it.text.orEmpty()) == needle
+        }
+        if (matches.isEmpty()) return null
+        return matches.firstOrNull { positionMs >= it.begin && positionMs < it.end }
+            ?: matches.minByOrNull { abs(it.begin - positionMs) }
+    }
+
+    /**
+     * 行身份的第二匹配档：两侧仅**首两字叹词**不同、其余逐字相同。实测生产者
+     * `咚咚 流水破开寒霜` vs TTML `哈啊 流水破开寒霜`：逐字比失配后主行退回按位置取，
+     * 并发行取到 TTML 的 `哈啊…`，生产者的 `咚咚…` 在哪个车道都不出现（owner 真机
+     * 「咚咚 流水破开寒霜被吞」）。
+     *
+     * 只放宽这一种形状（等长、从第 2 个字起完全一致），并排除男/女/合/对唱/伴唱
+     * 这类**角色前缀**——否则不同声部的同一句会被认成一句。
+     */
+    private fun sameLineIgnoringInterjection(producerLine: String, pluginText: String): Boolean {
+        val a = normalizeLyricText(producerLine)
+        val b = normalizeLyricText(pluginText)
+        if (a == b) return false
+        if (a.length < 4 || a.length != b.length) return false
+        if (!a.regionMatches(2, b, 2, a.length - 2)) return false
+        return a.substring(0, 2) !in ROLE_PREFIXES && b.substring(0, 2) !in ROLE_PREFIXES
+    }
+
+    private fun activeRowByLooseText(
+        rows: List<PluginLyricLine>,
+        producerLine: String,
+        positionMs: Long
+    ): PluginLyricLine? {
+        if (normalizeLyricText(producerLine).isEmpty()) return null
+        val matches = rows.filter {
+            !isHarmonyRow(it) && sameLineIgnoringInterjection(producerLine, it.text.orEmpty())
         }
         if (matches.isEmpty()) return null
         return matches.firstOrNull { positionMs >= it.begin && positionMs < it.end }

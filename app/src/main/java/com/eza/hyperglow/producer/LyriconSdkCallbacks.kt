@@ -67,6 +67,47 @@ internal fun LyriconLyricProducer.createConnectionListener(): ConnectionListener
         }
     }
 
+/**
+ * 回调异常隔离：SDK 在自己的线程上派发监听器，任何异常逃逸都可能让 SDK 停止派发
+ * （真机表现为「突然断联、位置不再更新」）。这里把每个回调包住，只记日志不抛出；
+ * 转发行为本身与直接注册监听器完全一致。
+ */
+internal class GuardedActivePlayerListener(
+    private val delegate: ActivePlayerListener
+) : ActivePlayerListener by delegate {
+    override fun onActiveProviderChanged(providerInfo: ProviderInfo?) =
+        guard("onActiveProviderChanged") { delegate.onActiveProviderChanged(providerInfo) }
+
+    override fun onSongChanged(song: Song?) =
+        guard("onSongChanged") { delegate.onSongChanged(song) }
+
+    override fun onReceiveText(text: String?) =
+        guard("onReceiveText") { delegate.onReceiveText(text) }
+
+    override fun onPlaybackStateChanged(isPlaying: Boolean) =
+        guard("onPlaybackStateChanged") { delegate.onPlaybackStateChanged(isPlaying) }
+
+    override fun onPositionChanged(position: Long) =
+        guard("onPositionChanged") { delegate.onPositionChanged(position) }
+
+    override fun onSeekTo(position: Long) =
+        guard("onSeekTo") { delegate.onSeekTo(position) }
+
+    override fun onDisplayTranslationChanged(isDisplayTranslation: Boolean) =
+        guard("onDisplayTranslationChanged") {
+            delegate.onDisplayTranslationChanged(isDisplayTranslation)
+        }
+
+    override fun onDisplayRomaChanged(isDisplayRoma: Boolean) =
+        guard("onDisplayRomaChanged") { delegate.onDisplayRomaChanged(isDisplayRoma) }
+
+    private inline fun guard(name: String, block: () -> Unit) {
+        runCatching(block).onFailure {
+            AppLog.w("LyriconLyricProducer", "player listener $name failed", it)
+        }
+    }
+}
+
 internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
     object : ActivePlayerListener {
         override fun onActiveProviderChanged(providerInfo: ProviderInfo?) {
@@ -142,6 +183,9 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
             noSongDropLogged = false
             generation.incrementAndGet()
             val lyrics = current.lyrics
+            // 曲目级时间轴缓存:hasTimedLyrics/是否有词级时间/行 begin 排序表一次算好,
+            // 高频位置回调不再每拍扫整首行表(见 LyriconSongTimingCache)。
+            songTimingCache = buildLyriconSongTimingCache(current)
             // 尾奏清行判据随行表一起预计算(60Hz 选行路径不扫全表):取所有合法 end
             // (end > begin)的最大值。对唱重叠时靠前的一行可能比最后一行结束得更晚,
             // 只看最后一行会提前清行(上游 HyperLyric 7.9 fdeb94f)。seek 不改变行表,
@@ -157,6 +201,7 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                 null
             }
             currentLineIndex = -1
+            currentLineHasWords = false
             cachedWords = null
             cachedTranslationWords = null
             // 对唱左右分侧快照随歌重算(身份排序依赖整首出现顺序,不能按单行现算);
@@ -185,6 +230,9 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                 lastRealPositionMs = 0L
                 lastRealPositionClockMs = clock()
                 extrapolating = false
+                // 新歌时间线尚未被可信位置锚定:禁止外推,渲染侧 speed 也保持 0,
+                // 直到第一个通过合理性门控的真实位置到达(见 onPositionChanged)。
+                positionAnchored = false
                 positionUnknown = false
                 heldAtSongEndStale = false
                 songEndCleared = false
@@ -219,6 +267,9 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                 // 真·重同步的首个真实位置与残留值不同,立即放行,不受影响。
                 songStartGateOpen = true
                 gateFrozenRejectMs = -1L
+                // 重同步保留的位置若已在本歌时间线中(>0)则视为已锚定；仍为 0 时宁可等
+                // 首个真实位置,也不要在起播前外推。
+                positionAnchored = lastRealPositionMs > 0L
                 AppLog.i(
                     "LyriconLyricProducer",
                     "onSongChanged: (re)connect re-sync; keeping position ${lastRealPositionMs}ms, " +
@@ -451,11 +502,23 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                                 "${lastRealPositionMs}ms after ${sinceRealForFlushMs}ms silence; " +
                                 "holding extrapolated display"
                         )
+                        // 驳回的是写端值，不是展示时钟：写端冻结后会把同一个陈旧值按 60Hz
+                        // 反复回传，若观察拍只 “保持” 上一拍位置，AOD 会被永久钉死在这一句
+                        // （2026-11-05 真机 18:27:21–18:27:50：pos 停在 118747ms 达 30s，
+                        // 期间 sampledAt 每秒刷新，渲染侧无从外推）。继续按挂钟推进，
+                        // 写端恢复后由 HONOR/monotonicResume 立即对齐。
+                        advanceExtrapolation(
+                            now,
+                            "stale flush ${realPosition}ms behind base ${lastRealPositionMs}ms"
+                        )
                         recomputeAndEmit()
                         return
                     }
                     StaleFlushAction.REJECT -> {
                         staleFlushPendingValueMs = realPosition
+                        // 同上：写端重复陈值/冲刷追赶期间，展示位置必须继续按挂钟前进，
+                        // 否则 “观察” 会变成无限期冻结。
+                        advanceExtrapolation(now, "stale flush repeat ${realPosition}ms")
                         recomputeAndEmit()
                         return
                     }
@@ -481,6 +544,8 @@ internal fun LyriconLyricProducer.createPlayerListener(): ActivePlayerListener =
                     lastRealPositionUpdateMs = now
                     currentPositionMs = realPosition
                 }
+                // 通过了合理性门控的真实位置 = 本歌时间线已锚定,从这里开始才允许墙钟外推。
+                positionAnchored = true
                 // A different value means the player has started writing the new song's progress.
                 // Disable residual filtering — subsequent positions are from the new song.
                 previousSongLastPositionMs = -1L
@@ -565,6 +630,8 @@ internal fun LyriconLyricProducer.applySeek(position: Long) {
     lastRealPositionUpdateMs = now
     currentPositionMs = position
     extrapolating = false
+    // Seek 是权威位置变更:目标位置即本歌时间线锚点。
+    positionAnchored = true
     // A seek is a deliberate position change — the position is known again.
     positionUnknown = false
     // A seek is a deliberate position change — clear residual filtering so the new
@@ -582,7 +649,8 @@ internal fun LyriconLyricProducer.applySeek(position: Long) {
     // Seek invalidates the navigator's sequential cache (playback jumped).
     navigator?.resetCache()
     currentLineIndex = -1
+    currentLineHasWords = false
     cachedWords = null
     cachedTranslationWords = null
-    recomputeAndEmit()
+    recomputeAndEmit(force = true)
 }

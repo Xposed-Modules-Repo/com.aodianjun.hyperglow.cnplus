@@ -250,7 +250,10 @@ Customization is versioned, declarative data compiled in the app process and def
 again in SystemUI. SystemUI renders only a fixed internal widget registry. Imported documents may
 select known widgets, anchors, semantic palette tokens, typography, main-lyric line limits, static
 secondary-text brightness, and bounded transitions. Word animation selects from a fixed
-`Minimal`/`Gradient`/`BetterLyrics` vocabulary shared by both surfaces. They cannot name classes,
+`Minimal`/`Gradient`/`BetterLyrics` vocabulary shared by both surfaces, or a sandboxed effect
+program whose output is either controlled draw primitives (default) or a bounded list of
+positioned boxes (`EffectProgram.outputMode == "boxes"`) rendered by the host's fixed renderer.
+They cannot name classes,
 resources, methods, paths, URLs, commands, or executable code.
 
 Lockscreen profiles also accept a bounded `backgroundStyle`: `auto`/`card` resolves to the built-in
@@ -505,8 +508,15 @@ AOD 宿主容器以及锁屏控制器/宿主/几何接缝；未知 profile 仍�
 自定义内容是在 app 进程中编译的带版本声明式数据，并在 SystemUI 中再次进行防御性校验。SystemUI
 只渲染固定的内部 widget 注册表。导入的文档可以选择已知的 widget、锚点、语义化调色板 token、
 排版、主歌词行数上限、静态次级文本亮度以及受限的过渡效果。逐字动画从
-`Minimal`/`Gradient`/`BetterLyrics` 的固定词表中选择，两个 surface 共用。它们不能指定类、资源、
-方法、路径、URL、命令或任何可执行代码。
+`Minimal`/`Gradient`/`BetterLyrics` 的固定词表中选择，两个 surface 共用；或选择一段沙箱效果
+程序，其输出为受控绘制原语（缺省）或有界定位盒列表（`EffectProgram.outputMode == "boxes"`，
+由宿主固定渲染器绘制）。盒是纯数据，不能指定类、资源、方法、路径、URL、命令或任何可执行
+代码。用户导入的装饰贴纸同样不越过这条边界：文档只携带 64..255 的编号；图片字节经配置
+Bundle 的只读 `ParcelFileDescriptor` 通道下发，SystemUI 侧按 sha256 与尺寸/像素预算校验后
+才解码进进程内注册表，读失败或哈希不符只丢弃该张，配置里始终不出现路径、URL 或可执行内容。
+程序还可以携带一张不超过 256 条的逐词覆盖表（`wordOverrides`：行号、词号与五个数值），
+由 `wordOverride` 指令读取；它同样只是数值数据，经同一套归一化校验（范围/有限性/条数上限），
+不能指定资源或代码。
 
 锁屏 profile 还接受受限的 `backgroundStyle`：`auto`/`card` 解析为内置的非交互通知式遮罩；
 `none` 保持透明。AOD 始终将其规范化为 `none`。

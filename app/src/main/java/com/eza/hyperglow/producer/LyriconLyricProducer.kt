@@ -67,6 +67,45 @@ internal data class MediaSessionPosition(
 internal enum class StaleFlushAction { HONOR, ARM, REJECT }
 
 /**
+ * 歌曲级时间轴缓存（随 `onSongChanged` 重建，position 热路径只读）。
+ *
+ * `emit()` 位于 SDK 的高频位置回调路径上：旧实现每次发射都会对整首行表做
+ * `hasTimedLyrics`/下一行起点/下一行文本的全表扫描。这里把与位置无关的结论预计算一次，
+ * 下一行由已排序的 [lineStarts] 二分得到。行表引用固定后不可变；`song` 身份用于防御
+ * 切歌与位置回调之间的竞态（缓存与当前歌不匹配时调用方回退扫描）。
+ */
+internal class LyriconSongTimingCache(
+    val song: Song,
+    val lines: List<RichLyricLine>,
+    val lineStarts: LongArray,
+    val hasTimedLyrics: Boolean,
+    val hasAnyWordTimings: Boolean
+) {
+    /** 第一条 `begin > positionMs` 的行下标；没有则 -1。行表按 begin 升序（SDK normalize）。 */
+    fun firstLineIndexAfter(positionMs: Long): Int {
+        var low = 0
+        var high = lineStarts.size
+        while (low < high) {
+            val mid = (low + high).ushr(1)
+            if (lineStarts[mid] <= positionMs) low = mid + 1 else high = mid
+        }
+        return if (low < lineStarts.size) low else -1
+    }
+}
+
+internal fun buildLyriconSongTimingCache(song: Song): LyriconSongTimingCache {
+    val lines = song.lyrics.orEmpty()
+    val starts = LongArray(lines.size) { lines[it].begin }
+    var hasTimedLyrics = false
+    var hasAnyWordTimings = false
+    for (line in lines) {
+        if (line.end > line.begin) hasTimedLyrics = true
+        if (!line.words.isNullOrEmpty()) hasAnyWordTimings = true
+    }
+    return LyriconSongTimingCache(song, lines, starts, hasTimedLyrics, hasAnyWordTimings)
+}
+
+/**
  * 陈旧冲刷判定（纯函数）。
  *
  * 场景 A（2026-10-24 实测）：外推中（写端沉默 ≥3s）送来落后 ~20s 的首值，随后 20ms 内
@@ -169,6 +208,8 @@ class LyriconLyricProducer(
      */
     @Volatile internal var sessionPlayingObserved: Boolean? = null
     private val watchdogScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    /** 看门狗心跳节流(诊断用,默认 1 分钟一条)。 */
+    private var lastWatchdogHeartbeatAtMs = 0L
 
     // --- Song-feed watchdog (issue #64) ---
     // 位置通道活跃(回调持续、值在推进)但歌曲通道已丢(onSongChanged 不再到达,
@@ -243,10 +284,26 @@ class LyriconLyricProducer(
      * 「最后一行 end」旧语义。
      */
     @Volatile internal var maxLineEndMs: Long = -1L
+    /** 当前歌曲的行开始时间/纯音乐/词级结论缓存；见 [buildLyriconSongTimingCache]。 */
+    @Volatile internal var songTimingCache: LyriconSongTimingCache? = null
     @Volatile internal var currentPositionMs: Long = 0L
     @Volatile internal var isPlayingState: Boolean = false
     @Volatile internal var currentLineIndex: Int = -1
+    @Volatile internal var currentLineHasWords: Boolean = false
     @Volatile internal var cachedWords: List<LyricWord>? = null
+
+    // --- 例行状态发射合流 ---
+    // SDK 位置回调约 60Hz，但下游仲裁/投影按 100ms 采样，渲染侧又用 sampledAt+speed 外推。
+    // 位置在同一行内的小步推进无需每次构造完整 LyricProducerState；事件型变化（换行/
+    // 播放态/speed/位置未知/切歌/seek）仍立即发射。同毫秒的两次回调不合并，保证注入时钟
+    // 的单测与真实回调语义一致。
+    @Volatile internal var lastEmitAtMs: Long = 0L
+    @Volatile internal var lastEmittedLineIndex: Int = Int.MIN_VALUE
+    @Volatile internal var lastEmittedPlaying: Boolean = false
+    @Volatile internal var lastEmittedSpeed: Float = -1f
+    @Volatile internal var lastEmittedPositionUnknown: Boolean = false
+    @Volatile internal var lastEmittedLineHasWords: Boolean = false
+    @Volatile internal var lastEmittedGeneration: Int = Int.MIN_VALUE
 
     /**
      * 当前活动行的翻译词表（SDK `RichLyricLine.translationWords` 映射，随行缓存、随行清空）：
@@ -291,6 +348,21 @@ class LyriconLyricProducer(
     @Volatile internal var lastRealPositionMs: Long = 0L
     @Volatile internal var lastRealPositionClockMs: Long = -1L
     @Volatile internal var extrapolating: Boolean = false
+
+    /**
+     * 位置是否已被「本首歌的可信真实位置」锚定。切歌后归零为 false，直到第一个通过
+     * 合理性门控的真实位置到达才置 true；未锚定期间禁止墙钟外推（见
+     * [advanceExtrapolation]），下发状态的 speed 也保持 0。
+     *
+     * 为什么需要：切歌瞬间写端可能还在回传旧歌残值、或新歌尚未真正起播，此时位置
+     * 回调持续重复同一个值（常见为 0）。旧逻辑把「位置重复」一律当写端冻结去外推，
+     * 于是歌词在开唱前就从 0 自己往前跑（2026-11-06 真机：切新歌后前奏阶段歌词
+     * 已开始，真实位置回来后整段回跳）。未锚定时下发 speed=0，渲染侧也不会自行外推。
+     */
+    @Volatile internal var positionAnchored: Boolean = false
+
+    /** 切歌后「锚不住 → 试 MediaSession」的重试节流（避免 60Hz 回调里做 Binder 查询）。 */
+    @Volatile internal var lastUnanchoredAnchorAttemptMs: Long = 0L
 
     // --- Extrapolation budget / unknown position ---
     // When the position source goes silent while playing, extrapolation advances the lyric for at
@@ -398,7 +470,8 @@ class LyriconLyricProducer(
 
     internal val connectionListener = createConnectionListener()
 
-    internal val playerListener = createPlayerListener()
+    // 回调异常隔离：SDK 派发线程上的异常不得逃逸，否则可能整条回调链被静默掐断。
+    internal val playerListener = GuardedActivePlayerListener(createPlayerListener())
 
     override fun start(context: Context) {
         if (started) {
@@ -406,6 +479,7 @@ class LyriconLyricProducer(
             return
         }
         started = true
+        resetEmitCoalescing()
         contextRef = context.applicationContext
         // issue #64:复位歌曲侧看门狗状态 —— 上一次运行遗留的缺席纪元/等歌宽限不应
         // 影响本次会话(新订阅建立后 SDK 会重新补发 onSongChanged,见 #56)。
@@ -472,6 +546,7 @@ class LyriconLyricProducer(
         subscriber = null
         mutableConnection.value = ProducerConnection.DISCONNECTED
         mutableState.value = null
+        resetEmitCoalescing()
         AppLog.i("LyriconLyricProducer", "stop: done")
     }
 
@@ -542,6 +617,9 @@ class LyriconLyricProducer(
         navigator = null
         maxLineEndMs = -1L
         currentLineIndex = -1
+        currentLineHasWords = false
+        songTimingCache = null
+        resetEmitCoalescing()
         cachedWords = null
         cachedTranslationWords = null
         duetResolvedAlignedRight = null
@@ -555,6 +633,7 @@ class LyriconLyricProducer(
         lastRealPositionUpdateMs = -1L
         extrapolating = false
         positionUnknown = false
+        positionAnchored = false
         heldAtSongEndStale = false
         songEndCleared = false
         staleFlushPendingValueMs = Long.MIN_VALUE
@@ -585,7 +664,10 @@ class LyriconLyricProducer(
     private suspend fun stopDetectionLoop() {
         while (watchdogScope.isActive) {
             delay(STOP_DETECT_INTERVAL_MS)
-            maybeClearOnStoppedPlayer()
+            // 同样的隔离:单次查询异常不得让停止检测永久退出。
+            runCatching { maybeClearOnStoppedPlayer() }.onFailure {
+                AppLog.w("LyriconLyricProducer", "stop detection iteration failed", it)
+            }
         }
     }
 
@@ -734,16 +816,89 @@ class LyriconLyricProducer(
             // 非音乐源(视频等)期间看门狗静默:此时「位置在推、歌曲缺失」是预期状态,
             // 重建订阅只会拿到同一首被忽略的「歌」,白耗 IPC。
             if (!activeSourceEligible()) continue
-            refreshSessionPlaying()
-            // 2.10:先结算上一次重建的成败(失败计数/升级告警),再决定是否发起新的重建。
-            verifyPendingResubscribe()
-            // 回调链彻底停发时（onPositionChanged 不再来），advanceExtrapolation 永远不会
-            // 被调用——第二位置源必须由看门狗主动驱动，否则只剩外推/卡死。
-            maybeRecoverPositionFromMediaSession()
-            maybeMarkPausedWhenStaleExtrapolating()
-            maybeResubscribeOnPositionSilence()
-            maybeResubscribeOnSongFeed()
+            // 单次迭代异常不得让整个看门狗循环静默退出（否则断联后永远无人重建）。
+            runCatching {
+                refreshSessionPlaying()
+                // 2.10:先结算上一次重建的成败(失败计数/升级告警),再决定是否发起新的重建。
+                verifyPendingResubscribe()
+                // 回调链彻底停发时（onPositionChanged 不再来），advanceExtrapolation 永远不会
+                // 被调用——第二位置源必须由看门狗主动驱动，否则只剩外推/卡死。
+                maybeRecoverPositionFromMediaSession()
+                maybeMarkPausedWhenStaleExtrapolating()
+                // 兜底推进:回调链静默/位置被过滤吞掉时,不让歌词行停在半句上。
+                maybeAdvanceStalledPosition()
+                maybeResubscribeOnPositionSilence()
+                maybeResubscribeOnSongFeed()
+                logWatchdogHeartbeatIfDue()
+            }.onFailure {
+                AppLog.w("LyriconLyricProducer", "position watchdog iteration failed", it)
+            }
         }
+    }
+
+    /** 看门狗心跳（1 分钟一次）：下一份日志可直接判断看门狗是否还活着、链路状态如何。 */
+    private fun logWatchdogHeartbeatIfDue() {
+        val now = clock()
+        if (now - lastWatchdogHeartbeatAtMs < WATCHDOG_HEARTBEAT_MS) return
+        lastWatchdogHeartbeatAtMs = now
+        val callbackAgo = if (lastPositionCallbackElapsedMs < 0L) {
+            -1L
+        } else {
+            (now - lastPositionCallbackElapsedMs) / 1000
+        }
+        val realAgo = if (lastRealPositionClockMs < 0L) {
+            -1L
+        } else {
+            (now - lastRealPositionClockMs) / 1000
+        }
+        AppLog.i(
+            "LyriconLyricProducer",
+            "watchdog alive: playing=$isPlayingState anchored=$positionAnchored " +
+                "pos=$currentPositionMs extrapolating=$extrapolating " +
+                "callbackAgo=${callbackAgo}s realAgo=${realAgo}s"
+        )
+    }
+
+    /**
+     * 切歌后长时间锚不住时的第二位置源（2026-11-07 真机：切到下一首歌词卡死，
+     * 暂停后重新播放才恢复）。
+     *
+     * 写端在新歌开始后仍可能整段回传旧歌时间线的值，合理性门控会持续拒绝；
+     * 回调本身一直没停，所以「回调静默 15s 才兜底」的
+     * [maybeRecoverPositionFromMediaSession] 永远不触发——时间线锚不住（未锚定不外推），
+     * 歌词就停住。这里在切歌后超过 [UNANCHORED_RECOVERY_MS] 仍锚不住时，直接拿
+     * 播放器 MediaSession 的位置锚定。要求当前曲目名下确有在播会话，避免把旧歌/
+     * 别的会话的位置锚到新歌上。
+     */
+    internal fun maybeAnchorUnanchoredPosition(now: Long): Boolean {
+        if (positionAnchored) return false
+        if (lastRealPositionClockMs < 0L) return false
+        if (now - lastRealPositionClockMs < UNANCHORED_RECOVERY_MS) return false
+        if (now - lastUnanchoredAnchorAttemptMs < UNANCHORED_ANCHOR_RETRY_MS) return false
+        lastUnanchoredAnchorAttemptMs = now
+        val title = currentSong?.name
+        // 管理器不可用（单测/无通知权限）时不做标题校验；可用时只认同名在播会话。
+        if (mediaSessionManager != null && !title.isNullOrBlank() &&
+            !anySessionActiveFor(title)
+        ) {
+            return false
+        }
+        val recovered = probeMediaSessionPosition(now) ?: return false
+        lastRealPositionMs = recovered
+        lastRealPositionClockMs = now
+        lastRealPositionUpdateMs = now
+        currentPositionMs = recovered
+        extrapolating = false
+        positionUnknown = false
+        positionAnchored = true
+        heldAtSongEndStale = false
+        songEndCleared = false
+        staleFlushPendingValueMs = Long.MIN_VALUE
+        AppLog.i(
+            "LyriconLyricProducer",
+            "position anchored via MediaSession after song change: pos=${recovered}ms"
+        )
+        return true
     }
 
     /**
@@ -763,10 +918,12 @@ class LyriconLyricProducer(
         currentPositionMs = recovered
         extrapolating = false
         positionUnknown = false
+        // MediaSession 的权威位置已拿到:本歌时间线锚定,允许后续外推。
+        positionAnchored = true
         heldAtSongEndStale = false
         songEndCleared = false
         staleFlushPendingValueMs = Long.MIN_VALUE
-        recomputeAndEmit()
+        recomputeAndEmit(force = true)
         AppLog.i(
             "LyriconLyricProducer",
             "position recovered via MediaSession (watchdog): pos=${recovered}ms"
@@ -795,7 +952,34 @@ class LyriconLyricProducer(
             "MediaSession not playing while position stale; marking paused " +
                 "(pos=${currentPositionMs}ms staleForMs=${now - lastRealPositionClockMs})"
         )
-        recomputeAndEmit()
+        recomputeAndEmit(force = true)
+    }
+
+    /**
+     * 播放中位置停更的兜底推进（安全网）：不依赖 onPositionChanged 是否还在来。
+     *
+     * 回调链静默、回调被残留/冲刷判定吞掉、或写端冻结时，唯一会推进位置的
+     * [advanceExtrapolation] 只在回调到达时执行；一旦回调本身停了，歌词行就会停在
+     * 半句上（真机「播放一半卡住」）。看门狗每 5s 检查：在播 + 已锚定 + 最后真实位置
+     * 已过期时，主动按挂钟推进并重发行。advanceExtrapolation 每次都从
+     * lastReal + sinceReal 重算，幂等，与回调路径重复执行不会多推。
+     */
+    private fun maybeAdvanceStalledPosition() {
+        val now = clock()
+        if (!shouldAdvanceStalledPosition(
+                playing = isPlayingState,
+                anchored = positionAnchored,
+                lastRealClockMs = lastRealPositionClockMs,
+                now = now
+            )
+        ) return
+        advanceExtrapolation(now, "watchdog stalled position")
+        recomputeAndEmit(force = true)
+        AppLog.w(
+            "LyriconLyricProducer",
+            "watchdog advanced stalled position to ${currentPositionMs}ms " +
+                "(stale=${(now - lastRealPositionClockMs) / 1000}s)"
+        )
     }
 
     /**
@@ -845,19 +1029,37 @@ class LyriconLyricProducer(
         if (last < 0L) return // never saw a position callback: nothing to compare yet
         val now = clock()
         val silenceMs = now - last
+        val playing = watchdogPlaying(isPlayingState, sessionPlayingObserved)
+        val cooldown = resubscribeCooldownMs(consecutiveResubscribeFailures)
+        val sinceLastAttempt = now - lastForcedResubscribeElapsedMs
+        val blindSpot = shouldForceResubscribePositionBlindSpot(
+            playing = playing,
+            playingStateUnknown = sessionPlayingObserved == null,
+            hasSong = currentSong != null,
+            silenceMs = silenceMs,
+            sinceLastAttemptMs = sinceLastAttempt,
+            cooldownMs = cooldown
+        )
         if (!shouldForceResubscribePositionFeed(
                 silenceMs = silenceMs,
-                playing = watchdogPlaying(isPlayingState, sessionPlayingObserved),
-                sinceLastAttemptMs = now - lastForcedResubscribeElapsedMs,
+                playing = playing,
+                sinceLastAttemptMs = sinceLastAttempt,
                 // 2.10:连续无效重建后退避(见 resubscribeCooldownMs)。
-                cooldownMs = resubscribeCooldownMs(consecutiveResubscribeFailures)
-            )
+                cooldownMs = cooldown
+            ) && !blindSpot
         ) {
             return
         }
         // Re-anchor the heartbeat so the same silence doesn't re-trigger before the next poll.
         lastPositionCallbackElapsedMs = now
-        forceResubscribeActivePlayer("position feed silent for ${silenceMs}ms while playing")
+        forceResubscribeActivePlayer(
+            if (blindSpot) {
+                "position feed silent for ${silenceMs}ms with playback state unknown; " +
+                    "blind-spot rebuild"
+            } else {
+                "position feed silent for ${silenceMs}ms while playing"
+            }
+        )
     }
 
     /**
@@ -1083,6 +1285,12 @@ class LyriconLyricProducer(
 
         /** Poll interval for the position-silence watchdog. */
         private const val POSITION_WATCHDOG_POLL_MS = 5_000L
+        /** 看门狗心跳日志周期。 */
+        private const val WATCHDOG_HEARTBEAT_MS = 60_000L
+        /** 切歌后超过该时长仍锚不住 → 用 MediaSession 位置锚定。 */
+        internal const val UNANCHORED_RECOVERY_MS = 3_000L
+        /** 上述锚定尝试的节流（60Hz 回调里不做 Binder 查询）。 */
+        private const val UNANCHORED_ANCHOR_RETRY_MS = 1_000L
 
         /**
          * issue #27: poll interval for the MediaSession stop detector. Multiple matched samples
@@ -1100,6 +1308,14 @@ class LyriconLyricProducer(
          * stalled value at ~60 Hz). See [shouldForceResubscribePositionFeed].
          */
         internal const val POSITION_SILENCE_RESUBSCRIBE_MS = 20_000L
+
+        /**
+         * 播放态不可确认时的盲区兜底阈值（0.3.120 老病根）：回调链死后 isPlayingState
+         * 冻结 false、MediaSession 也读不到（sessionPlayingObserved=null），此时「有歌 +
+         * 回调全静默」却因 playing=false 永不重建订阅 —— 歌词从此断到进程重启。
+         * 用更长阈值（60s）兜底，配合既有冷却防抖。
+         */
+        internal const val POSITION_SILENCE_BLIND_RESUBSCRIBE_MS = 60_000L
 
         /** Minimum gap between two forced resubscribes, so a persistent failure doesn't hammer IPC. */
         internal const val RESUBSCRIBE_COOLDOWN_MS = 30_000L
@@ -1238,3 +1454,20 @@ internal fun resolveSessionPlayingObserved(
     hasSong -> sameTitlePlaying // 会话查不到：只认同名在播会话
     else -> null // 无歌、无信息：保持未知，不误触发
 }
+
+/**
+ * 看门狗是否应主动推进停更的位置：在播、时间线已锚定、且最后真实位置已过期
+ * [WATCHDOG_STALLED_POSITION_MS]。暂停（playing=false）时位置本就该冻结；
+ * 切歌后尚未锚定时也必须等真实位置（见 positionAnchored）。
+ */
+internal fun shouldAdvanceStalledPosition(
+    playing: Boolean,
+    anchored: Boolean,
+    lastRealClockMs: Long,
+    now: Long,
+    minStaleMs: Long = WATCHDOG_STALLED_POSITION_MS
+): Boolean = playing && anchored && lastRealClockMs >= 0L &&
+    now - lastRealClockMs >= minStaleMs
+
+/** 看门狗兜底推进的停更阈值：正常回调每 ~17ms 一次，2s 不动即视为停更。 */
+internal const val WATCHDOG_STALLED_POSITION_MS = 2_000L

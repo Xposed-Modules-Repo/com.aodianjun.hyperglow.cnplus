@@ -926,17 +926,166 @@ class LyriconLyricProducerTest {
         assertEquals(6_000L + 100_000L, state.positionMs)
 
         // Real position eventually resumes (screen-on) → extrapolation stops, real value wins.
-        // 陈旧冲刷判定：沉默 ≥3s 后的首个落后值先观察一拍（保持外推显示），
-        // 下一拍按正常节奏小幅前进即确认为真 seek/回跳并采纳（仅延迟一拍）。
+        // 陈旧冲刷判定：沉默 ≥3s 后的首个落后值先观察一拍（不采纳该值），但观察拍本身
+        // 仍按挂钟推进展示位置——不得把位置钉在上一拍（2026-11-05 真机：写端冻结 30s
+        // 期间 AOD 停在 118747ms，sampledAt 每秒刷新却永不前进）。
         clockValue = 10_000L + 100_500L
         producer.playerListener.onPositionChanged(3_000L) // line 1 [3500,5000]? no → 3000 is line 0 end/line1 gap
         state = producer.state.value!!
-        assertEquals(106_000L, state.positionMs) // 观察拍：保持上一外推显示，不倒回也不推进
+        assertEquals(106_500L, state.positionMs) // 观察拍：继续按挂钟推进，但不采纳 3_000
 
         clockValue = 10_000L + 100_517L
         producer.playerListener.onPositionChanged(3_017L) // 正常 60Hz 节奏 → 真 seek，采纳
         state = producer.state.value!!
         assertEquals(3_017L, state.positionMs)
+    }
+
+    @Test
+    fun staleFlushRepeatedWhileWriterFrozen_keepsExtrapolatingInsteadOfFreezing() {
+        // 2026-11-05 真机（18:27:21–18:27:50）：写端熄屏冻结后按 60Hz 反复回传同一个
+        // 落后 40s+ 的陈旧值。冲刷判定先 ARM 再持续 REJECT；若这两条分支只重发状态、
+        // 不推进外推，展示位置会被永久钉死（AOD 卡在同一句的一个字上），而每次状态
+        // 的 sampledAt 都被刷新成当前时刻，渲染侧的 projectedPosition() 也救不回来。
+        var clockValue = 10_000L
+        val producer = LyriconLyricProducer { clockValue }
+
+        producer.playerListener.onSongChanged(threeLineSong().copy(duration = 180_000L))
+        producer.playerListener.onPlaybackStateChanged(true)
+        producer.playerListener.onPositionChanged(60_000L) // real base
+
+        clockValue = 20_000L
+        producer.playerListener.onPositionChanged(60_000L) // stall → display 70_000
+        assertEquals(70_000L, producer.state.value!!.positionMs)
+
+        clockValue = 20_500L
+        producer.playerListener.onPositionChanged(20_000L) // stale first sample → ARM
+        assertEquals(70_500L, producer.state.value!!.positionMs)
+
+        clockValue = 21_000L
+        producer.playerListener.onPositionChanged(20_000L) // repeat → REJECT
+        assertEquals(71_000L, producer.state.value!!.positionMs)
+
+        clockValue = 23_000L
+        producer.playerListener.onPositionChanged(20_000L) // still stale → must keep moving
+        assertEquals(73_000L, producer.state.value!!.positionMs)
+    }
+
+    @Test
+    fun songChange_holdsPositionUntilFirstPlausibleRealPosition() {
+        // 2026-11-06 真机：切新歌时时间线归零，但写端可能还在回传旧歌残值、或新歌尚未
+        // 真正起播；此时位置回调持续重复同一个值。旧逻辑把「位置重复」当写端冻结去外推，
+        // 歌词在开唱前就从 0 自己往前走，真实位置回来后整段回跳。
+        var clockValue = 10_000L
+        val producer = LyriconLyricProducer { clockValue }
+
+        // 旧歌已播到 20s。
+        producer.playerListener.onSongChanged(threeLineSong().copy(duration = 180_000L))
+        producer.playerListener.onPlaybackStateChanged(true)
+        producer.playerListener.onPositionChanged(20_000L)
+        assertEquals(20_000L, producer.state.value!!.positionMs)
+
+        // 切到新歌：位置归零，未锚定 → speed 也是 0。
+        clockValue = 21_000L
+        producer.playerListener.onSongChanged(
+            threeLineSong().copy(id = "song-2", name = "Next Song", duration = 180_000L)
+        )
+        assertEquals(0L, producer.state.value!!.positionMs)
+        assertEquals(0f, producer.state.value!!.speed)
+
+        // 5 秒内只有旧歌残值重复到达：不得外推（旧实现会走到 5_000）。
+        clockValue = 26_000L
+        producer.playerListener.onPositionChanged(20_000L)
+        val held = producer.state.value!!
+        assertEquals(0L, held.positionMs)
+        assertEquals(0f, held.speed)
+
+        // 新歌真正起播：首个可信位置被采纳并锚定。
+        clockValue = 26_050L
+        producer.playerListener.onPositionChanged(50L)
+        val anchored = producer.state.value!!
+        assertEquals(50L, anchored.positionMs)
+        assertEquals(1f, anchored.speed)
+
+        // 锚定后写端冻结仍按挂钟外推（原有行为不受影响）。
+        clockValue = 27_050L
+        producer.playerListener.onPositionChanged(50L)
+        assertEquals(1_050L, producer.state.value!!.positionMs)
+    }
+
+    @Test
+    fun songChange_unanchoredFallsBackToMediaSessionAfterThreeSeconds() {
+        // 2026-11-07 真机：切到下一首歌词卡死，暂停后重新播放才恢复（重播逼写端写了
+        // 一次新位置）。写端整段回传旧歌时间线，合理性门控一直拒绝；回调本身没停，
+        // 「静默 15s 才兜底」永远不触发。超过 3s 仍锚不住时改用 MediaSession 锚定。
+        var clockValue = 10_000L
+        val producer = LyriconLyricProducer { clockValue }
+        producer.activePlayerPackage = "com.netease.cloudmusic"
+        producer.playerListener.onSongChanged(threeLineSong().copy(duration = 180_000L))
+        producer.playerListener.onPlaybackStateChanged(true)
+        producer.playerListener.onPositionChanged(20_000L) // 旧歌已锚定
+
+        clockValue = 11_000L
+        producer.playerListener.onSongChanged(
+            threeLineSong().copy(id = "song-2", name = "Next Song", duration = 180_000L)
+        )
+        assertEquals(0f, producer.state.value!!.speed)
+
+        // MediaSession 已经是新歌位置。
+        producer.mediaSessionPositionReader = {
+            MediaSessionPosition(
+                positionMs = 3_000L,
+                lastUpdateElapsedMs = clockValue,
+                speed = 1f
+            )
+        }
+
+        // 3s 后写端仍在回传旧歌的 20000（门控拒绝）→ 用 MediaSession 的 3000 锚定。
+        clockValue = 14_100L
+        producer.playerListener.onPositionChanged(20_000L)
+        val state = producer.state.value!!
+        assertTrue(
+            "expected MediaSession anchor, got ${state.positionMs}",
+            state.positionMs >= 3_000L
+        )
+        assertEquals(1f, state.speed)
+
+        // 锚定后写端恢复真实位置：正常采纳。
+        clockValue = 15_100L
+        producer.playerListener.onPositionChanged(3_050L)
+        assertEquals(3_050L, producer.state.value!!.positionMs)
+    }
+
+    @Test
+    fun stalledPositionWatchdog_onlyFiresWhilePlayingAndAnchored() {        // 在播 + 已锚定 + 超过 2s 没有真实位置 → 看门狗兜底推进（防「播放一半卡住」）。
+        assertTrue(
+            shouldAdvanceStalledPosition(
+                playing = true, anchored = true, lastRealClockMs = 1_000L, now = 3_000L
+            )
+        )
+        // 未到阈值不推进。
+        assertFalse(
+            shouldAdvanceStalledPosition(
+                playing = true, anchored = true, lastRealClockMs = 1_000L, now = 2_500L
+            )
+        )
+        // 暂停时位置本就该冻结。
+        assertFalse(
+            shouldAdvanceStalledPosition(
+                playing = false, anchored = true, lastRealClockMs = 1_000L, now = 9_000L
+            )
+        )
+        // 切歌后尚未锚定：必须等真实位置，不能从 0 自己外推。
+        assertFalse(
+            shouldAdvanceStalledPosition(
+                playing = true, anchored = false, lastRealClockMs = 1_000L, now = 9_000L
+            )
+        )
+        // 从未有过真实位置。
+        assertFalse(
+            shouldAdvanceStalledPosition(
+                playing = true, anchored = true, lastRealClockMs = -1L, now = 9_000L
+            )
+        )
     }
 
     @Test
@@ -1340,16 +1489,15 @@ class LyriconLyricProducerTest {
         producer.playerListener.onSongChanged(threeLineSong())
 
         // 即使远超旧的时间窗口(60s)，残留的 6000 仍必须被拒绝：否则会用旧歌位置在新歌词表
-        // 定位出错误行。拒绝后从 0 外推。
+        // 定位出错误行。拒绝期间未锚定，位置保持 0（不起播前外推）。
         clockValue = 10_000L + 60_001L
         producer.playerListener.onPositionChanged(6_000L)
 
         var state = producer.state.value!!
-        // 外推越过歌尾(0+60s ≥ duration 8s)后钳制到歌尾并清空活动行(issue #9);
-        // 残留旧位置 6000 未被接受。
+        // 未锚定 → 保持 0；残留旧位置 6000 未被接受，也不外推/不钳到歌尾。
         assertEquals(-1, state.lineIndex)
         assertEquals("", state.line)
-        assertEquals(8_000L, state.positionMs)
+        assertEquals(0L, state.positionMs)
 
         // 真实新歌位置(不同于残留 6000)到达后，恢复接受。
         clockValue = 10_000L + 61_000L
@@ -1671,11 +1819,11 @@ class LyriconLyricProducerTest {
         clockValue = 10_300L
 
         // The writer (still stuck) delivers 20000 again for the new song: the post-song-change
-        // gate rejects it (implausible for a song that just started), extrapolating from 0 —
-        // not capped to the new song's end, not accepted as a real position.
+        // gate rejects it (implausible for a song that just started). 新歌时间线尚未锚定,
+        // 保持 0 不外推（不在起播前自己往前走），也不按越界值钳到歌尾。
         producer.playerListener.onPositionChanged(20_000L)
         state = producer.state.value!!
-        assertEquals(100L, state.positionMs)
+        assertEquals(0L, state.positionMs)
         assertEquals(-1, state.lineIndex)
     }
 
@@ -1703,25 +1851,27 @@ class LyriconLyricProducerTest {
 
         // Old-timeline residual 16000 arrives 100ms after the change: the plausible bound is
         // 100 × 1.0 + 10000 = 10100 → 16000 is implausible (offset ≈ the old song's timeline).
+        // 未锚定 → 保持 0,不在起播前外推。
         clockValue = 12_200L
         producer.playerListener.onPositionChanged(16_000L)
         var state = producer.state.value!!
-        assertEquals(100L, state.positionMs) // extrapolated from 0
+        assertEquals(0L, state.positionMs)
         assertEquals(-1, state.lineIndex)    // before the first line
 
-        // The residual keeps accumulating at the playback rate → still rejected.
+        // The residual keeps accumulating at the playback rate → still rejected, still held.
         clockValue = 12_600L
         producer.playerListener.onPositionChanged(16_400L)
         state = producer.state.value!!
-        assertEquals(500L, state.positionMs)
+        assertEquals(0L, state.positionMs)
 
         // Frozen residual (repeats 16000) — by now the bound (14900 + 10000 = 24900) has grown
-        // past 16000, but the frozen value must stay rejected: extrapolation keeps advancing.
+        // past 16000, but the frozen value must stay rejected: still held at 0 until a real
+        // position arrives.
         clockValue = 27_000L
         producer.playerListener.onPositionChanged(16_000L)
         state = producer.state.value!!
-        assertEquals(14_900L, state.positionMs)
-        assertEquals(0, state.lineIndex) // gap after line 0 [1000,3000] shows line 0
+        assertEquals(0L, state.positionMs)
+        assertEquals(-1, state.lineIndex) // before the first line
 
         // A plausible real position (≤ elapsed × rate + tolerance) is accepted → gate opens.
         clockValue = 27_100L
@@ -1756,15 +1906,16 @@ class LyriconLyricProducerTest {
         producer.playerListener.onSongChanged(sixtySecondSong()) // gate closes @10_100
 
         // Old-timeline residual flowing at 2x: 40000 → 41000 over 500ms (rate estimate → 2.0).
+        // 门控拒绝期间未锚定,位置保持 0。
         clockValue = 10_200L
         producer.playerListener.onPositionChanged(40_000L)
         var state = producer.state.value!!
-        assertEquals(100L, state.positionMs) // extrapolated from 0
+        assertEquals(0L, state.positionMs)
 
         clockValue = 10_700L
         producer.playerListener.onPositionChanged(41_000L)
         state = producer.state.value!!
-        assertEquals(600L, state.positionMs)
+        assertEquals(0L, state.positionMs)
 
         // 15s after the song change a real 2x position arrives: 2 × 15s = 30000. With the
         // estimated 2.0x rate the bound is 15000 × 2 + 10000 = 40000 ≥ 30000 → accepted.
@@ -1778,10 +1929,10 @@ class LyriconLyricProducerTest {
     }
 
     @Test
-    fun postSongChange_beyondDurationResidual_rejectedAndExtrapolatesFromZero() {
+    fun postSongChange_beyondDurationResidual_rejectedAndHeldAtZero() {
         // issue #11 实报场景(旧歌比新歌长):残留远超新歌时长(487520ms vs 188718ms)且持续
-        // 累加。旧代码把它钳到歌尾清行 → 整首无歌词 + 60Hz capping 刷屏。门控拒绝 →
-        // 从 0 外推(新歌正确推进),真实位置到达后恢复。
+        // 累加。旧代码把它钳到歌尾清行 → 整首无歌词 + 60Hz capping 刷屏。门控拒绝后
+        // 新歌时间线未锚定,保持 0 不外推(不在起播前自己往前走),真实位置到达后恢复。
         var clockValue = 10_000L
         val producer = LyriconLyricProducer { clockValue }
 
@@ -1797,13 +1948,13 @@ class LyriconLyricProducerTest {
         clockValue = 10_200L
         producer.playerListener.onPositionChanged(487_520L)
         var state = producer.state.value!!
-        assertEquals(100L, state.positionMs) // extrapolated from 0, NOT capped to 8000
+        assertEquals(0L, state.positionMs) // held at 0, NOT capped to 8000, NOT extrapolated
         assertEquals(-1, state.lineIndex)
 
         clockValue = 12_100L
         producer.playerListener.onPositionChanged(488_000L)
         state = producer.state.value!!
-        assertEquals(2_000L, state.positionMs) // advancing through the new song
+        assertEquals(0L, state.positionMs) // still unanchored → held
 
         // Real new-song position arrives (screen-on) → accepted, correct line. (1200, not 1500:
         // the previous song's last position was 1500 and would be caught by the exact-match
@@ -2173,6 +2324,50 @@ class LyriconLyricProducerTest {
             resubscribeCooldownMs(9)
         )
         assertEquals(60_000L, LyriconLyricProducer.RESUBSCRIBE_COOLDOWN_MAX_MS)
+    }
+
+    @Test
+    fun positionSilenceBlindSpotForcesResubscribeWhenPlaybackStateUnknown() {
+        // 0.3.120 老病根：播放态不可确认 + 有歌 + 回调全静默 ≥60s + 冷却外 → 兜底重建。
+        assertTrue(
+            shouldForceResubscribePositionBlindSpot(
+                playing = false, playingStateUnknown = true, hasSong = true,
+                silenceMs = 61_000L, sinceLastAttemptMs = 61_000L
+            )
+        )
+        // 播放态已知为暂停 → 静默是预期，不重建。
+        assertFalse(
+            shouldForceResubscribePositionBlindSpot(
+                playing = false, playingStateUnknown = false, hasSong = true,
+                silenceMs = 300_000L, sinceLastAttemptMs = 300_000L
+            )
+        )
+        // 无歌 → 不重建；静默不够长 → 不重建；冷却内 → 不重建。
+        assertFalse(
+            shouldForceResubscribePositionBlindSpot(
+                playing = false, playingStateUnknown = true, hasSong = false,
+                silenceMs = 300_000L, sinceLastAttemptMs = 300_000L
+            )
+        )
+        assertFalse(
+            shouldForceResubscribePositionBlindSpot(
+                playing = false, playingStateUnknown = true, hasSong = true,
+                silenceMs = 59_000L, sinceLastAttemptMs = 300_000L
+            )
+        )
+        assertFalse(
+            shouldForceResubscribePositionBlindSpot(
+                playing = false, playingStateUnknown = true, hasSong = true,
+                silenceMs = 300_000L, sinceLastAttemptMs = 1_000L
+            )
+        )
+        // 在播时走原判定，不靠盲区兜底。
+        assertFalse(
+            shouldForceResubscribePositionBlindSpot(
+                playing = true, playingStateUnknown = true, hasSong = true,
+                silenceMs = 300_000L, sinceLastAttemptMs = 300_000L
+            )
+        )
     }
 
     @Test
@@ -2623,6 +2818,73 @@ class LyriconLyricProducerTest {
                 sinceRealMs = 20_000L, pendingValueMs = 72_000L
             )
         )
+    }
+
+    // --- Song-level timing cache / routine emission coalescing ---
+
+    @Test
+    fun songTimingCachePrecomputesTimedAndWordFlagsWithSortedStarts() {
+        val cache = buildLyriconSongTimingCache(threeLineSong())
+
+        assertTrue(cache.hasTimedLyrics)
+        assertTrue(cache.hasAnyWordTimings)
+        assertEquals(0, cache.firstLineIndexAfter(500L))
+        // Strictly after: position == line 0 begin still returns the next line.
+        assertEquals(1, cache.firstLineIndexAfter(1_000L))
+        assertEquals(1, cache.firstLineIndexAfter(3_000L))
+        assertEquals(2, cache.firstLineIndexAfter(3_500L))
+        assertEquals(-1, cache.firstLineIndexAfter(7_000L))
+    }
+
+    @Test
+    fun routinePositionEmissionsAreCoalescedWithin50ms() {
+        var now = 1_000L
+        val producer = LyriconLyricProducer { now }
+        producer.playerListener.onSongChanged(threeLineSong())
+
+        now = 1_050L
+        producer.playerListener.onPositionChanged(2_000L)
+        val first = producer.state.value!!
+        assertEquals(0, first.lineIndex)
+        assertEquals(2_000L, first.positionMs)
+        val firstSequence = first.sequence
+
+        // Same line, 40 ms later: routine position-only update is held; the renderer
+        // extrapolates from sampledAtElapsedMs + speed until the next emitted sample.
+        now = 1_090L
+        producer.playerListener.onPositionChanged(2_090L)
+        val held = producer.state.value!!
+        assertEquals(firstSequence, held.sequence)
+        assertEquals(2_000L, held.positionMs)
+
+        // 100 ms after the last emission: due; publishes the newer position.
+        now = 1_150L
+        producer.playerListener.onPositionChanged(2_150L)
+        val resumed = producer.state.value!!
+        assertTrue(resumed.sequence > firstSequence)
+        assertEquals(2_150L, resumed.positionMs)
+    }
+
+    @Test
+    fun lineBoundaryBypassesCoalescingWindow() {
+        var now = 1_000L
+        val producer = LyriconLyricProducer { now }
+        producer.playerListener.onSongChanged(threeLineSong())
+
+        now = 1_050L
+        producer.playerListener.onPositionChanged(2_000L)
+        val first = producer.state.value!!
+        assertEquals(0, first.lineIndex)
+        val firstSequence = first.sequence
+
+        // Crossing into line 1 only 50 ms later must still emit immediately: the visual
+        // content changed even though the routine interval has not elapsed.
+        now = 1_100L
+        producer.playerListener.onPositionChanged(3_500L)
+        val next = producer.state.value!!
+        assertTrue(next.sequence > firstSequence)
+        assertEquals(1, next.lineIndex)
+        assertEquals(3_500L, next.positionMs)
     }
 
     private fun markerDuetSong(): Song = Song(

@@ -79,19 +79,33 @@
   // ---------------------------------------------------------------------------
 
   const EFFECT_PROGRAM_VERSION = 1;
-  const MAX_EFFECT_CONSTANTS = 64;
-  const MAX_EFFECT_CODE = 512;
+  const MAX_EFFECT_CONSTANTS = 128;
+  const MAX_EFFECT_CODE = 1024;
   const MAX_EFFECT_LOCALS = 24;
   const MAX_EFFECT_STACK = 64;
   const MAX_EFFECT_STEPS_PER_FRAME = 100000;
   const MAX_EFFECT_DRAW_OPS_PER_FRAME = 4096;
-  const MAX_EFFECT_PROGRAM_ESTIMATED_BYTES = 12 * 1024;
+  const MAX_EFFECT_PROGRAM_ESTIMATED_BYTES = 16 * 1024;
+  const MAX_EFFECT_WORD_OVERRIDES = 256;
+  const MAX_EFFECT_OVERRIDE_OFFSET_EM = 20;
+  const MAX_EFFECT_OVERRIDE_SCALE = 8;
+  const MAX_EFFECT_OVERRIDE_ROTATE = 720;
+
+  // 盒模型输出模式(与 EffectProgram.kt / EffectBoxCollector.kt 逐值对齐)。
+  const EFFECT_OUTPUT_DRAW = 'draw';
+  const EFFECT_OUTPUT_BOXES = 'boxes';
+  const MAX_EFFECT_BOXES = 512;
+  const MAX_EFFECT_PATH_POINTS_PER_BOX = 256;
+  const MAX_EFFECT_TOTAL_PATH_POINTS = 4096;
+  const MAX_EFFECT_BOX_TEXT_CHARS = 512;
+  const MAX_EFFECT_BOX_SAVE_DEPTH = 16;
+  const MAX_EFFECT_SPRITE_ID = 255;
 
   const EFFECT_OPS = new Set([
     'const', 'loadLocal', 'storeLocal', 'pop', 'dup', 'swap',
     'globalField', 'lineField', 'lineCount', 'line', 'lineAtField',
     'canvasField', 'colorField',
-    'wordCount', 'word', 'wordField',
+    'wordCount', 'word', 'wordField', 'wordOverride',
     'add', 'sub', 'mul', 'div', 'mod', 'neg',
     'sin', 'cos', 'abs', 'min', 'max', 'clamp', 'lerp', 'pow', 'sqrt',
     'floor', 'round',
@@ -103,6 +117,7 @@
     'setStrokeWidth', 'setFill', 'setStroke',
     'save', 'restore', 'translate', 'rotate', 'scale', 'clipRect',
     'drawText', 'drawRect', 'drawCircle', 'drawLine', 'drawRoundRect', 'drawOval', 'drawArc',
+    'drawSprite',
     'pathMove', 'pathLine', 'pathQuad', 'pathCubic', 'pathClose', 'drawPath',
     'measureText', 'end'
   ]);
@@ -111,7 +126,7 @@
     'time', 'wall', 'baseline', 'textSize', 'blockWidth', 'blockHeight'
   ]);
   const EFFECT_LINE_FIELDS = new Set([
-    'text', 'start', 'end', 'progress', 'index', 'x', 'width', 'baseline', 'height'
+    'text', 'fullText', 'start', 'end', 'progress', 'index', 'x', 'width', 'baseline', 'height'
   ]);
   const EFFECT_CANVAS_FIELDS = new Set(['width', 'height']);
   const EFFECT_COLOR_FIELDS = new Set(['sung', 'unsung', 'glow', 'accent']);
@@ -135,6 +150,7 @@
     'setStrokeWidth', 'setFill', 'setStroke',
     'save', 'restore', 'translate', 'rotate', 'scale', 'clipRect',
     'drawText', 'drawRect', 'drawCircle', 'drawLine', 'drawRoundRect', 'drawOval', 'drawArc',
+    'drawSprite',
     'pathMove', 'pathLine', 'pathQuad', 'pathCubic', 'pathClose', 'drawPath', 'measureText'
   ]);
 
@@ -559,6 +575,7 @@
     const constants = rawProgram.constants == null ? [] : rawProgram.constants;
     const code = rawProgram.code;
     const maxLocals = rawProgram.maxLocals == null ? 16 : rawProgram.maxLocals;
+    const wordOverrides = rawProgram.wordOverrides == null ? [] : rawProgram.wordOverrides;
 
     if (!Array.isArray(constants)) errors.push('program.constants 必须是数组');
     if (!Array.isArray(code)) errors.push('program.code 必须是数组');
@@ -571,6 +588,54 @@
     }
     if (!Number.isInteger(maxLocals) || maxLocals < 0 || maxLocals > MAX_EFFECT_LOCALS) {
       errors.push('program.maxLocals 必须是 0..' + MAX_EFFECT_LOCALS + ' 的整数');
+    }
+    if (!Array.isArray(wordOverrides)) {
+      errors.push('program.wordOverrides 必须是数组');
+    } else {
+      if (wordOverrides.length > MAX_EFFECT_WORD_OVERRIDES) {
+        errors.push('逐词覆盖超过 ' + MAX_EFFECT_WORD_OVERRIDES + ' 条');
+      }
+      for (let i = 0; i < wordOverrides.length; i++) {
+        const ov = wordOverrides[i];
+        if (!ov || typeof ov !== 'object' || Array.isArray(ov)) {
+          errors.push('逐词覆盖 ' + i + ' 不是对象');
+          continue;
+        }
+        const fields = ['line', 'word', 'dx', 'dy', 'scale', 'rotate', 'alpha'];
+        for (const key of fields) {
+          if (ov[key] != null && !Number.isFinite(ov[key])) {
+            errors.push('逐词覆盖 ' + i + ' 的 ' + key + ' 非有限数值');
+          }
+        }
+        if (Number.isFinite(ov.line) && (!Number.isInteger(ov.line) || ov.line < 0)) {
+          errors.push('逐词覆盖 ' + i + ' 的 line 必须是非负整数');
+        }
+        if (Number.isFinite(ov.word) && (!Number.isInteger(ov.word) || ov.word < 0)) {
+          errors.push('逐词覆盖 ' + i + ' 的 word 必须是非负整数');
+        }
+        if (ov.lineText != null && typeof ov.lineText !== 'string') {
+          errors.push('逐词覆盖 ' + i + ' 的 lineText 必须是字符串');
+        } else if (typeof ov.lineText === 'string') {
+          if (ov.lineText.length > 256) errors.push('逐词覆盖 ' + i + ' 的 lineText 过长');
+          if (ov.lineText.indexOf(' ') >= 0) errors.push('逐词覆盖 ' + i + ' 的 lineText 含非法字符');
+        }
+        if (Number.isFinite(ov.dx) && Math.abs(ov.dx) > MAX_EFFECT_OVERRIDE_OFFSET_EM) {
+          errors.push('逐词覆盖 ' + i + ' 的 dx 越界');
+        }
+        if (Number.isFinite(ov.dy) && Math.abs(ov.dy) > MAX_EFFECT_OVERRIDE_OFFSET_EM) {
+          errors.push('逐词覆盖 ' + i + ' 的 dy 越界');
+        }
+        if (Number.isFinite(ov.scale) &&
+          (ov.scale < 0.05 || ov.scale > MAX_EFFECT_OVERRIDE_SCALE)) {
+          errors.push('逐词覆盖 ' + i + ' 的 scale 越界');
+        }
+        if (Number.isFinite(ov.rotate) && Math.abs(ov.rotate) > MAX_EFFECT_OVERRIDE_ROTATE) {
+          errors.push('逐词覆盖 ' + i + ' 的 rotate 越界');
+        }
+        if (Number.isFinite(ov.alpha) && (ov.alpha < 0 || ov.alpha > 1)) {
+          errors.push('逐词覆盖 ' + i + ' 的 alpha 越界');
+        }
+      }
     }
     if (errors.length) return { ok: false, program: null, errors };
 
@@ -630,30 +695,42 @@
       }
     }
 
-    const estimatedBytes = estimateProgramBytes({ code, constants });
+    const estimatedBytes = estimateProgramBytes({ code, constants }) +
+      wordOverrides.reduce((sum, ov) => sum + 48 + (typeof ov.lineText === 'string' ? ov.lineText.length : 0), 0);
     if (estimatedBytes > MAX_EFFECT_PROGRAM_ESTIMATED_BYTES) {
       errors.push('程序估算字节 ' + estimatedBytes + ' 超过 12 KiB 预算');
     }
 
     if (errors.length) return { ok: false, program: null, errors };
-    return {
-      ok: true,
-      program: {
-        version: EFFECT_PROGRAM_VERSION,
-        constants: constants.map((constant) => ({
-          type: constant.type == null ? 'number' : constant.type,
-          value: constant.value
-        })),
-        code: code.map((instruction) => {
-          const out = { op: instruction.op };
-          if (instruction.arg !== undefined && instruction.arg !== null) out.arg = instruction.arg;
-          if (instruction.text !== undefined && instruction.text !== null) out.text = instruction.text;
-          return out;
-        }),
-        maxLocals
-      },
-      errors
+    const program = {
+      version: EFFECT_PROGRAM_VERSION,
+      constants: constants.map((constant) => ({
+        type: constant.type == null ? 'number' : constant.type,
+        value: constant.value
+      })),
+      code: code.map((instruction) => {
+        const out = { op: instruction.op };
+        if (instruction.arg !== undefined && instruction.arg !== null) out.arg = instruction.arg;
+        if (instruction.text !== undefined && instruction.text !== null) out.text = instruction.text;
+        return out;
+      }),
+      maxLocals
     };
+    if (Array.isArray(wordOverrides) && wordOverrides.length) {
+      program.wordOverrides = wordOverrides.map((ov) => ({
+        line: ov.line == null ? 0 : ov.line,
+        word: ov.word == null ? 0 : ov.word,
+        lineText: typeof ov.lineText === 'string' ? ov.lineText : '',
+        dx: ov.dx == null ? 0 : ov.dx,
+        dy: ov.dy == null ? 0 : ov.dy,
+        scale: ov.scale == null ? 1 : ov.scale,
+        rotate: ov.rotate == null ? 0 : ov.rotate,
+        alpha: ov.alpha == null ? 1 : ov.alpha
+      }));
+    }
+    // outputMode:仅 "boxes" 显式落盘;draw/未知值省略字段(与缺省值一致,旧导出逐字节不变)。
+    if (rawProgram.outputMode === EFFECT_OUTPUT_BOXES) program.outputMode = EFFECT_OUTPUT_BOXES;
+    return { ok: true, program, errors };
   }
 
   // ---------------------------------------------------------------------------
@@ -865,6 +942,7 @@
     const: 1, loadLocal: 1, storeLocal: -1, pop: -1, dup: 1, swap: 0,
     globalField: 1, lineField: 1, lineCount: 1, line: 0, lineAtField: 0,
     canvasField: 1, colorField: 1, wordCount: 1, word: 0, wordField: 0,
+    wordOverride: 2,
     add: -1, sub: -1, mul: -1, div: -1, mod: -1, neg: 0, sin: 0, cos: 0, abs: 0,
     min: -1, max: -1, clamp: -2, lerp: -2, pow: -1, sqrt: 0, floor: 0, round: 0,
     lt: -1, le: -1, gt: -1, ge: -1, eq: -1, ne: -1, and: -1, or: -1, not: 0,
@@ -875,13 +953,14 @@
     setStrokeWidth: -1, setFill: 0, setStroke: 0,
     save: 0, restore: 0, translate: -2, rotate: -1, scale: -2, clipRect: -4,
     drawText: -3, drawRect: -4, drawCircle: -3, drawLine: -4, drawRoundRect: -6,
-    drawOval: -4, drawArc: -6,
+    drawOval: -4, drawArc: -6, drawSprite: -5,
     pathMove: -2, pathLine: -2, pathQuad: -4, pathCubic: -6, pathClose: 0, drawPath: 0,
     measureText: 0, end: 0
   };
 
   const STACK_NEED = {
     storeLocal: 1, pop: 1, dup: 1, swap: 2, line: 1, lineAtField: 1, word: 1, wordField: 1,
+    wordOverride: 3,
     add: 2, sub: 2, mul: 2, div: 2, mod: 2, min: 2, max: 2, pow: 2,
     lt: 2, le: 2, gt: 2, ge: 2, eq: 2, ne: 2, and: 2, or: 2,
     neg: 1, sin: 1, cos: 1, abs: 1, sqrt: 1, floor: 1, round: 1, not: 1, stringLength: 1,
@@ -890,7 +969,7 @@
     setColor: 1, setAlpha: 1, setTextSize: 1, setTextAlign: 1, setGradient: 6, setShadow: 4,
     setStrokeWidth: 1, translate: 2, rotate: 1, scale: 2, clipRect: 4,
     drawText: 3, drawRect: 4, drawCircle: 3, drawLine: 4, drawRoundRect: 6,
-    drawOval: 4, drawArc: 6, pathMove: 2, pathLine: 2, pathQuad: 4, pathCubic: 6,
+    drawOval: 4, drawArc: 6, drawSprite: 5, pathMove: 2, pathLine: 2, pathQuad: 4, pathCubic: 6,
     measureText: 1
   };
 
@@ -1337,6 +1416,18 @@
     }
     const code = program.code;
     const constants = program.constants || [];
+    const wordOverrides = Array.isArray(program.wordOverrides) ? program.wordOverrides : [];
+    const overrideByKey = new Map();
+    const overrideByText = new Map();
+    for (const ov of wordOverrides) {
+      if (!ov || !Number.isFinite(ov.word)) continue;
+      if (Number.isFinite(ov.line)) {
+        overrideByKey.set((ov.line | 0) * 100000 + (ov.word | 0), ov);
+      }
+      if (typeof ov.lineText === 'string' && ov.lineText.length) {
+        overrideByText.set(ov.lineText + ' ' + (ov.word | 0), ov);
+      }
+    }
     const maxLocals = Math.max(0, Math.min(MAX_EFFECT_LOCALS, toInt32Trunc(program.maxLocals == null ? 16 : program.maxLocals)));
     const locals = new Array(maxLocals).fill(null);
     const stack = [];
@@ -1446,6 +1537,7 @@
       if (!line) return field === 'text' ? '' : 0;
       switch (field) {
         case 'text': return line.text == null ? '' : line.text;
+        case 'fullText': return line.fullText == null || line.fullText === '' ? (line.text || '') : line.fullText;
         case 'start': return line.startMs || 0;
         case 'end': return line.endMs || 0;
         case 'progress': return line.progress || 0;
@@ -1598,6 +1690,21 @@
           const ref = pop();
           const word = ref && ref.kind === 'word' && ctx.words ? ctx.words[ref.index] : null;
           push(wordAtField(word, instruction.text));
+          break;
+        }
+        case 'wordOverride': {
+          const wordIndex = popNumber() | 0;
+          const lineIndex = popNumber() | 0;
+          const lineText = pop();
+          const textOv = (typeof lineText === 'string' && lineText.length
+            ? overrideByText.get(lineText + ' ' + wordIndex)
+            : null);
+          const ov = textOv || overrideByKey.get(lineIndex * 100000 + wordIndex);
+          push(ov && Number.isFinite(ov.dx) ? ov.dx : 0);
+          push(ov && Number.isFinite(ov.dy) ? ov.dy : 0);
+          push(ov && Number.isFinite(ov.scale) ? ov.scale : 1);
+          push(ov && Number.isFinite(ov.rotate) ? ov.rotate : 0);
+          push(ov && Number.isFinite(ov.alpha) ? ov.alpha : 1);
           break;
         }
         case 'add': binary((a, b) => a + b); break;
@@ -1804,6 +1911,15 @@
           sink.drawArc(x, y, w, h, start, sweep);
           break;
         }
+        case 'drawSprite': {
+          const h = popNumber();
+          const w = popNumber();
+          const y = popNumber();
+          const x = popNumber();
+          const id = toInt32Trunc(popNumber());
+          sink.drawSprite(id, x, y, w, h);
+          break;
+        }
         case 'pathMove': {
           const y = popNumber();
           const x = popNumber();
@@ -1843,6 +1959,219 @@
       }
     }
     return finish(!failed);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Box output mode (mirrors EffectBox.kt / EffectBoxCollector.kt)
+  // ---------------------------------------------------------------------------
+
+  function identityMatrix() { return [1, 0, 0, 0, 1, 0]; }
+  function translationMatrix(tx, ty) { return [1, 0, tx, 0, 1, ty]; }
+  function rotationMatrix(deg) {
+    const rad = (deg * Math.PI) / 180;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    return [c, -s, 0, s, c, 0];
+  }
+  function scaleMatrix(sx, sy) { return [sx, 0, 0, 0, sy, 0]; }
+  /** 行主序 [m0 m1 m2; m3 m4 m5],a 右乘 b(post-concat,与 Canvas 后乘语义一致)。 */
+  function multiplyMatrix(a, b) {
+    return [
+      a[0] * b[0] + a[1] * b[3],
+      a[0] * b[1] + a[1] * b[4],
+      a[0] * b[2] + a[1] * b[5] + a[2],
+      a[3] * b[0] + a[4] * b[3],
+      a[3] * b[1] + a[4] * b[4],
+      a[3] * b[2] + a[4] * b[5] + a[5]
+    ];
+  }
+
+  /**
+   * 盒收集器 sink:把直绘指令翻译成盒数据(与 Kotlin EffectBoxCollector 逐值对齐)。
+   * 返回对象可直接传给 runProgram——解释器对 sink 泛型;绘制状态快照/矩阵烘焙/预算
+   * (盒数/路径段数/文本长)都在此处执行。failed 为 true 时 result() 返回 null。
+   */
+  function createBoxCollectorSink(measureText, initialColor, initialTextSize) {
+    const boxes = [];
+    const state = {
+      color: initialColor || 0,
+      alpha: 1,
+      textSize: clamp(initialTextSize || 0, 1, 512),
+      align: 0,
+      style: 0,
+      strokeWidth: 1,
+      gradient: null,
+      shadow: null,
+      failed: false
+    };
+    const matrixStack = [identityMatrix()];
+    const path = [];
+    let totalPathPoints = 0;
+    const top = () => matrixStack[matrixStack.length - 1];
+    const paintSnapshot = () => ({
+      color: state.color,
+      alpha: state.alpha,
+      textSize: state.textSize,
+      align: state.align,
+      style: state.style,
+      strokeWidth: state.strokeWidth,
+      gradient: state.gradient,
+      shadow: state.shadow
+    });
+    const transformSnapshot = () => {
+      const m = top();
+      return { m0: m[0], m1: m[1], m2: m[2], m3: m[3], m4: m[4], m5: m[5] };
+    };
+    const canEmit = () => {
+      if (state.failed) return false;
+      if (boxes.length >= MAX_EFFECT_BOXES) {
+        state.failed = true;
+        return false;
+      }
+      return true;
+    };
+    const pushSegment = (segment) => {
+      if (path.length >= MAX_EFFECT_PATH_POINTS_PER_BOX) {
+        state.failed = true;
+        return;
+      }
+      path.push(segment);
+    };
+    return {
+      get failed() { return state.failed; },
+      get boxes() { return boxes; },
+      result() { return state.failed ? null : boxes; },
+      setColor(argb) { state.color = argb | 0; },
+      setAlpha(alpha) { state.alpha = clamp(alpha, 0, 1); },
+      setTextSize(px) { state.textSize = clamp(px, 1, 512); },
+      setTextAlign(align) { state.align = align === 1 || align === 2 ? align : 0; },
+      setGradient(x0, y0, x1, y1, color0, color1) {
+        state.gradient = { x0, y0, x1, y1, color0, color1 };
+      },
+      clearGradient() { state.gradient = null; },
+      setShadow(radius, dx, dy, color) {
+        state.shadow = {
+          set: true,
+          radius: clamp(radius, 0, 256),
+          dx: clamp(dx, -256, 256),
+          dy: clamp(dy, -256, 256),
+          color
+        };
+      },
+      clearShadow() { state.shadow = null; },
+      setStrokeWidth(width) { state.strokeWidth = clamp(width, 0, 128); },
+      setFill() { state.style = 0; },
+      setStroke() { state.style = 1; },
+      save() { if (matrixStack.length < MAX_EFFECT_BOX_SAVE_DEPTH) matrixStack.push(top().slice()); },
+      restore() { if (matrixStack.length > 1) matrixStack.pop(); },
+      translate(x, y) {
+        matrixStack[matrixStack.length - 1] = multiplyMatrix(
+          top(),
+          translationMatrix(clamp(x, -10000, 10000), clamp(y, -10000, 10000))
+        );
+      },
+      rotate(deg) {
+        matrixStack[matrixStack.length - 1] = multiplyMatrix(top(), rotationMatrix(clamp(deg, -7200, 7200)));
+      },
+      scale(sx, sy) {
+        matrixStack[matrixStack.length - 1] = multiplyMatrix(
+          top(),
+          scaleMatrix(clamp(sx, 0.01, 100), clamp(sy, 0.01, 100))
+        );
+      },
+      clipRect() { /* 盒模式 no-op(与 EffectBoxCollector 一致) */ },
+      drawText(text, x, y) {
+        if (!canEmit()) return;
+        const value = String(text);
+        if (value.length > MAX_EFFECT_BOX_TEXT_CHARS) {
+          state.failed = true;
+          return;
+        }
+        boxes.push({
+          type: 'text', text: value, x, baseline: y,
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawRect(x, y, w, h) {
+        if (!canEmit()) return;
+        boxes.push({
+          type: 'rect', x, y, width: Math.max(0, w), height: Math.max(0, h),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawRoundRect(x, y, w, h, rx, ry) {
+        if (!canEmit()) return;
+        boxes.push({
+          type: 'roundRect', x, y,
+          width: Math.max(0, w), height: Math.max(0, h),
+          rx: Math.max(0, rx), ry: Math.max(0, ry),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawCircle(cx, cy, r) {
+        if (!canEmit()) return;
+        boxes.push({
+          type: 'circle', cx, cy, radius: Math.max(0, r),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawLine(x1, y1, x2, y2) {
+        if (!canEmit()) return;
+        const saved = state.style;
+        state.style = 1; // 线段强制描边(与 Kotlin 收集器一致)
+        boxes.push({
+          type: 'line', x1, y1, x2, y2,
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+        state.style = saved;
+      },
+      drawOval(x, y, w, h) {
+        if (!canEmit()) return;
+        boxes.push({
+          type: 'oval', x, y, width: Math.max(0, w), height: Math.max(0, h),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawArc(x, y, w, h, start, sweep) {
+        if (!canEmit()) return;
+        boxes.push({
+          type: 'arc', x, y,
+          width: Math.max(0, w), height: Math.max(0, h),
+          start, sweep,
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      drawSprite(spriteId, x, y, w, h) {
+        if (!canEmit()) return;
+        if (spriteId < 0 || spriteId > MAX_EFFECT_SPRITE_ID) return;
+        boxes.push({
+          type: 'sprite', spriteId, x, y,
+          width: Math.max(0, w), height: Math.max(0, h),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+      },
+      pathMove(x, y) { pushSegment({ kind: 0, x0: x, y0: y }); },
+      pathLine(x, y) { pushSegment({ kind: 1, x0: x, y0: y }); },
+      pathQuad(cx, cy, x, y) { pushSegment({ kind: 2, x0: cx, y0: cy, x1: x, y1: y }); },
+      pathCubic(c1x, c1y, c2x, c2y, x, y) {
+        pushSegment({ kind: 3, x0: c1x, y0: c1y, x1: c2x, y1: c2y, x2: x, y2: y });
+      },
+      pathClose() { pushSegment({ kind: 4 }); },
+      drawPath() {
+        if (!canEmit()) return;
+        totalPathPoints += path.length;
+        if (totalPathPoints > MAX_EFFECT_TOTAL_PATH_POINTS) {
+          state.failed = true;
+          return;
+        }
+        boxes.push({
+          type: 'path', segments: path.slice(),
+          paint: paintSnapshot(), transform: transformSnapshot()
+        });
+        path.length = 0;
+      },
+      measureText(text) { return measureText(String(text), state.textSize, state.align); }
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -2106,6 +2435,15 @@
     assemble,
     disassemble,
     runProgram,
+    createBoxCollectorSink,
+    EFFECT_OUTPUT_DRAW,
+    EFFECT_OUTPUT_BOXES,
+    MAX_EFFECT_BOXES,
+    MAX_EFFECT_PATH_POINTS_PER_BOX,
+    MAX_EFFECT_TOTAL_PATH_POINTS,
+    MAX_EFFECT_BOX_TEXT_CHARS,
+    MAX_EFFECT_BOX_SAVE_DEPTH,
+    MAX_EFFECT_SPRITE_ID,
     tokenizeLine,
     wordWeight,
     parseLrc,

@@ -18,6 +18,7 @@ import com.eza.hyperglow.customization.normalizeMetadataParts
 import com.eza.hyperglow.customization.normalizeMetadataSeparators
 import com.eza.hyperglow.customization.normalizeSecondaryTextSizePercent
 import com.eza.hyperglow.customization.normalizeSongInfoArtistSizePercent
+import com.eza.hyperglow.customization.normalizeSpectrum
 import com.eza.hyperglow.customization.normalizeWordEffectSpec
 import com.eza.hyperglow.aod.normalizePauseLingerMs
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
@@ -33,6 +34,7 @@ internal enum class WidgetRendererId {
     LYRICS,
     METADATA,
     MEDIA_PROGRESS,
+    SPECTRUM,
     ARTWORK_ACCENT,
     STATUS_TEXT,
     SPACER,
@@ -44,6 +46,7 @@ internal object WidgetRendererRegistry {
         "lyrics" -> WidgetRendererId.LYRICS
         "metadata" -> WidgetRendererId.METADATA
         "media_progress" -> WidgetRendererId.MEDIA_PROGRESS
+        "spectrum" -> WidgetRendererId.SPECTRUM
         else -> null
     }
 }
@@ -82,6 +85,9 @@ internal object SystemUiCustomizationValidator {
                 interludeCountdown = rawAod.interludeCountdown,
                 // 无歌词/纯音乐歌词行为:同为歌词呈现项,linkSurfaces 下继承息屏值。
                 noLyricsBehavior = rawAod.noLyricsBehavior,
+                // 纯音乐识别开关/显示文本:同为歌词呈现项,linkSurfaces 下继承息屏值。
+                pureMusicDisplay = rawAod.pureMusicDisplay,
+                pureMusicText = rawAod.pureMusicText,
                 // 尾奏超时行为/延迟:同为歌词呈现项,linkSurfaces 下继承息屏值。
                 tailTimeoutBehavior = rawAod.tailTimeoutBehavior,
                 tailTimeoutDelaySeconds = rawAod.tailTimeoutDelaySeconds
@@ -122,6 +128,7 @@ internal object SystemUiCustomizationValidator {
             if (aod) LyricSurfaceKind.AOD else LyricSurfaceKind.LOCKSCREEN
         )
         val maxWidgets = policy.maxWidgets
+        val spectrum = normalizeSpectrum(profile.spectrum)
         val widgets = profile.widgets.asSequence()
             .filter { WidgetRendererRegistry.renderer(it.type) != null }
             .filter { !aod || it.type != "media_progress" }
@@ -131,6 +138,14 @@ internal object SystemUiCustomizationValidator {
         if (widgets.none { it.type == "lyrics" }) {
             if (widgets.size >= maxWidgets) widgets.removeLast()
             widgets.add(0, WidgetSpec("lyrics"))
+        }
+        if (spectrum.enabled) {
+            if (widgets.none { it.type == "spectrum" }) {
+                if (widgets.size >= maxWidgets) widgets.removeLast()
+                widgets += WidgetSpec("spectrum", optional = true)
+            }
+        } else {
+            widgets.removeAll { it.type == "spectrum" }
         }
         return profile.copy(
             surface = surface,
@@ -144,6 +159,7 @@ internal object SystemUiCustomizationValidator {
             collisionPolicy = profile.collisionPolicy.takeIf { it in COLLISION_POLICIES }
                 ?: "avoid",
             widgets = widgets,
+            spectrum = spectrum,
             transition = profile.transition.copy(
                 id = profile.transition.id.takeIf { it in TRANSITIONS } ?: "continuity",
                 durationMs = profile.transition.durationMs.coerceIn(
@@ -203,6 +219,12 @@ internal object SystemUiCustomizationValidator {
             // validate 改写字段、wire 的 hash 校验拒收整份配置。
             noLyricsBehavior = com.eza.hyperglow.customization.normalizeNoLyricsBehavior(
                 profile.noLyricsBehavior
+            ),
+            // 与 SceneCompiler.compileProfile 同源归一(去首尾空白、截断;空 = 默认文案,
+            // 渲染层回落 PURE_MUSIC_TEXT_DEFAULT)。开关为纯布尔透传。
+            pureMusicDisplay = profile.pureMusicDisplay,
+            pureMusicText = com.eza.hyperglow.customization.normalizePureMusicText(
+                profile.pureMusicText
             ),
             // 与 SceneCompiler.compileProfile 同源归一(非法行为回落 keep、延迟钳 0-30)。
             tailTimeoutBehavior = com.eza.hyperglow.customization.normalizeTailTimeoutBehavior(

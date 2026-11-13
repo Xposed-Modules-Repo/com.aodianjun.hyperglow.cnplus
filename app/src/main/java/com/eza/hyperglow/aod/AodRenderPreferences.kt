@@ -112,7 +112,7 @@ data class AodRenderConfig(
     val aodDebugShowCanvasFrame: Boolean = false,
     /**
      * 渲染刷新率上限档(issue #68 #12):0=跟随现有行为(16ms≈60fps);
-     * 60/90/120=用户可选上限,随配置下发到 SystemUI 侧帧调度。
+     * 30/60/90/120=用户可选上限,随配置下发到 SystemUI 侧帧调度。
      */
     val aodRefreshRateCap: Int = 0,
     /**
@@ -137,7 +137,36 @@ data class AodRenderConfig(
      * [com.eza.hyperglow.producer.LyricOpeningFilter] 的保守语义(作词/作曲不隐藏)
      * 互不冲突——本开关是新增能力,不是在既有开场清理里补一条词表的改动。
      */
-    val hideCreditLines: Boolean = false
+    val hideCreditLines: Boolean = false,
+    /**
+     * 「歌词固定在音乐卡下方」:锁屏音乐卡可见时把歌词卡钉在卡下,通知栈整体下移,
+     * 音乐卡反向补偿保持不动。默认关闭,关闭时保持原有避让布局。
+     */
+    val lockscreenReserveBelowMediaCard: Boolean = false,
+    /**
+     * 开发者选项:强制指定歌词提供器。开启后仲裁器只使用设置里选中的歌词源,不再因为
+     * 另一个源带逐字时间而自动升级,也不会在选中源只是暂停冻结态时让位;选中源断连或
+     * 故障时仍回退(否则屏上无歌词)。默认关闭,保持「自动选更好的源」。
+     */
+    val forceLyricProvider: Boolean = false,
+    /**
+     * 「歌词计算缓存」:插件链对一首歌的处理结果按歌曲身份落盘,回放同曲直接复用,
+     * 不再重跑链(链内可能是逐行 LLM 调用)。默认开启;关闭后每次播放都重跑链,
+     * 行为与无缓存版本一致。见 PluginChainResultCache。
+     */
+    val pluginResultCacheEnabled: Boolean = true,
+    /**
+     * 「插件自动更新」:后台自动从插件发行通道拉取最新插件清单,缺失的插件自动安装、
+     * 已装的旧版本自动升级,无需手动下载 ZIP。默认开启;关闭后只保留手动检查入口。
+     */
+    val pluginAutoUpdateEnabled: Boolean = true,
+    /**
+     * 锁屏歌词卡相对系统媒体卡的位置:
+     * - `clock`：沿用按系统时钟避让的旧布局（默认）；
+     * - `above_media`：歌词卡放在媒体卡上方，媒体卡与通知栈整体上移让位；
+     * - `below_media`：歌词卡放在媒体卡下方，卡片高度变化只推动下面的通知，媒体卡不动。
+     */
+    val lockscreenCardPlacement: String = "clock"
 ) {
     companion object {
         /** 出厂默认配置;备份解码时用于逐字段回退缺失/类型错误的值。 */
@@ -169,6 +198,12 @@ internal fun normalizeAodOverflow(value: String?): String = when (value) {
 
 internal fun normalizeAodMetadataVisible(value: String?): String =
     if (value == "show") "show" else "hide"
+
+/** 锁屏歌词卡相对媒体卡的位置。未知值一律回落到旧布局(clock)。 */
+internal fun normalizeLockscreenCardPlacement(value: String?): String = when (value) {
+    "above_media", "below_media" -> value
+    else -> "clock"
+}
 
 internal fun normalizeAodMetadataAnchor(value: String?): String =
     if (value == "bottom") "bottom" else "top"
@@ -314,9 +349,9 @@ internal fun normalizePauseLingerMs(value: Long): Long = when (value) {
 internal fun normalizeAodClockYOffset(value: Int): Int =
     value.coerceIn(MIN_AOD_CLOCK_Y_OFFSET, MAX_AOD_CLOCK_Y_OFFSET)
 
-/** 渲染刷新率上限档:仅接受 0(跟随现有)/60/90/120,其余回落 0。 */
+/** 渲染刷新率上限档:仅接受 0(跟随现有)/30/60/90/120,其余回落 0。 */
 internal fun normalizeAodRefreshRateCap(value: Int): Int = when (value) {
-    60, 90, 120 -> value
+    30, 60, 90, 120 -> value
     else -> 0
 }
 
@@ -378,6 +413,11 @@ object AodRenderPreferences {
     const val AOD_POWER_SAVER = "aod_power_saver"
     const val FILTER_NON_MUSIC_SOURCES = "filter_non_music_sources"
     const val HIDE_CREDIT_LINES = "hide_credit_lines"
+    const val LOCKSCREEN_RESERVE_BELOW_MEDIA_CARD = "lockscreen_reserve_below_media_card"
+    const val LOCKSCREEN_CARD_PLACEMENT = "lockscreen_card_placement"
+    const val FORCE_LYRIC_PROVIDER = "force_lyric_provider"
+    const val PLUGIN_RESULT_CACHE_ENABLED = "plugin_result_cache_enabled"
+    const val PLUGIN_AUTO_UPDATE_ENABLED = "plugin_auto_update_enabled"
 
     // SharedPreferences throws ClassCastException when an older/imported value has the wrong
     // primitive type. Treat malformed entries as missing so a bad setting cannot crash startup.
@@ -395,6 +435,17 @@ object AodRenderPreferences {
 
     private fun SharedPreferences.safeString(key: String, default: String?): String? =
         runCatching { getString(key, default) }.getOrDefault(default)
+
+    /** 旧版本只有「固定在音乐卡下方」布尔值:有该键、无新键时迁移成 below_media。 */
+    private fun resolveLockscreenCardPlacement(prefs: SharedPreferences): String {
+        val stored = prefs.safeString(LOCKSCREEN_CARD_PLACEMENT, null)
+        if (!stored.isNullOrBlank()) return normalizeLockscreenCardPlacement(stored)
+        return if (prefs.safeBoolean(LOCKSCREEN_RESERVE_BELOW_MEDIA_CARD, false)) {
+            "below_media"
+        } else {
+            "clock"
+        }
+    }
 
     private var preferences: SharedPreferences? = null
     private var cachedConfig: AodRenderConfig? = null
@@ -483,7 +534,12 @@ object AodRenderPreferences {
             normalizeAodRefreshRateCap(prefs.safeInt(AOD_REFRESH_RATE_CAP, 0)),
             prefs.safeBoolean(FILTER_NON_MUSIC_SOURCES, true),
             prefs.safeBoolean(AOD_POWER_SAVER, true),
-            prefs.safeBoolean(HIDE_CREDIT_LINES, false)
+            prefs.safeBoolean(HIDE_CREDIT_LINES, false),
+            prefs.safeBoolean(LOCKSCREEN_RESERVE_BELOW_MEDIA_CARD, false),
+            prefs.safeBoolean(FORCE_LYRIC_PROVIDER, false),
+            prefs.safeBoolean(PLUGIN_RESULT_CACHE_ENABLED, true),
+            prefs.safeBoolean(PLUGIN_AUTO_UPDATE_ENABLED, true),
+            resolveLockscreenCardPlacement(prefs)
         ).also { cachedConfig = it }
     }
 

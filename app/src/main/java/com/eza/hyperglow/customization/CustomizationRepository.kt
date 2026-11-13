@@ -317,6 +317,8 @@ object CustomizationRepository {
         duetConcurrent = duetConcurrent,
         interludeCountdown = interludeCountdown,
         noLyricsBehavior = noLyricsBehavior,
+        pureMusicDisplay = pureMusicDisplay,
+        pureMusicText = pureMusicText,
         tailTimeoutBehavior = tailTimeoutBehavior,
         tailTimeoutDelaySeconds = tailTimeoutDelaySeconds,
         // per-surface 内容项:携带本面已解析值,canonicalize 往返不丢失按面独立性。
@@ -341,6 +343,9 @@ object CustomizationRepository {
         palette = palette,
         backgroundStyle = backgroundStyle,
         cardAlpha = cardAlpha,
-        cardColor = cardColor
+        cardColor = cardColor,
+        // 频谱配置:canonicalize 逐字段重建时必须带上,否则保存/加载/导出会静默丢失,
+        // 设置页开关会表现为“点开又弹回”。
+        spectrum = spectrum
     )
 }

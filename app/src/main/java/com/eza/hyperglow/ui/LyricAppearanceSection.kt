@@ -1,8 +1,12 @@
 package com.eza.hyperglow.ui
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -12,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
@@ -25,10 +30,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,15 +47,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.eza.hyperglow.R
+import com.eza.hyperglow.audio.SpectrumCaptureService
+import com.eza.hyperglow.audio.SpectrumCaptureState
 import com.eza.hyperglow.aod.AodRenderPreferences
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
 import com.eza.hyperglow.customization.CustomFontContract
 import com.eza.hyperglow.customization.CustomFontEntry
@@ -57,12 +71,16 @@ import com.eza.hyperglow.customization.WordEffectSpec
 import com.eza.hyperglow.customization.CustomizationDocument
 import com.eza.hyperglow.customization.CustomizationEditorState
 import com.eza.hyperglow.customization.CustomizationRepository
+import com.eza.hyperglow.customization.DecorSpriteStore
 import com.eza.hyperglow.customization.LyricTimeOffset
 import com.eza.hyperglow.customization.LINE_TRANSITION_MODES
 import com.eza.hyperglow.customization.LINE_TRANSITION_SPEEDS
 import com.eza.hyperglow.customization.NO_LYRICS_BEHAVIORS
 import com.eza.hyperglow.customization.NO_LYRICS_BEHAVIOR_KEEP
 import com.eza.hyperglow.customization.normalizeNoLyricsBehavior
+import com.eza.hyperglow.customization.PURE_MUSIC_TEXT_DEFAULT
+import com.eza.hyperglow.customization.PURE_MUSIC_TEXT_MAX_LENGTH
+import com.eza.hyperglow.customization.normalizePureMusicText
 import com.eza.hyperglow.customization.TAIL_TIMEOUT_BEHAVIORS
 import com.eza.hyperglow.customization.TAIL_TIMEOUT_DELAY_SECONDS_MAX
 import com.eza.hyperglow.customization.TAIL_TIMEOUT_DELAY_SECONDS_MIN
@@ -119,6 +137,7 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.RadioButtonPreference
 import top.yukonga.miuix.kmp.preference.SliderPreference
@@ -168,8 +187,82 @@ internal fun LyricAppearanceSection(
     }
     var activeChoice by remember { mutableStateOf<AodChoice?>(null) }
     var activeColorPicker by remember { mutableStateOf<PaletteColor?>(null) }
+    var showSpectrumColorPicker by remember { mutableStateOf(false) }
     var activePartsEditor by remember { mutableStateOf(false) }
+    // 纯音乐识别显示文本编辑器(per-surface):与歌曲信息内容编辑器同式,WindowDialog + TextField。
+    var activePureMusicTextEditor by remember { mutableStateOf(false) }
     var showResetDialog by remember { mutableStateOf(false) }
+    // 预设包选择器:一键应用整套外观(息屏+锁屏),新装应用不必逐项手调。
+    var showPresetDialog by remember { mutableStateOf(false) }
+    // 音乐频谱可选的系统回放监听：默认不启用，只有用户把数据源切到 capture 并打开开关才采集。
+    var spectrumCapturePending by remember { mutableStateOf(false) }
+    val spectrumProjectionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        spectrumCapturePending = false
+        val data = result.data
+        if (result.resultCode == Activity.RESULT_OK && data != null) {
+            runCatching { SpectrumCaptureService.start(context, result.resultCode, data) }
+                .onFailure {
+                    Toast.makeText(
+                        context,
+                        R.string.spectrum_error_projection_unavailable,
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+        } else {
+            Toast.makeText(context, R.string.spectrum_error_no_grant, Toast.LENGTH_LONG).show()
+        }
+    }
+    fun launchSpectrumProjection() {
+        val manager = context.getSystemService(MediaProjectionManager::class.java)
+        if (manager == null) {
+            spectrumCapturePending = false
+            Toast.makeText(
+                context,
+                R.string.spectrum_error_projection_unavailable,
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            spectrumCapturePending = true
+            spectrumProjectionLauncher.launch(manager.createScreenCaptureIntent())
+        }
+    }
+    val spectrumPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchSpectrumProjection()
+        } else {
+            spectrumCapturePending = false
+            Toast.makeText(context, R.string.spectrum_error_no_grant, Toast.LENGTH_LONG).show()
+        }
+    }
+    fun requestSpectrumRecordAudio() {
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            launchSpectrumProjection()
+        } else {
+            spectrumCapturePending = true
+            spectrumPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    fun stopSpectrumCaptureIfUnused() {
+        val stillUsed = editorState.document.profiles.values.any {
+            it.spectrum.enabled && it.spectrum.source == "capture"
+        }
+        if (!stillUsed) {
+            spectrumCapturePending = false
+            SpectrumCaptureService.stop(context)
+        }
+    }
+    // 进入外观页时清掉可能残留的监听服务：默认数据源是律动，不应在后台继续录音。
+    LaunchedEffect(Unit) {
+        stopSpectrumCaptureIfUnused()
+    }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -336,7 +429,51 @@ internal fun LyricAppearanceSection(
         }
     }
 
+    // 自定义贴纸:导入即落盘(编号 64..255),发布配置时以 fd 通道下发给 SystemUI;
+    // 效果程序里用 drawSprite 引用编号。删除后立即重推,锁屏/AOD 同步消失。
+    var customSprites by remember { mutableStateOf(DecorSpriteStore.list(context)) }
+    val spriteImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: android.net.Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val bytes = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                input.readNBytes(DecorSpriteStore.MAX_SOURCE_BYTES + 1)
+            }
+        }.getOrNull()
+        val imported = bytes
+            ?.takeIf { it.size <= DecorSpriteStore.MAX_SOURCE_BYTES }
+            ?.let { DecorSpriteStore.import(context, it, queryDisplayName(context, uri) ?: "") }
+        customSprites = DecorSpriteStore.list(context)
+        if (imported != null) {
+            publishRuntimeConfiguration(context)
+            Toast.makeText(
+                context,
+                context.getString(R.string.toast_custom_sprite_imported, imported.id),
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            Toast.makeText(
+                context,
+                context.getString(
+                    if (customSprites.size >= DecorSpriteStore.MAX_ENTRIES) {
+                        R.string.toast_custom_sprite_limit
+                    } else {
+                        R.string.toast_custom_sprite_invalid
+                    }
+                ),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     val selectedProfile = editorState.document.profiles[editorState.selectedSurface] ?: SurfaceProfile()
+    // 锁屏歌词卡相对媒体卡的位置:与「位置」锚点同屏编辑,避免出现第二个重复的位置开关。
+    var lockscreenCardPlacement by remember {
+        mutableStateOf(
+            com.eza.hyperglow.aod.AodRenderPreferences.read(context).lockscreenCardPlacement
+        )
+    }
     // per-surface 内容项(歌曲信息内容/分隔符/识别对唱标记):本面未显式设置(null)时继承文档级
     // 默认值(与 SceneCompiler.withDocumentDefaults 同口径)。读取用有效值,写入落到本面,改一面
     // 不再联动另一面。文档级字段仅作旧配置升级的兜底默认值。
@@ -378,18 +515,52 @@ internal fun LyricAppearanceSection(
         item { SmallTitle(text = stringResource(R.string.section_placement)) }
         item {
             SettingsCard {
-                AodChoiceRow(AodChoiceKind.POSITION, selectedProfile.anchor) {
+                val lockscreenSurface =
+                    editorState.selectedSurface == SceneCompiler.SURFACE_LOCKSCREEN
+                val positionValue = when {
+                    !lockscreenSurface -> selectedProfile.anchor
+                    lockscreenCardPlacement == "above_media" -> "above_media_card"
+                    lockscreenCardPlacement == "below_media" -> "below_media_card"
+                    else -> selectedProfile.anchor
+                }
+                AodChoiceRow(AodChoiceKind.POSITION, positionValue) {
                     openChoice(
                         AodChoiceKind.POSITION,
-                        listOf(
-                            "below_stock_clock",
-                            "screen_center",
-                            "screen_top_safe",
-                            "screen_bottom_safe",
-                            "custom_vertical_bias"
-                        ),
-                        selectedProfile.anchor
-                    ) { value -> updateSelected { it.copy(anchor = value) } }
+                        buildList {
+                            add("below_stock_clock")
+                            add("screen_center")
+                            add("screen_top_safe")
+                            add("screen_bottom_safe")
+                            add("custom_vertical_bias")
+                            if (lockscreenSurface) {
+                                add("above_media_card")
+                                add("below_media_card")
+                            }
+                        },
+                        positionValue
+                    ) { value ->
+                        when (value) {
+                            "above_media_card", "below_media_card" -> {
+                                val placement = if (value == "above_media_card") {
+                                    "above_media"
+                                } else {
+                                    "below_media"
+                                }
+                                if (updateLockscreenCardPlacement(context, placement)) {
+                                    lockscreenCardPlacement = placement
+                                    // 媒体相对位置由渲染偏好驱动;锚点回落到时钟下方,
+                                    // 避免两套位置同时生效造成重叠。
+                                    updateSelected { it.copy(anchor = "below_stock_clock") }
+                                }
+                            }
+                            else -> {
+                                if (updateLockscreenCardPlacement(context, "clock")) {
+                                    lockscreenCardPlacement = "clock"
+                                }
+                                updateSelected { it.copy(anchor = value) }
+                            }
+                        }
+                    }
                 }
                 AodChoiceRow(AodChoiceKind.WIDTH, selectedProfile.widthFraction.toString()) {
                     openChoice(
@@ -487,6 +658,26 @@ internal fun LyricAppearanceSection(
                             it.copy(noLyricsBehavior = normalizeNoLyricsBehavior(value))
                         }
                     }
+                }
+                // 纯音乐识别(per-surface 开关):开启后投影层在标记文本命中之外补空行兜底
+                // (Lyricon lines=0 等「整首无行」曲目按纯音乐处理),渲染面在歌词位置改画
+                // 本面配置文本(默认「纯音乐，请欣赏」,可自定义),并接管上面的行为三态;
+                // 关闭时历史行为零变化。息屏与锁屏各自独立。
+                SwitchPreference(
+                    selectedProfile.pureMusicDisplay,
+                    { enabled -> updateSelected { it.copy(pureMusicDisplay = enabled) } },
+                    stringResource(R.string.setting_pure_music_display),
+                    summary = stringResource(R.string.summary_pure_music_display)
+                )
+                if (selectedProfile.pureMusicDisplay) {
+                    // 纯音乐显示文本:摘要展示当前生效值(自定义文本非空取自定义,空回落默认,
+                    // 与渲染层 pureMusicDisplayText 同一口径)。
+                    ArrowPreference(
+                        title = stringResource(R.string.setting_pure_music_text),
+                        summary = normalizePureMusicText(selectedProfile.pureMusicText)
+                            .ifBlank { PURE_MUSIC_TEXT_DEFAULT },
+                        onClick = { activePureMusicTextEditor = true }
+                    )
                 }
                 // 尾奏超时行为(per-surface):最后一句歌词结束后延迟 N 秒,再决定保留最后一行
                 // / 替换为歌曲信息 / 交还系统默认。纯音乐/真无歌词由上一项优先接管。
@@ -1056,6 +1247,203 @@ internal fun LyricAppearanceSection(
                 }
             }
         }
+        item { SmallTitle(text = stringResource(R.string.section_spectrum)) }
+        item {
+            SettingsCard {
+                SwitchPreference(
+                    selectedProfile.spectrum.enabled,
+                    { enabled ->
+                        updateSelected {
+                            it.copy(spectrum = it.spectrum.copy(enabled = enabled))
+                        }
+                        if (!enabled) stopSpectrumCaptureIfUnused()
+                    },
+                    stringResource(R.string.setting_spectrum_enabled),
+                    summary = stringResource(R.string.summary_spectrum_enabled)
+                )
+                if (selectedProfile.spectrum.enabled) {
+                    AodChoiceRow(
+                        AodChoiceKind.SPECTRUM_SOURCE,
+                        selectedProfile.spectrum.source
+                    ) {
+                        openChoice(
+                            AodChoiceKind.SPECTRUM_SOURCE,
+                            listOf("rhythm", "loopback", "capture"),
+                            selectedProfile.spectrum.source
+                        ) { value ->
+                            updateSelected {
+                                it.copy(spectrum = it.spectrum.copy(source = value))
+                            }
+                            if (value != "capture") stopSpectrumCaptureIfUnused()
+                        }
+                    }
+                    AodChoiceRow(
+                        AodChoiceKind.SPECTRUM_STYLE,
+                        selectedProfile.spectrum.style
+                    ) {
+                        openChoice(
+                            AodChoiceKind.SPECTRUM_STYLE,
+                            listOf("bars", "mirror", "line"),
+                            selectedProfile.spectrum.style
+                        ) { value ->
+                            updateSelected {
+                                it.copy(spectrum = it.spectrum.copy(style = value))
+                            }
+                        }
+                    }
+                    AodChoiceRow(
+                        AodChoiceKind.SPECTRUM_COLOR,
+                        selectedProfile.spectrum.color
+                    ) {
+                        openChoice(
+                            AodChoiceKind.SPECTRUM_COLOR,
+                            listOf("accent", "primary", "gradient"),
+                            selectedProfile.spectrum.color
+                        ) { value ->
+                            updateSelected {
+                                it.copy(
+                                    spectrum = it.spectrum.copy(
+                                        color = value,
+                                        // 选预设 = 退出独立颜色，避免自定义色继续覆盖。
+                                        customColor = ""
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    SwitchPreference(
+                        selectedProfile.spectrum.background,
+                        { background ->
+                            updateSelected {
+                                it.copy(spectrum = it.spectrum.copy(background = background))
+                            }
+                        },
+                        stringResource(R.string.setting_spectrum_background),
+                        summary = stringResource(R.string.summary_spectrum_background)
+                    )
+                    SliderPreference(
+                        value = selectedProfile.spectrum.opacity.toFloat(),
+                        onValueChange = { percent ->
+                            updateSelected {
+                                it.copy(
+                                    spectrum = it.spectrum.copy(
+                                        opacity = percent.roundToInt().coerceIn(10, 100)
+                                    )
+                                )
+                            }
+                        },
+                        title = stringResource(R.string.setting_spectrum_opacity),
+                        valueText = "${selectedProfile.spectrum.opacity}%",
+                        valueRange = 10f..100f,
+                        steps = 9
+                    )
+                    if (editorState.selectedSurface == SceneCompiler.SURFACE_AOD) {
+                        SliderPreference(
+                            value = selectedProfile.spectrum.yOffsetPercent.toFloat(),
+                            onValueChange = { percent ->
+                                updateSelected {
+                                    it.copy(
+                                        spectrum = it.spectrum.copy(
+                                            yOffsetPercent = percent.roundToInt().coerceIn(-50, 50)
+                                        )
+                                    )
+                                }
+                            },
+                            title = stringResource(R.string.setting_spectrum_y_offset),
+                            valueText = "${selectedProfile.spectrum.yOffsetPercent}%",
+                            valueRange = -50f..50f,
+                            steps = 20
+                        )
+                    }
+                    if (!selectedProfile.spectrum.background) {
+                        SliderPreference(
+                            value = selectedProfile.spectrum.heightPercent.toFloat(),
+                            onValueChange = { percent ->
+                                updateSelected {
+                                    it.copy(
+                                        spectrum = it.spectrum.copy(
+                                            heightPercent = percent.roundToInt().coerceIn(50, 200)
+                                        )
+                                    )
+                                }
+                            },
+                            title = stringResource(R.string.setting_spectrum_height),
+                            valueText = "${selectedProfile.spectrum.heightPercent}%",
+                            valueRange = 50f..200f,
+                            steps = 15
+                        )
+                    }
+                    SliderPreference(
+                        value = selectedProfile.spectrum.sensitivity.toFloat(),
+                        onValueChange = { percent ->
+                            updateSelected {
+                                it.copy(
+                                    spectrum = it.spectrum.copy(
+                                        sensitivity = percent.roundToInt().coerceIn(50, 200)
+                                    )
+                                )
+                            }
+                        },
+                        title = stringResource(R.string.setting_spectrum_sensitivity),
+                        valueText = "${selectedProfile.spectrum.sensitivity}%",
+                        valueRange = 50f..200f,
+                        steps = 15
+                    )
+                    if (selectedProfile.spectrum.source == "capture") {
+                        SpectrumCaptureSwitch(
+                            pending = spectrumCapturePending,
+                            onToggle = { enabled ->
+                                if (enabled) {
+                                    requestSpectrumRecordAudio()
+                                } else {
+                                    spectrumCapturePending = false
+                                    SpectrumCaptureService.stop(context)
+                                }
+                            }
+                        )
+                    }
+                    if (selectedProfile.spectrum.source == "loopback") {
+                        Text(
+                            text = stringResource(R.string.summary_spectrum_loopback),
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+            }
+        }
+        item { SmallTitle(text = stringResource(R.string.section_custom_sprites)) }
+        item {
+            SettingsCard {
+                ArrowPreference(
+                    title = stringResource(R.string.action_import_custom_sprite),
+                    summary = stringResource(R.string.summary_import_custom_sprite),
+                    onClick = { spriteImportLauncher.launch(arrayOf("image/*")) }
+                )
+                customSprites.forEach { sprite ->
+                    ArrowPreference(
+                        title = sprite.name,
+                        summary = stringResource(R.string.summary_custom_sprite_row, sprite.id),
+                        onClick = {
+                            val deleted = DecorSpriteStore.delete(context, sprite.id)
+                            customSprites = DecorSpriteStore.list(context)
+                            if (deleted) {
+                                publishRuntimeConfiguration(context)
+                                Toast.makeText(
+                                    context,
+                                    context.getString(
+                                        R.string.toast_custom_sprite_deleted,
+                                        sprite.id
+                                    ),
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    )
+                }
+            }
+        }
         item { SmallTitle(text = stringResource(R.string.section_colors)) }
         item {
             SettingsCard {
@@ -1074,6 +1462,19 @@ internal fun LyricAppearanceSection(
                         }
                     )
                 }
+                val spectrumCustom = selectedProfile.spectrum.customColor
+                ArrowPreference(
+                    title = stringResource(R.string.palette_spectrum),
+                    summary = if (spectrumCustom.isBlank()) {
+                        stringResource(R.string.palette_spectrum_follow_preset)
+                    } else {
+                        spectrumCustom
+                    },
+                    startAction = {
+                        ColorSwatch(argb = spectrumEffectiveColorArgb(selectedProfile))
+                    },
+                    onClick = { showSpectrumColorPicker = true }
+                )
             }
         }
         if (editorState.selectedSurface == SceneCompiler.SURFACE_LOCKSCREEN) {
@@ -1145,6 +1546,11 @@ internal fun LyricAppearanceSection(
             ) {
                 Column {
                     ArrowPreference(
+                        title = stringResource(R.string.action_preset_pack),
+                        summary = stringResource(R.string.summary_action_preset_pack),
+                        onClick = { showPresetDialog = true }
+                    )
+                    ArrowPreference(
                         title = stringResource(R.string.action_import_appearance),
                         onClick = { importLauncher.launch(arrayOf("application/json", "text/plain")) }
                     )
@@ -1179,6 +1585,22 @@ internal fun LyricAppearanceSection(
                 activeColorPicker = null
             },
             onDismiss = { activeColorPicker = null }
+        )
+    }
+
+    if (showSpectrumColorPicker) {
+        SpectrumColorPickerDialog(
+            currentArgb = spectrumEffectiveColorArgb(selectedProfile),
+            onPick = { argb ->
+                updateSelected {
+                    it.copy(spectrum = it.spectrum.copy(customColor = argbToColorToken(argb)))
+                }
+            },
+            onReset = {
+                updateSelected { it.copy(spectrum = it.spectrum.copy(customColor = "")) }
+                showSpectrumColorPicker = false
+            },
+            onDismiss = { showSpectrumColorPicker = false }
         )
     }
 
@@ -1325,6 +1747,100 @@ internal fun LyricAppearanceSection(
                         ).show()
                     }
                 )
+            }
+        }
+    }
+
+    // 预设包选择器:整份文档替换(外观整体切换,不做字段合并),走 saveDocument 的
+    // canonicalize 落盘;成功后与导入同路——同步运行时 + 重建编辑器状态。
+    if (showPresetDialog) {
+        WindowDialog(
+            title = stringResource(R.string.action_preset_pack),
+            summary = stringResource(R.string.summary_action_preset_pack),
+            show = true,
+            onDismissRequest = { showPresetDialog = false }
+        ) {
+            Column(
+                Modifier
+                    .heightIn(max = 440.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                CustomizationPresets.ALL.forEach { preset ->
+                    ArrowPreference(
+                        title = stringResource(preset.nameRes),
+                        summary = stringResource(preset.summaryRes),
+                        onClick = {
+                            showPresetDialog = false
+                            val applied = CustomizationPresets.apply(context, preset)
+                            if (applied) {
+                                val document = CustomizationRepository.loadDocument(context)
+                                syncCustomizationRuntime(context, document)
+                                editorState = CustomizationEditorState(
+                                    document,
+                                    editorState.selectedSurface
+                                )
+                            }
+                            CustomizationPresets.toastApplied(context, preset, applied)
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    // 纯音乐显示文本编辑器(per-surface):打开时以本面当前值为初值,应用即写回并归一
+    // (去首尾空白、截断到上限);留空应用 = 使用默认文案(渲染层回落「纯音乐，请欣赏」)。
+    if (activePureMusicTextEditor) {
+        var text by remember(activePureMusicTextEditor) {
+            mutableStateOf(selectedProfile.pureMusicText)
+        }
+        WindowDialog(
+            title = stringResource(R.string.setting_pure_music_text),
+            show = true,
+            onDismissRequest = { activePureMusicTextEditor = false }
+        ) {
+            Column(Modifier.dialogScrollable()) {
+                TextField(
+                    value = text,
+                    onValueChange = { text = it.take(PURE_MUSIC_TEXT_MAX_LENGTH) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = stringResource(R.string.pure_music_text_hint),
+                    useLabelAsPlaceholder = true,
+                    textStyle = TextStyle(
+                        color = MiuixTheme.colorScheme.onSurfaceContainerHighest,
+                        fontSize = 16.sp
+                    ),
+                    cursorBrush = SolidColor(MiuixTheme.colorScheme.primary),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        updateSelected {
+                            it.copy(pureMusicText = normalizePureMusicText(text))
+                        }
+                        activePureMusicTextEditor = false
+                    })
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        text = stringResource(R.string.action_cancel),
+                        onClick = { activePureMusicTextEditor = false }
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    TextButton(
+                        text = stringResource(R.string.action_apply),
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                        onClick = {
+                            updateSelected {
+                                it.copy(pureMusicText = normalizePureMusicText(text))
+                            }
+                            activePureMusicTextEditor = false
+                        }
+                    )
+                }
             }
         }
     }
@@ -1987,6 +2503,69 @@ private fun PaletteColorPickerDialog(
     }
 }
 
+/**
+ * 频谱实际生效颜色：独立颜色优先，否则跟随频谱区选择的配色预设。
+ * 仅用于设置页色块/取色器初值；渲染端同源逻辑在 AodLyricCanvasView。
+ */
+private fun spectrumEffectiveColorArgb(profile: SurfaceProfile): Int {
+    val custom = profile.spectrum.customColor
+    if (custom.isNotBlank()) {
+        runCatching { android.graphics.Color.parseColor(custom) }.getOrNull()?.let { return it }
+    }
+    return when (profile.spectrum.color) {
+        "primary" -> paletteEffectiveArgb(profile.palette, PaletteColor.SUNG_TEXT)
+        else -> paletteEffectiveArgb(profile.palette, PaletteColor.ACCENT)
+    }
+}
+
+/** 频谱独立颜色取色对话框；重置=清空独立颜色，回到配色预设。 */
+@Composable
+private fun SpectrumColorPickerDialog(
+    currentArgb: Int,
+    onPick: (Int) -> Unit,
+    onReset: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    WindowDialog(
+        title = stringResource(R.string.palette_spectrum),
+        summary = stringResource(R.string.dialog_pick_color),
+        show = true,
+        onDismissRequest = onDismiss
+    ) {
+        Column {
+            ColorPicker(
+                color = Color(currentArgb),
+                onColorChanged = { onPick(it.toArgb()) }
+            )
+            ColorSwatchHexInput(
+                argb = currentArgb,
+                onColorChange = onPick,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+            )
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp)
+            ) {
+                TextButton(
+                    text = stringResource(R.string.action_reset_color),
+                    modifier = Modifier.weight(1f),
+                    onClick = onReset
+                )
+                Spacer(Modifier.width(20.dp))
+                TextButton(
+                    text = stringResource(R.string.action_save),
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    onClick = onDismiss
+                )
+            }
+        }
+    }
+}
+
 /** 歌曲信息部分排序按钮(上/下移),与字号步进按钮同风格。 */
 @Composable
 private fun MetadataOrderButton(
@@ -2083,6 +2662,8 @@ private fun choiceDisplayLabel(
         "screen_top_safe" -> R.string.option_top_safe_area
         "screen_bottom_safe" -> R.string.option_bottom_safe_area
         "custom_vertical_bias" -> R.string.option_custom_vertical_position
+        "above_media_card" -> R.string.option_above_media_card
+        "below_media_card" -> R.string.option_below_media_card
         else -> R.string.option_below_clock
     })
     AodChoiceKind.WIDTH ->
@@ -2143,6 +2724,23 @@ private fun choiceDisplayLabel(
     AodChoiceKind.TEXT_BRIGHTNESS -> context.getString(
         if (value == "dimmed") R.string.option_dimmed else R.string.option_default
     )
+    AodChoiceKind.SPECTRUM_STYLE -> context.getString(when (value) {
+        "mirror" -> R.string.option_spectrum_mirror
+        "line" -> R.string.option_spectrum_line
+        else -> R.string.option_spectrum_bars
+    })
+    AodChoiceKind.SPECTRUM_SOURCE -> context.getString(
+        when (value) {
+            "loopback" -> R.string.option_spectrum_source_loopback
+            "capture" -> R.string.option_spectrum_source_capture
+            else -> R.string.option_spectrum_source_rhythm
+        }
+    )
+    AodChoiceKind.SPECTRUM_COLOR -> context.getString(when (value) {
+        "primary" -> R.string.option_spectrum_primary
+        "gradient" -> R.string.option_spectrum_gradient
+        else -> R.string.option_spectrum_accent
+    })
     AodChoiceKind.LINE_PROGRESS -> context.getString(when (value) {
         "None" -> R.string.option_none
         "Top to bottom" -> R.string.option_top_to_bottom
@@ -2268,6 +2866,34 @@ private fun choiceDisplayLabel(
     })
 }
 
+/**
+ * 可选系统回放监听开关。默认数据源是“音乐律动”，不采集音频；只有用户主动切到
+ * “系统回放”并打开此开关时，才请求录音权限 + MediaProjection。
+ */
+@Composable
+private fun SpectrumCaptureSwitch(
+    pending: Boolean,
+    onToggle: (Boolean) -> Unit
+) {
+    val running by SpectrumCaptureState.running.collectAsState()
+    val error by SpectrumCaptureState.error.collectAsState()
+    SwitchPreference(
+        running || pending,
+        onToggle,
+        stringResource(R.string.setting_spectrum_capture),
+        summary = stringResource(R.string.summary_spectrum_capture)
+    )
+    val message = error
+    if (message != null) {
+        Text(
+            text = message,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+        )
+    }
+}
+
 private enum class AodChoiceKind(@param:StringRes val titleRes: Int) {
     POSITION(R.string.choice_position),
     WIDTH(R.string.choice_width),
@@ -2296,7 +2922,10 @@ private enum class AodChoiceKind(@param:StringRes val titleRes: Int) {
     LINE_TRANSITION_SPEED(R.string.choice_line_transition_speed),
     TEXT_BRIGHTNESS(R.string.choice_text_brightness),
     TRANSITION_SPEED(R.string.choice_scene_transition_speed),
-    CARD_COLOR(R.string.choice_card_color)
+    CARD_COLOR(R.string.choice_card_color),
+    SPECTRUM_SOURCE(R.string.choice_spectrum_source),
+    SPECTRUM_STYLE(R.string.choice_spectrum_style),
+    SPECTRUM_COLOR(R.string.choice_spectrum_color)
 }
 
 private data class AodChoice(

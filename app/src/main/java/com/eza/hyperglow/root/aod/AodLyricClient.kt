@@ -16,12 +16,16 @@ import com.eza.hyperglow.aod.AodStateWireCodec
 import com.eza.hyperglow.aod.AodStateWireMessage
 import com.eza.hyperglow.aod.IAodLyricBridge
 import com.eza.hyperglow.aod.IAodLyricCallback
+import com.eza.hyperglow.aod.IAodSpectrumCallback
+import com.eza.hyperglow.aod.SpectrumFrame
+import com.eza.hyperglow.aod.SpectrumWireCodec
 import com.eza.hyperglow.aod.XiaomiCapabilityBundleCodec
 import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.root.capability.XiaomiCapabilityResolver
 import com.eza.hyperglow.root.capability.missingProbeNames
 import com.eza.hyperglow.root.customization.CompiledCustomizationBundleCodec
 import com.eza.hyperglow.root.customization.CompiledCustomizationBundleCodec.WirePayload
+import com.eza.hyperglow.root.customization.SpriteWire
 import com.eza.hyperglow.root.projection.LyricProjectionClient
 
 private const val RETRY_DELAY_BASE_MS = 1_000L
@@ -127,7 +131,8 @@ internal class GenerationBoundLatest<T> {
 internal class AodLyricClient(
     private val onConfiguration: (WirePayload) -> Unit,
     private val onState: (AodStateWireMessage) -> Unit,
-    private val onDisconnected: () -> Unit
+    private val onDisconnected: () -> Unit,
+    private val onSpectrum: (SpectrumFrame) -> Unit = {}
 ) : LyricProjectionClient {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var context: Context? = null
@@ -135,6 +140,8 @@ internal class AodLyricClient(
     private var bridge: IAodLyricBridge? = null
     private var connection: ServiceConnection? = null
     private var callback: IAodLyricCallback? = null
+    private var spectrumCallback: IAodSpectrumCallback? = null
+    private var pendingSpectrum: SpectrumFrame? = null
     private var bound = false
     private var stopped = true
     private var bindingGeneration = 0L
@@ -223,10 +230,22 @@ internal class AodLyricClient(
                     return
                 }
             }
+            // 自定义贴图随配置走 fd 通道:必须在本回调内读满并关闭 fd(Bundle 不得外传);
+            // 哈希/尺寸校验在 [SpriteWire.read] 与注册表内完成,失败只丢贴图不影响配置。
+            val spriteBytes = try {
+                SpriteWire.read(configuration) { reason ->
+                    HookLogger.w(TAG, "Sprite payload rejected reason=$reason")
+                }
+            } catch (error: Exception) {
+                HookLogger.w(TAG, "Sprite payload read failed", error)
+                emptyList()
+            }
+            CustomSpriteRegistry.install(spriteBytes)
             HookLogger.w(
                 TAG,
                 "Configuration queued rev=${ownedPayload.revision} " +
-                    "hash=${ownedPayload.hash.take(8)} gen=$generation"
+                    "hash=${ownedPayload.hash.take(8)} gen=$generation " +
+                    "sprites=${spriteBytes.size}"
             )
             mainHandler.removeCallbacks(deliverConfiguration)
             mainHandler.post(deliverConfiguration)
@@ -288,8 +307,52 @@ internal class AodLyricClient(
             mainHandler.post(deliverState)
         }
     }
+    private val deliverSpectrum = Runnable {
+        val frame = synchronized(this) {
+            if (stopped) {
+                pendingSpectrum = null
+                null
+            } else {
+                pendingSpectrum.also { pendingSpectrum = null }
+            }
+        } ?: return@Runnable
+        try {
+            onSpectrum(frame)
+        } catch (error: Exception) {
+            HookLogger.e(TAG, "Spectrum apply failed", error)
+        }
+    }
 
-    private fun createConnection(generation: Long, registeredCallback: IAodLyricCallback) =
+    private fun createSpectrumCallback(generation: Long) = object : IAodSpectrumCallback.Stub() {
+        override fun onSpectrum(frame: Bundle?) {
+            if (frame == null) return
+            synchronized(this@AodLyricClient) {
+                if (stopped || generation != bindingGeneration) return
+            }
+            val decoded = try {
+                SpectrumWireCodec.fromBundle(frame)
+            } catch (error: Exception) {
+                HookLogger.w(TAG, "Rejected malformed spectrum payload", error)
+                return
+            }
+            if (decoded == null) {
+                HookLogger.w(TAG, "Rejected invalid spectrum payload")
+                return
+            }
+            synchronized(this@AodLyricClient) {
+                if (stopped || generation != bindingGeneration) return
+                pendingSpectrum = decoded
+            }
+            mainHandler.removeCallbacks(deliverSpectrum)
+            mainHandler.post(deliverSpectrum)
+        }
+    }
+
+    private fun createConnection(
+        generation: Long,
+        registeredCallback: IAodLyricCallback,
+        registeredSpectrumCallback: IAodSpectrumCallback
+    ) =
         object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 if (stopped || generation != bindingGeneration || connection !== this) return
@@ -307,6 +370,12 @@ internal class AodLyricClient(
                     HookLogger.i(TAG, "Bridge connected")
                     retryAttempt = 0
                     reportCapabilities()
+                    try {
+                        remote.registerSpectrumCallback(registeredSpectrumCallback)
+                        HookLogger.bootstrap(TAG, "bridge_spectrum_callback_registered")
+                    } catch (error: Exception) {
+                        HookLogger.w(TAG, "Spectrum callback registration failed", error)
+                    }
                 } catch (error: Exception) {
                     HookLogger.bootstrap(TAG, "bridge_callback_registration_failed")
                     HookLogger.w(TAG, "Bridge callback registration failed", error)
@@ -356,8 +425,14 @@ internal class AodLyricClient(
         bindAttemptCount++
         retryAttempt++
         val registeredCallback = createCallback(generation)
-        val serviceConnection = createConnection(generation, registeredCallback)
+        val registeredSpectrumCallback = createSpectrumCallback(generation)
+        val serviceConnection = createConnection(
+            generation,
+            registeredCallback,
+            registeredSpectrumCallback
+        )
         callback = registeredCallback
+        spectrumCallback = registeredSpectrumCallback
         connection = serviceConnection
         bound = try {
             appContext.bindServiceAsUser(
@@ -407,12 +482,15 @@ internal class AodLyricClient(
             mainHandler.removeCallbacks(connectWatchdog)
             mainHandler.removeCallbacks(deliverConfiguration)
             mainHandler.removeCallbacks(deliverState)
+            mainHandler.removeCallbacks(deliverSpectrum)
             synchronized(this) {
                 pendingConfiguration.clear()
                 pendingState.clear()
+                pendingSpectrum = null
             }
             bridge = null
             callback = null
+            spectrumCallback = null
             connection = null
             lastNoBridgeReportElapsedMs = -1L
             if (bound) context?.let {
@@ -443,14 +521,22 @@ internal class AodLyricClient(
         mainHandler.removeCallbacks(retry)
         mainHandler.removeCallbacks(deliverConfiguration)
         mainHandler.removeCallbacks(deliverState)
+        mainHandler.removeCallbacks(deliverSpectrum)
         synchronized(this) {
             pendingConfiguration.clear()
             pendingState.clear()
+            pendingSpectrum = null
         }
         try {
             callback?.let {
                 try {
                     bridge?.unregisterCallback(it)
+                } catch (_: Exception) {
+                }
+            }
+            spectrumCallback?.let {
+                try {
+                    bridge?.unregisterSpectrumCallback(it)
                 } catch (_: Exception) {
                 }
             }
@@ -468,6 +554,7 @@ internal class AodLyricClient(
             } finally {
                 bridge = null
                 callback = null
+                spectrumCallback = null
                 connection = null
                 retryAttempt = 0
                 bindAttemptCount = 0

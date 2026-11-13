@@ -7,6 +7,7 @@ import com.eza.hyperglow.AppLog
 import com.eza.hyperglow.customization.CompiledCustomization
 import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.root.customization.CompiledCustomizationBundleCodec
+import com.eza.hyperglow.root.customization.SpriteWire
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
@@ -181,6 +182,9 @@ data class AodDisplayDuetLine(
 
 object AodStateBridge {
     private val callbacks = RemoteCallbackList<IAodLyricCallback>()
+    private val spectrumCallbacks = RemoteCallbackList<IAodSpectrumCallback>()
+    private var latestSpectrumFrame: SpectrumFrame? = null
+    private var lastSpectrumPublishAtMs = 0L
     private var currentRevision = 0L
     private var latestMessage: AodStateWireMessage = AodStateWireMessage.Hidden(
         revision = 0L,
@@ -193,7 +197,9 @@ object AodStateBridge {
         requireNotNull(AodStateWireCodec.encode(latestMessage))
     )
     private var latestConfiguration: Bundle? = null
+    private var latestSpriteAttachments: List<SpriteWire.Attachment> = emptyList()
     private var lastConfigurationHash = ""
+    private var lastSpriteSignature = ""
     private var lastPublished: AodDisplayState? = null
     private var lastFullPublishAtElapsedMs = Long.MIN_VALUE
 
@@ -219,10 +225,18 @@ object AodStateBridge {
                 (if (cached != null) "replayed" else "absent")
         )
         cached?.let { configuration ->
+            // 补推时重新打开贴图 fd:缓存的 payload bundle 不持有 fd,避免长期占着
+            // 文件描述符;每次投递临时打开、投递后立即关闭(接收侧由 Binder dup)。
+            val replay = Bundle(configuration)
+            val spriteFds = runCatching {
+                SpriteWire.attach(replay, latestSpriteAttachments)
+            }.getOrDefault(emptyList())
             try {
-                callback.onConfiguration(Bundle(configuration))
+                callback.onConfiguration(replay)
             } catch (error: Exception) {
                 AppLog.w(TAG, "Initial configuration delivery failed", error)
+            } finally {
+                spriteFds.forEach { descriptor -> runCatching { descriptor.close() } }
             }
         }
         val replayEnvelope = AodStateWireCodec.encode(latestMessage) ?: return
@@ -240,6 +254,65 @@ object AodStateBridge {
 
     @Synchronized
     fun hasSystemUiCallback(): Boolean = callbacks.registeredCallbackCount > 0
+
+    /** SystemUI 侧注册低速率频谱回调；注册时回放最近一帧（过期则回放静默帧）。 */
+    @Synchronized
+    fun registerSpectrum(callback: IAodSpectrumCallback) {
+        spectrumCallbacks.register(callback)
+        val now = SystemClock.elapsedRealtime()
+        val latest = latestSpectrumFrame
+        val replay = if (latest != null &&
+            now - latest.capturedAtElapsedMs <= SpectrumContract.MAX_FRAME_AGE_MS
+        ) {
+            latest
+        } else {
+            SpectrumFrame.idle(
+                sequence = latest?.sequence ?: 0L,
+                nowElapsedMs = now
+            )
+        }
+        val envelope = SpectrumWireCodec.toBundle(replay) ?: return
+        try {
+            callback.onSpectrum(Bundle(envelope))
+        } catch (error: Exception) {
+            AppLog.w(TAG, "Initial spectrum delivery failed", error)
+        }
+    }
+
+    @Synchronized
+    fun unregisterSpectrum(callback: IAodSpectrumCallback) {
+        spectrumCallbacks.unregister(callback)
+    }
+
+    @Synchronized
+    fun hasSpectrumCallback(): Boolean = spectrumCallbacks.registeredCallbackCount > 0
+
+    /**
+     * 发布一帧频谱。默认按 [SpectrumContract.MIN_PUBLISH_INTERVAL_MS] 节流；
+     * force=true 用于停播/销毁时的静默帧，必须无条件送达。
+     */
+    @Synchronized
+    fun publishSpectrum(frame: SpectrumFrame, force: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastSpectrumPublishAtMs < SpectrumContract.MIN_PUBLISH_INTERVAL_MS) {
+            return
+        }
+        val bundle = SpectrumWireCodec.toBundle(frame) ?: return
+        lastSpectrumPublishAtMs = now
+        latestSpectrumFrame = frame
+        val count = spectrumCallbacks.beginBroadcast()
+        try {
+            for (index in 0 until count) {
+                try {
+                    spectrumCallbacks.getBroadcastItem(index).onSpectrum(Bundle(bundle))
+                } catch (error: Exception) {
+                    AppLog.w(TAG, "Spectrum delivery failed", error)
+                }
+            }
+        } finally {
+            spectrumCallbacks.finishBroadcast()
+        }
+    }
 
     @Synchronized
     fun publish(state: AodDisplayState) {
@@ -280,34 +353,49 @@ object AodStateBridge {
     }
 
     @Synchronized
-    fun publishConfiguration(
+    internal fun publishConfiguration(
         configuration: CompiledCustomization,
         userId: Int,
-        experimentalMode: Boolean = false
+        experimentalMode: Boolean = false,
+        spriteAttachments: List<SpriteWire.Attachment> = emptyList()
     ) {
-        if (configuration.hash == lastConfigurationHash) return
+        val spriteSignature = SpriteWire.signature(spriteAttachments)
+        // 配置哈希不变但贴图集合变了(导入/删除自定义贴图)也必须重推,否则 SystemUI
+        // 侧注册表停留在旧图。
+        if (configuration.hash == lastConfigurationHash && spriteSignature == lastSpriteSignature) {
+            return
+        }
         val animationSummary = configuration.profiles.entries.joinToString(",") { (surface, profile) ->
             "$surface=${profile.animation}"
         }
         val bundle = CompiledCustomizationBundleCodec.toBundle(configuration, userId, experimentalMode)
         lastConfigurationHash = configuration.hash
+        lastSpriteSignature = spriteSignature
         latestConfiguration = bundle
+        latestSpriteAttachments = spriteAttachments.filter { it.isValid }
+        // payload 与贴图分开:缓存只留 payload,投递用的副本临时挂 fd。
+        val delivery = Bundle(bundle)
+        val spriteFds = SpriteWire.attach(delivery, latestSpriteAttachments) { reason ->
+            AppLog.w(TAG, "Sprite attach rejected reason=$reason")
+        }
         val count = callbacks.beginBroadcast()
         AppLog.w(
             TAG,
             "Configuration publish hash=${configuration.hash.take(8)} userId=$userId " +
-                "callbacks=$count anim=[$animationSummary]"
+                "callbacks=$count sprites=${latestSpriteAttachments.size} anim=[$animationSummary]"
         )
         try {
             for (index in 0 until count) {
                 try {
-                    callbacks.getBroadcastItem(index).onConfiguration(Bundle(bundle))
+                    callbacks.getBroadcastItem(index).onConfiguration(delivery)
                 } catch (error: Exception) {
                     AppLog.w(TAG, "Configuration delivery failed", error)
                 }
             }
         } finally {
             callbacks.finishBroadcast()
+            // Binder 在事务发送时已把 fd dup 到接收进程,这里关的是发送侧副本。
+            spriteFds.forEach { descriptor -> runCatching { descriptor.close() } }
         }
     }
 

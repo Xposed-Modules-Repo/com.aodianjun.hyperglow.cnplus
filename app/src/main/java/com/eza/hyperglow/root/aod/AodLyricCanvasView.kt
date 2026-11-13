@@ -17,12 +17,20 @@ import com.eza.hyperglow.BuildConfig
 import com.eza.hyperglow.aod.AOD_ROTATION_MODE_PORTRAIT
 import com.eza.hyperglow.aod.DEFAULT_CANVAS_PADDING_PERCENT
 import com.eza.hyperglow.aod.DEFAULT_FULLSCREEN_SAFE_MARGIN_PERCENT
+import com.eza.hyperglow.aod.SpectrumContract
+import com.eza.hyperglow.aod.SpectrumFrame
+import com.eza.hyperglow.aod.resampleSpectrumBands
 import com.eza.hyperglow.customization.ARTWORK_SHAPE_CIRCLE
+import com.eza.hyperglow.customization.MAX_SPECTRUM_BARS
 import com.eza.hyperglow.customization.METADATA_LAYOUT_SINGLE
 import com.eza.hyperglow.customization.METADATA_LAYOUT_STACKED
+import com.eza.hyperglow.customization.MIN_SPECTRUM_BARS
+import com.eza.hyperglow.customization.spectrumWidgetHeightDp
+import com.eza.hyperglow.effect.EFFECT_OUTPUT_BOXES
 import com.eza.hyperglow.effect.EffectColors
 import com.eza.hyperglow.effect.EffectFrameContext
 import com.eza.hyperglow.effect.EffectLineSample
+import com.eza.hyperglow.effect.EffectTextMeasurer
 import com.eza.hyperglow.effect.EffectVm
 import com.eza.hyperglow.effect.EffectWordSample
 import com.eza.hyperglow.producer.DuetLineWindow
@@ -30,8 +38,11 @@ import com.eza.hyperglow.producer.shouldAdoptDuetLineCandidate
 import com.eza.hyperglow.root.HookLogger
 import com.eza.hyperglow.root.SurfaceEvidence
 import com.eza.hyperglow.root.projection.LyricSurfaceKind
+import com.eza.hyperglow.root.spectrum.SystemUiSpectrumCapture
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /** Bounded Spicy live-card renderer adapted for Xiaomi AOD. */
 internal class AodLyricCanvasView(
@@ -218,6 +229,8 @@ internal class AodLyricCanvasView(
     private var handoffActive = false
     private var suppressNextLineTransition = false
     private var timingEffectEnabled = false
+    /** [wakeContentProfile] 计算的纯行级扫光状态；帧回调据此限到约 24fps。 */
+    private var lineSweepOnlyCached = false
     private var lastDrawAtElapsedMs = 0L
     private var cadenceWindowStartedAt = 0L
     private var cadenceCallbackCount = 0
@@ -225,6 +238,32 @@ internal class AodLyricCanvasView(
     private var cadenceMaxDrawGapMs = 0L
     private var cadenceLastDrawAt = 0L
     private var verticalAlignment = AodCanvasVerticalAlignment.TOP
+
+    // ---- 音乐频谱条：配置来自 AodCanvasContent，帧由 App 进程低频推入 ----
+    private var spectrumSpec = AodCanvasSpectrum()
+    private var playbackActive = false
+    private var spectrumBands = FloatArray(0)
+    private var spectrumActive = false
+    private var spectrumReceivedAt = 0L
+    private var spectrumDisplay = FloatArray(0)
+    private var spectrumPeaks = FloatArray(0)
+    private val loopbackDemandKey = "spectrum-canvas-${System.identityHashCode(this)}"
+    private var loopbackDemandActive = false
+    private val spectrumPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val spectrumPeakPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val spectrumLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val spectrumPath = Path()
+    private val spectrumBarRect = RectF()
+    private var spectrumShader: android.graphics.Shader? = null
+    private var spectrumShaderKey = ""
 
     // ---- AOD 画布随设备旋转(刚性绘制变换)配置 ----
     @Volatile
@@ -656,6 +695,10 @@ internal class AodLyricCanvasView(
             }
         }
         this.content = nextContent
+        spectrumSpec = nextContent.spectrum
+        playbackActive = nextContent.playbackActive
+        ensureSpectrumBuffers()
+        updateLoopbackDemand()
         syncArtworkBitmap()
         // 渲染模式留痕(仅变化时记录):实机实际生效的逐字动画档/是否逐字时间源/发光开关/
         // 行进度效果——「预览有效果实机没有」类反馈靠这条日志即可区分是配置没下发到这侧、
@@ -814,6 +857,97 @@ internal class AodLyricCanvasView(
         listener?.invoke()
     }
 
+    /** 只更新“音乐是否在播”门控；keepalive 不重建画布内容，但暂停必须立刻停律动。 */
+    fun setPlaybackActive(active: Boolean) {
+        if (playbackActive == active) return
+        playbackActive = active
+        updateLoopbackDemand()
+        if (spectrumSpec.enabled) {
+            syncCadence()
+            invalidate()
+        }
+    }
+
+    /**
+     * loopback 源只在“频谱开启 + 正在播放 + 画布可见”时占用一次系统回环；
+     * 两面画布各自登记，SystemUiSpectrumCapture 合并成单会话。
+     */
+    private fun updateLoopbackDemand() {
+        // 息屏 doze 窗口的 onVisibilityAggregated 可能为 false（窗口已由宿主持有），
+        // 不能只靠它；画布已附着且自身可见时就允许采集。否则 AOD 上采集会话永远不启动。
+        val attachedAndVisible = isAttachedToWindow &&
+            (aggregatedVisible || visibility == View.VISIBLE)
+        val want = spectrumSpec.enabled &&
+            spectrumSpec.source == "loopback" &&
+            playbackActive &&
+            attachedAndVisible
+        if (want) {
+            SystemUiSpectrumCapture.setDemand(loopbackDemandKey, true, context) { frame ->
+                setSpectrum(frame)
+            }
+        } else {
+            SystemUiSpectrumCapture.clear(loopbackDemandKey)
+        }
+        if (want != loopbackDemandActive) {
+            loopbackDemandActive = want
+            HookLogger.i(
+                "AodLyricCanvasView",
+                "loopback demand=$want surface=$surfaceKind attached=$isAttachedToWindow " +
+                    "visible=${visibility == View.VISIBLE} aggregated=$aggregatedVisible " +
+                    "playback=$playbackActive source=${spectrumSpec.source}"
+            )
+        }
+    }
+
+    /**
+     * 消费一帧频谱。必须在该 View 的主线程调用（AodLyricClient 已经切主线程）。
+     * 帧只替换目标值，实际柱高在本端按显示帧率插值/衰减。
+     */
+    fun setSpectrum(frame: SpectrumFrame) {
+        spectrumBands = frame.bands.copyOf()
+        spectrumActive = frame.active
+        spectrumReceivedAt = SystemClock.elapsedRealtime()
+        if (spectrumSpec.enabled) {
+            syncCadence()
+            invalidate()
+        }
+    }
+
+    /** 投影断开/隐藏时清空频谱目标，柱体在 1.5s 新鲜窗口内自然衰减到零。 */
+    fun clearSpectrum() {
+        spectrumBands = FloatArray(0)
+        spectrumActive = false
+        spectrumReceivedAt = SystemClock.elapsedRealtime()
+        invalidate()
+    }
+
+    private fun ensureSpectrumBuffers() {
+        val bars = spectrumSpec.barCount.coerceIn(MIN_SPECTRUM_BARS, MAX_SPECTRUM_BARS)
+        if (spectrumDisplay.size != bars) {
+            spectrumDisplay = FloatArray(bars)
+            spectrumPeaks = FloatArray(bars)
+        }
+    }
+
+    /** 频谱带高度：与 placement 测量共用同一 dp 公式，并限制在可用高度内。 */
+    private fun spectrumStripHeight(): Float {
+        if (!spectrumSpec.enabled || spectrumSpec.background) return 0f
+        val available = (oh - padTop - padBottom).toFloat().coerceAtLeast(0f)
+        if (available <= 0f) return 0f
+        val desired = spectrumWidgetHeightDp(spectrumSpec.heightPercent) * density
+        return minOf(desired, available * 0.42f)
+    }
+
+    private fun contentBottomInset(): Int = padBottom + spectrumStripHeight().roundToInt()
+
+    /** 卡片自适应高度测量用：只有独立条带模式才占高度，背景层不占。 */
+    private fun spectrumMeasureHeight(content: AodCanvasContent): Float =
+        if (content.spectrum.enabled && !content.spectrum.background) {
+            spectrumWidgetHeightDp(content.spectrum.heightPercent) * density
+        } else {
+            0f
+        }
+
     fun setVerticalAlignment(alignment: AodCanvasVerticalAlignment) {
         if (verticalAlignment == alignment) return
         verticalAlignment = alignment
@@ -919,28 +1053,33 @@ internal class AodLyricCanvasView(
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         aggregatedVisible = isShown
+        updateLoopbackDemand()
         syncCadence()
     }
 
     override fun onDetachedFromWindow() {
         stop()
+        SystemUiSpectrumCapture.clear(loopbackDemandKey)
         aggregatedVisible = false
         super.onDetachedFromWindow()
     }
 
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
+        updateLoopbackDemand()
         syncCadence()
     }
 
     override fun onVisibilityChanged(changedView: View, visibility: Int) {
         super.onVisibilityChanged(changedView, visibility)
+        updateLoopbackDemand()
         syncCadence()
     }
 
     override fun onVisibilityAggregated(isVisible: Boolean) {
         super.onVisibilityAggregated(isVisible)
         aggregatedVisible = isVisible
+        updateLoopbackDemand()
         syncCadence()
     }
 
@@ -1019,7 +1158,7 @@ internal class AodLyricCanvasView(
     private fun computeLandscapeTextScale(): Float {
         val bounds = verticalBounds(layout) ?: return landscapeTextScale
         val contentHeight = (bounds.bottom - bounds.top).coerceAtLeast(1f)
-        val availableHeight = ((oh - padTop - padBottom).toFloat()).coerceAtLeast(1f)
+        val availableHeight = ((oh - padTop - contentBottomInset()).toFloat()).coerceAtLeast(1f)
         val maxLineWidth = widestContentLineWidth(layout)
         val availableWidth = ((ow - padLeft - padRight).toFloat()).coerceAtLeast(1f)
         val fitScale = minOf(
@@ -1227,6 +1366,8 @@ internal class AodLyricCanvasView(
         lastDrawAtElapsedMs = SystemClock.elapsedRealtime()
         recordDozeDraw()
         syncCadence()
+        // 背景层模式先画频谱，歌词随后覆盖上去；条带模式在文字之后画。
+        if (spectrumSpec.enabled && spectrumSpec.background) drawSpectrum(canvas)
         // 并发行加入淡入:在淡入窗口内主动续帧(暂停态/低节拍下也能完成淡入),结束后归零。
         if (duetJoinStartedAt != 0L) {
             if (SystemClock.elapsedRealtime() - duetJoinStartedAt < DUET_JOIN_FADE_MS) {
@@ -1263,6 +1404,7 @@ internal class AodLyricCanvasView(
                 canvas.restoreToCount(duetGroup)
             }
             drawRows(canvas, layout, content, LineTransitionFrame(alpha = 1f))
+            if (!spectrumSpec.background) drawSpectrum(canvas)
             return
         }
         val timeline = transitionTimeline ?: lineTransitionTimeline(
@@ -1413,6 +1555,7 @@ internal class AodLyricCanvasView(
         if (clock.completed) {
             endLineTransition()
         }
+        if (!spectrumSpec.background) drawSpectrum(canvas)
     }
 
     /**
@@ -1529,6 +1672,368 @@ internal class AodLyricCanvasView(
             }
             canvas.restore()
         }
+    }
+
+    /**
+     * 在歌词块下方预留的条带里画频谱。目标值只在收到帧时更新，柱高逐帧插值：
+     * 起音快、回落慢，静音/停播时自然衰减到零，不需要额外定时器。
+     */
+    private fun drawSpectrumLegacy(canvas: Canvas) {
+        if (!spectrumSpec.enabled) return
+        val bars = spectrumDisplay.size
+        if (bars == 0) return
+        if (spectrumReceivedAt == 0L) return
+        val strip = spectrumStripHeight()
+        if (strip <= 0f) return
+
+        val now = SystemClock.elapsedRealtime()
+        val age = now - spectrumReceivedAt
+        val fresh = age <= SpectrumContract.MAX_FRAME_AGE_MS
+        val target = if (fresh && spectrumActive && spectrumBands.isNotEmpty()) {
+            resampleSpectrumBands(spectrumBands, bars)
+        } else {
+            null
+        }
+        val gain = spectrumSpec.sensitivity / 100f
+        var maxDisplay = 0f
+        for (index in 0 until bars) {
+            val value = ((target?.get(index) ?: 0f) * gain).coerceIn(0f, 1f)
+            val current = spectrumDisplay[index]
+            val next = if (value > current) {
+                current + (value - current) * SPECTRUM_ATTACK
+            } else {
+                current + (value - current) * SPECTRUM_RELEASE
+            }
+            spectrumDisplay[index] = next
+            spectrumPeaks[index] = maxOf(spectrumPeaks[index] - SPECTRUM_PEAK_DECAY, next)
+            if (next > maxDisplay) maxDisplay = next
+        }
+
+        val fadeStart = SpectrumContract.MAX_FRAME_AGE_MS - SPECTRUM_FADE_MS
+        val fade = if (age <= fadeStart) {
+            1f
+        } else {
+            ((SpectrumContract.MAX_FRAME_AGE_MS - age).toFloat() / SPECTRUM_FADE_MS)
+                .coerceIn(0f, 1f)
+        }
+        if (fade <= 0f) return
+        if (maxDisplay < 0.004f && fade < 1f) return
+        val alpha = (255f * fade).roundToInt().coerceIn(0, 255)
+        if (alpha == 0) return
+
+        val left = padLeft.toFloat()
+        val right = (ow - padRight).toFloat()
+        if (right <= left) return
+        val bottom = (oh - padBottom).toFloat() - density
+        val top = bottom - strip
+        val width = right - left
+        val gap = (width * 0.35f / bars).coerceIn(1f * density, 3f * density)
+        val barWidth = ((width - gap * (bars - 1)) / bars).coerceAtLeast(0.8f * density)
+        val totalWidth = barWidth * bars + gap * (bars - 1)
+        val startX = left + (width - totalWidth) / 2f
+
+        val customColor = spectrumSpec.customColor
+            .takeIf { it.isNotBlank() }
+            ?.let(::parseColorOrNull)
+        val startColor = customColor ?: when (spectrumSpec.color) {
+            "primary" -> resolvedPalette.sungText
+            else -> resolvedPalette.accent
+        }
+        val endColor = customColor ?: if (spectrumSpec.color == "gradient") {
+            resolvedPalette.sungText
+        } else {
+            startColor
+        }
+        val shaderKey = "$startColor|$endColor|${bottom.roundToInt()}|${top.roundToInt()}"
+        if (shaderKey != spectrumShaderKey) {
+            spectrumShader = android.graphics.LinearGradient(
+                0f,
+                bottom,
+                0f,
+                top,
+                startColor,
+                endColor,
+                android.graphics.Shader.TileMode.CLAMP
+            )
+            spectrumShaderKey = shaderKey
+        }
+        spectrumPaint.shader = spectrumShader
+        spectrumPaint.alpha = alpha
+        spectrumPeakPaint.shader = spectrumShader
+        spectrumPeakPaint.alpha = (alpha * 0.55f).roundToInt().coerceIn(0, 255)
+
+        when (spectrumSpec.style) {
+            "mirror" -> {
+                val center = (top + bottom) / 2f
+                for (index in 0 until bars) {
+                    val half = (spectrumDisplay[index].coerceIn(0f, 1f) * strip * 0.5f)
+                        .coerceAtLeast(0.8f * density)
+                    val x = startX + index * (barWidth + gap)
+                    spectrumBarRect.set(x, center - half, x + barWidth, center + half)
+                    canvas.drawRoundRect(
+                        spectrumBarRect,
+                        barWidth / 2f,
+                        barWidth / 2f,
+                        spectrumPaint
+                    )
+                }
+            }
+
+            "line" -> {
+                spectrumPath.reset()
+                val step = if (bars <= 1) 0f else width / (bars - 1)
+                for (index in 0 until bars) {
+                    val x = left + index * step
+                    val y = bottom - spectrumDisplay[index].coerceIn(0f, 1f) * strip
+                    if (index == 0) spectrumPath.moveTo(x, y) else spectrumPath.lineTo(x, y)
+                }
+                spectrumLinePaint.shader = spectrumShader
+                spectrumLinePaint.alpha = alpha
+                spectrumLinePaint.strokeWidth = 2f * density
+                canvas.drawPath(spectrumPath, spectrumLinePaint)
+            }
+
+            else -> {
+                for (index in 0 until bars) {
+                    val value = spectrumDisplay[index].coerceIn(0f, 1f)
+                    val height = (value * strip).coerceAtLeast(1.2f * density)
+                    val x = startX + index * (barWidth + gap)
+                    spectrumBarRect.set(x, bottom - height, x + barWidth, bottom)
+                    canvas.drawRoundRect(
+                        spectrumBarRect,
+                        barWidth / 2f,
+                        barWidth / 2f,
+                        spectrumPaint
+                    )
+                    val peak = (spectrumPeaks[index] * strip).coerceIn(0f, strip)
+                    if (peak > 1f) {
+                        canvas.drawRect(
+                            x,
+                            bottom - peak - density,
+                            x + barWidth,
+                            bottom - peak,
+                            spectrumPeakPaint
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 频谱绘制：默认 rhythm 源只认歌词源的 playbackActive，用确定性合成律动；
+     * source=capture 消费 App 的 MediaProjection 帧；source=loopback 消费 SystemUI
+     * 自己的 AudioPolicy 回环帧（采集失败时回退合成律动）。帧过期则衰减。
+     * background=true 画在歌词框内作为透明背景层（在文字之前绘制），false 画在
+     * 歌词下方独立条带。
+     */
+    private fun drawSpectrum(canvas: Canvas) {
+        if (!spectrumSpec.enabled) return
+        val bars = spectrumDisplay.size
+        if (bars == 0) return
+        val background = spectrumSpec.background
+        val strip = if (background) 0f else spectrumStripHeight()
+        if (!background && strip <= 0f) return
+
+        val now = SystemClock.elapsedRealtime()
+        val age = if (spectrumReceivedAt == 0L) Long.MAX_VALUE else now - spectrumReceivedAt
+        val captureSource = spectrumSpec.source == "capture" ||
+            spectrumSpec.source == "loopback"
+        val freshCapture = captureSource &&
+            spectrumActive && spectrumBands.isNotEmpty() &&
+            age <= SpectrumContract.MAX_FRAME_AGE_MS
+        // loopback 一帧都没收到（hook/ROM 不允许）时用律动兜底，避免整块空白。
+        val loopbackFallback = spectrumSpec.source == "loopback" &&
+            playbackActive && spectrumReceivedAt == 0L
+        val target = when {
+            spectrumSpec.source == "rhythm" ->
+                if (playbackActive) syntheticBands(bars) else null
+            freshCapture -> resampleSpectrumBands(spectrumBands, bars)
+            loopbackFallback -> syntheticBands(bars)
+            else -> null
+        }
+        val gain = spectrumSpec.sensitivity / 100f
+        var maxDisplay = 0f
+        for (index in 0 until bars) {
+            val value = ((target?.get(index) ?: 0f) * gain).coerceIn(0f, 1f)
+            val current = spectrumDisplay[index]
+            val next = if (value > current) {
+                current + (value - current) * SPECTRUM_ATTACK
+            } else {
+                current + (value - current) * SPECTRUM_RELEASE
+            }
+            spectrumDisplay[index] = next
+            spectrumPeaks[index] = maxOf(spectrumPeaks[index] - SPECTRUM_PEAK_DECAY, next)
+            if (next > maxDisplay) maxDisplay = next
+        }
+        if (maxDisplay < 0.004f) return
+
+        val fade = when {
+            spectrumSpec.source == "rhythm" -> 1f
+            freshCapture -> 1f
+            loopbackFallback -> 1f
+            age <= SpectrumContract.MAX_FRAME_AGE_MS -> 1f
+            age <= SpectrumContract.MAX_FRAME_AGE_MS + SPECTRUM_FADE_MS.toLong() ->
+                ((SpectrumContract.MAX_FRAME_AGE_MS + SPECTRUM_FADE_MS - age) /
+                    SPECTRUM_FADE_MS).coerceIn(0f, 1f)
+            else -> 0f
+        }
+        if (fade <= 0f) return
+
+        val left = padLeft.toFloat()
+        val right = (ow - padRight).toFloat()
+        if (right <= left) return
+        val baseBottom = (oh - padBottom).toFloat() - if (background) 2f * density else density
+        val baseTop = if (background) {
+            padTop.toFloat() + 2f * density
+        } else {
+            baseBottom - strip
+        }
+        // 背景层的高度本来就是整块歌词框，若再按 area 高度钳制，maxTop 会等于 baseTop，
+        // yOffset 永远被夹回 0。这里保留完整绘制区，改为绘制前整体平移 + 裁剪到歌词框。
+        val areaTop = baseTop
+        val areaBottom = baseBottom
+        val areaHeight = (areaBottom - areaTop).coerceAtLeast(1f)
+        val width = right - left
+        val gap = (width * 0.35f / bars).coerceIn(1f * density, 3f * density)
+        val barWidth = ((width - gap * (bars - 1)) / bars).coerceAtLeast(0.8f * density)
+        val totalWidth = barWidth * bars + gap * (bars - 1)
+        val startX = left + (width - totalWidth) / 2f
+
+        val customColor = spectrumSpec.customColor
+            .takeIf { it.isNotBlank() }
+            ?.let(::parseColorOrNull)
+        val startColor = customColor ?: when (spectrumSpec.color) {
+            "primary" -> resolvedPalette.sungText
+            else -> resolvedPalette.accent
+        }
+        val endColor = customColor ?: if (spectrumSpec.color == "gradient") {
+            resolvedPalette.sungText
+        } else {
+            startColor
+        }
+        val shaderKey = "$startColor|$endColor|${areaBottom.roundToInt()}|${areaTop.roundToInt()}"
+        if (shaderKey != spectrumShaderKey) {
+            spectrumShader = android.graphics.LinearGradient(
+                0f,
+                areaBottom,
+                0f,
+                areaTop,
+                startColor,
+                endColor,
+                android.graphics.Shader.TileMode.CLAMP
+            )
+            spectrumShaderKey = shaderKey
+        }
+        val alpha = (255f * (spectrumSpec.opacity / 100f) * fade).roundToInt().coerceIn(0, 255)
+        if (alpha == 0) return
+        spectrumPaint.shader = spectrumShader
+        spectrumPaint.alpha = alpha
+        spectrumPeakPaint.shader = spectrumShader
+        spectrumPeakPaint.alpha = (alpha * 0.55f).roundToInt().coerceIn(0, 255)
+        val amplitudeFactor = if (background) 0.85f else 1f
+        val frameTop = padTop.toFloat()
+        val frameBottom = (oh - padBottom).toFloat()
+        val frameHeight = (frameBottom - frameTop).coerceAtLeast(1f)
+        val yShift = frameHeight * (spectrumSpec.yOffsetPercent.coerceIn(-50, 50) / 100f)
+        canvas.save()
+        canvas.clipRect(0f, frameTop, ow.toFloat(), frameBottom)
+        canvas.translate(0f, yShift)
+        try {
+        when (spectrumSpec.style) {
+            "mirror" -> {
+                val center = (areaTop + areaBottom) / 2f
+                // 中轴线：mirror 的视觉基准，避免和 bars 看起来一样。
+                spectrumLinePaint.shader = null
+                spectrumLinePaint.color = startColor
+                spectrumLinePaint.alpha = (alpha * 0.35f).roundToInt().coerceIn(0, 255)
+                spectrumLinePaint.strokeWidth = 1f * density
+                canvas.drawLine(left, center, right, center, spectrumLinePaint)
+                for (index in 0 until bars) {
+                    val half = (spectrumDisplay[index].coerceIn(0f, 1f) *
+                        areaHeight * 0.45f).coerceAtLeast(0.8f * density)
+                    val x = startX + index * (barWidth + gap)
+                    spectrumBarRect.set(x, center - half, x + barWidth, center + half)
+                    canvas.drawRoundRect(
+                        spectrumBarRect,
+                        barWidth / 2f,
+                        barWidth / 2f,
+                        spectrumPaint
+                    )
+                }
+            }
+
+            "line" -> {
+                spectrumPath.reset()
+                val step = if (bars <= 1) 0f else width / (bars - 1)
+                for (index in 0 until bars) {
+                    val x = left + index * step
+                    val y = areaBottom - spectrumDisplay[index].coerceIn(0f, 1f) *
+                        areaHeight * amplitudeFactor
+                    if (index == 0) spectrumPath.moveTo(x, y) else spectrumPath.lineTo(x, y)
+                }
+                spectrumLinePaint.shader = spectrumShader
+                spectrumLinePaint.alpha = alpha
+                spectrumLinePaint.strokeWidth = 2f * density
+                canvas.drawPath(spectrumPath, spectrumLinePaint)
+            }
+
+            else -> {
+                for (index in 0 until bars) {
+                    val value = spectrumDisplay[index].coerceIn(0f, 1f)
+                    val height = (value * areaHeight * amplitudeFactor)
+                        .coerceAtLeast(1.2f * density)
+                    val x = startX + index * (barWidth + gap)
+                    spectrumBarRect.set(x, areaBottom - height, x + barWidth, areaBottom)
+                    canvas.drawRoundRect(
+                        spectrumBarRect,
+                        barWidth / 2f,
+                        barWidth / 2f,
+                        spectrumPaint
+                    )
+                    val peak = (spectrumPeaks[index] * areaHeight * amplitudeFactor)
+                        .coerceIn(0f, areaHeight)
+                    if (peak > 1f) {
+                        canvas.drawRect(
+                            x,
+                            areaBottom - peak - density,
+                            x + barWidth,
+                            areaBottom - peak,
+                            spectrumPeakPaint
+                        )
+                    }
+                }
+            }
+        }
+        } finally {
+            canvas.restore()
+        }
+    }
+
+    /**
+     * 纯音乐律动：只用播放态（playbackActive + speed）做门控，不读音频。
+     * 确定性基频 + 约 109 BPM 的脉冲包络，时间轴取单调时钟，暂停即衰减。
+     */
+    private fun syntheticBands(bars: Int): FloatArray {
+        val time = SystemClock.elapsedRealtime() / 1000f
+        val out = FloatArray(bars)
+        val beat = 0.55f
+        val pulse = exp(-((time % beat) / beat) * 5.5f)
+        for (index in 0 until bars) {
+            val phase = index * 0.55f
+            val wave = 0.5f + 0.5f * sin(time * (1.3f + index * 0.04f) + phase)
+            val lowBias = (1f - index.toFloat() / (bars * 1.4f)).coerceIn(0f, 1f)
+            val noise = hashNoise(index, (time * 4f).toInt())
+            out[index] = (0.08f + 0.50f * wave * lowBias + 0.32f * pulse +
+                0.09f * noise).coerceIn(0f, 1f)
+        }
+        return out
+    }
+
+    private fun hashNoise(index: Int, tick: Int): Float {
+        var value = index * 374761393 + tick * 668265263
+        value = (value xor (value shr 13)) * 1274126177
+        return ((value xor (value shr 16)) and 0xFFFF) / 65535f
     }
 
     private fun drawRows(
@@ -2190,7 +2695,7 @@ internal class AodLyricCanvasView(
             // (上游 84a0c9ce 项 #2/#3),歌名行回落整行 Paint。
             val paint = line.paint ?: metadata.row.paint
             paint.color = resolvedPalette.metadataText
-            paint.alpha = (255f * alpha.coerceIn(0f, 1f)).roundToInt()
+            paint.alpha = scaledAlpha(resolvedPalette.metadataText, alpha.coerceIn(0f, 1f))
             canvas.drawText(
                 line.text,
                 line.startX,
@@ -2239,7 +2744,7 @@ internal class AodLyricCanvasView(
                 currentRenderStyle.palette.metadataText,
                 value
             )
-            alpha = 255
+            // color 已含插值后的 alpha，不要再覆盖为不透明。
             shader = null
             clearShadowLayer()
         }
@@ -2299,7 +2804,7 @@ internal class AodLyricCanvasView(
                 metadataGapPx = if (metadataRow != null) METADATA_LYRIC_GAP_DP * density else 0f,
                 padTopPx = paddingTop.toFloat() + effectNeeds.topPx,
                 padBottomPx = paddingBottom.toFloat() + effectNeeds.bottomPx
-            ),
+            ) + spectrumMeasureHeight(content),
             metadataRowHeightPx = metadataRow?.height ?: 0f
         )
         stackMeasureCache = StackMeasureCache(content, widthPx, measure)
@@ -2756,7 +3261,7 @@ internal class AodLyricCanvasView(
                     (!skipOriginal || positioned.row.kind != RowKind.ORIGINAL)
             )
         }
-        return animatedBlockHeightPx(boxes, (oh - padTop - padBottom).toFloat()) / density
+        return animatedBlockHeightPx(boxes, (oh - padTop - contentBottomInset()).toFloat()) / density
     }
 
     private fun rowWithLines(
@@ -2875,11 +3380,20 @@ internal class AodLyricCanvasView(
             val referenceRow = rows.firstOrNull {
                 it.kind == RowKind.ORIGINAL || it.kind == RowKind.DUET_ORIGINAL
             } ?: topRow ?: rows.last()
-            com.eza.hyperglow.customization.wordEffectVerticalOverdrawPx(
+            val dslOverdraw = com.eza.hyperglow.customization.wordEffectVerticalOverdrawPx(
                 spec = spec,
                 textSizePx = referenceRow.paint.textSize,
                 lineHeightPx = referenceRow.lineHeight
             )
+            // 盒模型程序:输出盒可自由摆放/变换,上界无法从 DSL 轨道推出;取保守常量余量
+            // (2em),与 DSL 估算取大者。直绘程序维持现状(整帧裁剪兜底,见 frameClipBounds)。
+            val programOverdraw =
+                if (spec.program?.outputMode == EFFECT_OUTPUT_BOXES) {
+                    BOX_MODE_VERTICAL_OVERDRAW_EM * referenceRow.paint.textSize
+                } else {
+                    0f
+                }
+            maxOf(dslOverdraw, programOverdraw)
         } ?: 0f
         val topOverdraw = maxOf(
             rowEffectOverdrawPx(topRow, mainGlow, mainSink, auxGlow, betterLyrics),
@@ -2949,7 +3463,7 @@ internal class AodLyricCanvasView(
                 anchor,
                 oh.toFloat(),
                 padTop.toFloat(),
-                padBottom.toFloat(),
+                contentBottomInset().toFloat(),
                 metadata.ascentAt(0),
                 metadata.descentAt((metadata.lines.size - 1).coerceAtLeast(0)),
                 METADATA_LYRIC_GAP_DP * density,
@@ -2991,7 +3505,7 @@ internal class AodLyricCanvasView(
             // 无歌曲信息行:整块顶锚,两端余量都从放置区间让出(底部余量与卡片长高同源,
             // 卡片变高后块尾自然离裁剪沿 effectNeeds.bottomPx)。
             val topPadding = padTop.toFloat() + effectNeeds.topPx
-            val bottomPadding = oh - padBottom - effectNeeds.bottomPx
+            val bottomPadding = oh - contentBottomInset() - effectNeeds.bottomPx
             val available = (bottomPadding - topPadding).coerceAtLeast(0f)
             // issue #63:横屏时行堆叠轴经 90° 旋转映射为画布的视觉横轴,沿用竖屏的 TOP 会让
             // 内容整块贴向画布一侧(现场实测偏约 185px)。横屏的最终摆放统一交给
@@ -3118,7 +3632,7 @@ internal class AodLyricCanvasView(
         }
         // 区间起点必须与高度同源:只减高度、起点仍取 padTop 会让整块偏向一侧 safeInset 像素
         // (全屏化放大后偏移同步放大),现场表现为「横屏全屏化后歌词不在正中间」。
-        val region = landscapeSafeRegion(oh, padTop, padBottom, safeInset)
+        val region = landscapeSafeRegion(oh, padTop, contentBottomInset(), safeInset)
         val available = region.height
         val blockHeight = maxBottom - minTop
         val offset = landscapeBlockAnchorOffset(
@@ -3584,7 +4098,7 @@ internal class AodLyricCanvasView(
     private fun duetSharedScale(state: LayoutState): Float {
         if (state.duet == null) return 1f
         val total = state.rows.sumOf { (it.row.height + it.row.gapBefore).toDouble() }.toFloat()
-        val available = (oh - padTop - padBottom).coerceAtLeast(1).toFloat()
+        val available = (oh - padTop - contentBottomInset()).coerceAtLeast(1).toFloat()
         return duetSharedFitScale(total, available)
     }
 
@@ -4046,7 +4560,8 @@ internal class AodLyricCanvasView(
                 x = line.startX,
                 width = line.width,
                 baseline = lineBaseline,
-                height = originalLayout.lineHeight
+                height = originalLayout.lineHeight,
+                fullText = content.original
             )
             precedingWidth += line.width
             precedingRuby += line.rubyHeight
@@ -4065,7 +4580,7 @@ internal class AodLyricCanvasView(
             wallClockMs = SystemClock.elapsedRealtime(),
             deltaMs = 0L,
             frameIndex = 0L,
-            lineText = lines.firstOrNull()?.text ?: "",
+            lineText = content.original,
             lineStartMs = blockStartMs,
             lineEndMs = blockEndMs,
             lineProgress = timedWordProgress(position, blockStartMs, blockEndMs).coerceIn(0f, 1f),
@@ -4080,6 +4595,22 @@ internal class AodLyricCanvasView(
             blockWidth = blockWidth,
             blockHeight = originalLayout.stackedHeight
         )
+        // 盒模型模式:程序输出定位盒,由统一渲染器绘制(实机/预览同一条渲染路径);
+        // 失败不提交部分盒,也不回退内置路径(与直绘程序失败语义一致)。
+        if (program.outputMode == EFFECT_OUTPUT_BOXES) {
+            val boxes = runCatching {
+                EffectVm(program).collectBoxes(context, boxTextMeasurer())
+            }.getOrNull()
+            if (boxes != null) {
+                EffectBoxRenderer.draw(canvas, boxes, originalPaint, decorSpriteProvider)
+            } else {
+                HookLogger.iThrottled("effect-box-block", 2_000L, "AodLyricCanvasView") {
+                    "effect box block aborted (${program.code.size} instructions, " +
+                        "lines=${lines.size} words=${allWords.size})"
+                }
+            }
+            return
+        }
         val sink = AndroidEffectRenderSink(canvas, originalPaint, colors)
         val rendered = runCatching {
             EffectVm(program).render(context, sink)
@@ -4092,6 +4623,20 @@ internal class AodLyricCanvasView(
                     "lines=${lines.size} words=${allWords.size})"
             }
         }
+    }
+
+    /** 装饰素材 provider:用户导入贴图(配置回调注册表)优先,其次内置素材。 */
+    private val decorSpriteProvider by lazy {
+        hookSpriteProvider(fontContext ?: context)
+    }
+
+    /** 盒模式文本测量探针:复用主 Paint 的字体/字距测量态,只改字号。 */
+    private val boxMeasurePaint by lazy { Paint(originalPaint) }
+
+    /** 盒模式 `measureText` 的宿主测量实现(VM 侧计入 draw 预算;measureText 与对齐无关)。 */
+    private fun boxTextMeasurer() = EffectTextMeasurer { text, sizePx, _ ->
+        boxMeasurePaint.textSize = sizePx
+        boxMeasurePaint.measureText(text)
     }
 
     /**
@@ -4175,7 +4720,10 @@ internal class AodLyricCanvasView(
         bright: Boolean = true
     ) {
         rubyPaint.color = resolvedPalette.secondaryText
-        rubyPaint.alpha = (255f * steadyTextAlpha(if (bright) 1f else 0.35f)).toInt()
+        rubyPaint.alpha = scaledAlpha(
+            resolvedPalette.secondaryText,
+            steadyTextAlpha(if (bright) 1f else 0.35f)
+        )
         val gap = line.rubyHeight + rubyPaint.fontMetrics.ascent
         val baseline = baseBaseline + originalPaint.fontMetrics.ascent -
             gap - rubyPaint.fontMetrics.descent
@@ -4201,12 +4749,49 @@ internal class AodLyricCanvasView(
         return save
     }
 
-    private fun frameInterval(): Long = frameIntervalForTiming(
-        effectiveCadenceActive(),
-        timingActive = true,
-        powerSaverActive = powerSaverProvider(),
-        refreshRateCapHz = refreshRateCapProvider()
-    )
+    private fun frameInterval(): Long {
+        val transitionActive = content.speed > 0f &&
+            (exitSnapshot != null || duetExitSnapshot != null)
+        // 频谱单独出帧时不需要跟歌词逐字动画同帧率：AOD 10fps、锁屏 30fps。
+        // 系统省电/过热时再降一半；其它驱动的 16ms/扫光/过渡节奏保持不变。
+        if (effectiveCadenceActive() && spectrumDrawingActive() && !nonSpectrumAnimationActive()) {
+            val base = if (surfaceKind == LyricSurfaceKind.AOD) {
+                SPECTRUM_AOD_FRAME_INTERVAL_MS
+            } else {
+                SPECTRUM_LOCK_FRAME_INTERVAL_MS
+            }
+            return if (powerSaverProvider()) base * 2L else base
+        }
+        val base = frameIntervalForTiming(
+            effectiveCadenceActive(),
+            timingActive = true,
+            // 退场过渡很短:即使省电档也保持完整帧率，保证淡出不被粗步进截断。
+            // 主行与并发行退场都走 saveLayerAlpha，必须在同一例外内；暂停时过渡冻结
+            // (speed=0)不享受例外，避免暂停画面在省电档被拉回 60fps 空转。
+            exitTransitionActive = transitionActive,
+            powerSaverActive = powerSaverProvider(),
+            refreshRateCapHz = refreshRateCapProvider()
+        )
+        // 纯行级扫光限到约 24fps；逐字/圆点/旋转/换场不受此限，静态仍为 0 帧。
+        return lineSweepFrameIntervalMs(
+            baseIntervalMs = base,
+            lineSweepOnly = lineSweepOnlyCached,
+            transitionActive = transitionActive
+        )
+    }
+
+    /** 除频谱外，是否还有需要 16ms 帧循环的驱动（逐字、过渡、封面旋转、间奏圆点等）。 */
+    private fun nonSpectrumAnimationActive(): Boolean =
+        timingEffectActive() || exitSnapshot != null || duetExitSnapshot != null ||
+            artworkSpinActive() || handoffActive || duetJoinStartedAt != 0L ||
+            interludeDotsAnimating(
+                window = interludeDotsWindowOf(
+                    content.interludeDotsStartMs,
+                    content.interludeDotsEndMs
+                ),
+                positionMs = projectedPosition(),
+                speed = content.speed
+            )
 
     private fun effectiveCadenceActive(): Boolean = isEffectiveCadenceActive(
         attached = isAttachedToWindow,
@@ -4218,7 +4803,8 @@ internal class AodLyricCanvasView(
         // 圆形封面旋转与行级时间轴/过渡同待遇:驱动帧循环推进旋转角,隐藏即停。
         // 并发行自己的换行过渡(挂钟驱动)同样要帧循环才走得完,与主行过渡同待遇。
         timedOrTransitionActive = timingEffectActive() || exitSnapshot != null ||
-            duetExitSnapshot != null || artworkSpinActive() || interludeDotsAnimating(
+            duetExitSnapshot != null || artworkSpinActive() || spectrumDrawingActive() ||
+            interludeDotsAnimating(
                 window = interludeDotsWindowOf(
                     content.interludeDotsStartMs,
                     content.interludeDotsEndMs
@@ -4232,11 +4818,80 @@ internal class AodLyricCanvasView(
 
     private fun timingEffectActive(): Boolean = timingEffectEnabled
 
+    /**
+     * 当前内容的唤醒需求画像：供 AOD surface 决定是否连续续期 mWakeLock。
+     *
+     * 只读已缓存的布局/内容，不触发重排版；行级扫光被归到 [AodWakeContentProfile.lineSweep]，
+     * 由测试包的“内容变化短脉冲”策略处理，不计入 [AodWakeContentProfile.continuousAnimation]。
+     */
+    fun wakeContentProfile(): AodWakeContentProfile {
+        val speed = content.speed
+        val timed = layout.original.timed || hasTimedWordWindows(content.words)
+        val plan = planOriginalLine(
+            animationMode = content.animationMode,
+            timed = timed,
+            lineLevelSync = content.lineLevelSync,
+            lineSyncFillMode = content.lineSyncFillMode,
+            lineStartMs = content.lineStartMs,
+            lineEndMs = content.lineEndMs,
+            hasWordEffect = content.wordEffect != null
+        )
+        val auxKaraoke = content.secondaryWordKaraoke && hasFirstLineAuxText(
+            content.secondaryMode,
+            content.romanized,
+            content.translated
+        )
+        val wordKaraoke = speed > 0f && plan.path == OriginalLinePath.WORD_KARAOKE
+        val lineSweep = speed > 0f && timingEffectEnabled &&
+            plan.path == OriginalLinePath.BLOCK_SWEEP && !wordKaraoke
+        val dots = interludeDotsAnimating(
+            window = interludeDotsWindowOf(
+                content.interludeDotsStartMs,
+                content.interludeDotsEndMs
+            ),
+            positionMs = projectedPosition(),
+            speed = speed
+        )
+        val profile = AodWakeContentProfile(
+            wordKaraoke = wordKaraoke,
+            lineSweep = lineSweep,
+            interludeDots = dots,
+            artworkSpin = artworkSpinActive(),
+            lineTransition = speed > 0f && (exitSnapshot != null || duetExitSnapshot != null),
+            wordEffect = content.wordEffect != null,
+            auxKaraoke = auxKaraoke,
+            paused = speed <= 0f
+        )
+        lineSweepOnlyCached = profile.lineSweepOnly
+        return profile
+    }
+
     /** 渲染停摆看门狗用:最后一次真实 onDraw 的 elapsedRealtime 时刻,0 表示尚未绘制过。 */
     fun lastDrawAtElapsedMs(): Long = lastDrawAtElapsedMs
 
-    /** 渲染停摆看门狗用:当前内容是否带行级时间轴(播放中本应持续重绘)。 */
-    fun isTimingEffectActive(): Boolean = timingEffectEnabled
+    /** 渲染停摆看门狗用:当前内容是否带行级时间轴或活跃频谱(播放中本应持续重绘)。 */
+    fun isTimingEffectActive(): Boolean = timingEffectEnabled || spectrumDrawingActive()
+
+    /**
+     * 频谱是否还需要继续出帧：收到新帧后的新鲜窗口，或柱体/峰值尚未衰减到零。
+     * 纯 UI 线程访问（setSpectrum/onDraw 都在主线程）。
+     */
+    private fun spectrumDrawingActive(): Boolean {
+        if (!spectrumSpec.enabled) return false
+        val now = SystemClock.elapsedRealtime()
+        val rhythmFallback = spectrumSpec.source == "rhythm" ||
+            spectrumSpec.source == "loopback" && spectrumReceivedAt == 0L
+        if (rhythmFallback) {
+            if (playbackActive) return true
+        } else if (spectrumActive && spectrumReceivedAt > 0L &&
+            now - spectrumReceivedAt <= SpectrumContract.MAX_FRAME_AGE_MS
+        ) {
+            return true
+        }
+        for (value in spectrumDisplay) if (value > 0.008f) return true
+        for (value in spectrumPeaks) if (value > 0.008f) return true
+        return false
+    }
 
     private fun effectiveAlpha(): Float {
         var value = alpha * transitionAlpha
@@ -4889,7 +5544,7 @@ internal class AodLyricCanvasView(
             if (row.kind == RowKind.METADATA) {
                 val paint = line.paint ?: row.paint
                 paint.color = resolvedPalette.metadataText
-                paint.alpha = 255
+                paint.alpha = scaledAlpha(resolvedPalette.metadataText, 1f)
                 canvas.drawText(line.text, line.startX, lineBaseline, paint)
             } else if (row.kind == RowKind.NEXT_LINE) {
                 drawNextLine(canvas, row.paint, line.text, line.startX, lineBaseline)
@@ -5060,7 +5715,7 @@ internal class AodLyricCanvasView(
         color: Int
     ) {
         paint.color = color
-        paint.alpha = (255f * (steadyTextAlpha(factor) * brightness).coerceIn(0f, 1f)).toInt()
+        paint.alpha = scaledAlpha(color, steadyTextAlpha(factor) * brightness)
     }
 
     private fun drawGlowHalo(
@@ -5085,7 +5740,7 @@ internal class AodLyricCanvasView(
         // 硬件加速下 shadow+shader 同置导致发光丢失的问题。
         paint.shader = null
         paint.color = glowColor
-        paint.alpha = (GLOW_HALO_ALPHA * intensity).roundToInt().coerceIn(0, 255)
+        paint.alpha = scaledAlpha(glowColor, GLOW_HALO_ALPHA / 255f * intensity)
         paint.setShadowLayer(
             paint.textSize * GLOW_HALO_RADIUS * intensity,
             0f,
@@ -5146,7 +5801,7 @@ internal class AodLyricCanvasView(
             setTextAlpha(paint, staticSecondaryTextFactor(content.secondaryTextBright), 1f, color)
         } else {
             paint.color = color
-            paint.alpha = (255f * staticNextLineTextFactor()).toInt()
+            paint.alpha = scaledAlpha(color, staticNextLineTextFactor())
         }
         paint.shader = null
         paint.clearShadowLayer()
@@ -5320,6 +5975,12 @@ internal class AodLyricCanvasView(
     )
 
     companion object {
+        /**
+         * 盒模型效果的垂直外扩余量(em):盒可在整块内自由摆放/变换,上界无法静态推出,
+         * 放置与自适应测量按此保守常量让位;绘制期仍有整帧裁剪兜底(frameClipBounds)。
+         */
+        private const val BOX_MODE_VERTICAL_OVERDRAW_EM = 2f
+
         /** 对唱并发行加入淡入时长(毫秒);期间静音态绘制,完成恢复共享发光管线。 */
         private const val DUET_JOIN_FADE_MS = 180L
 
@@ -5341,5 +6002,13 @@ internal class AodLyricCanvasView(
         private const val SYNTHETIC_RUN_CACHE_CAPACITY = 12
         /** 扫光块行集合缓存容量:主行块与并发行块各一,容量 4 足够且保持有界。 */
         private const val GLOW_ROWS_CACHE_CAPACITY = 4
+
+        private const val SPECTRUM_ATTACK = 0.55f
+        private const val SPECTRUM_RELEASE = 0.20f
+        private const val SPECTRUM_PEAK_DECAY = 0.018f
+        private const val SPECTRUM_FADE_MS = 500f
+        /** 频谱单独出帧的省电间隔：AOD 10fps，锁屏 30fps（系统省电时再减半）。 */
+        private const val SPECTRUM_AOD_FRAME_INTERVAL_MS = 100L
+        private const val SPECTRUM_LOCK_FRAME_INTERVAL_MS = 33L
     }
 }

@@ -254,9 +254,18 @@
 | 字段 | 类型 | 约束 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `version` | int | 必须为 `1` | `1` | 程序格式版本 |
-| `constants` | array | ≤64 项 | `[]` | 常量池 |
-| `code` | array | 1..512 条 | 必填 | 指令序列 |
+| `constants` | array | ≤128 项 | `[]` | 常量池 |
+| `code` | array | 1..1024 条 | 必填 | 指令序列 |
 | `maxLocals` | int | 0..24 | `16` | 局部变量槽数量 |
+| `wordOverrides` | array | ≤256 项 | `[]` | 逐词手动排版覆盖表（见下） |
+
+`wordOverrides` 的每一项是
+`{ "line": 0, "word": 0, "lineText": "", "dx": 0, "dy": 0, "scale": 1, "rotate": 0, "alpha": 1 }`：
+`lineText` 非空时按「整首歌词行文本 + 词号」匹配（跨折行稳定），否则按「视觉行号 + 词号」。
+供 `wordOverride` 指令读取（弹 `lineText, line, word`，压 `dx,dy,scale,rotate,alpha`）。
+`dx`/`dy` 以 em 为单位（绝对值 ≤20），`scale` 0.05..8，`rotate` 单位度（绝对值 ≤720），
+`alpha` 0..1，`lineText` ≤256 字符；非有限值或越界直接拒绝。表项按
+`48 + lineText 长度` 字节计入程序估算预算，不占指令数。
 
 常量项是 `{ "type": "number" | "string" | "bool", "value": "..." }`。`type` 省略时按
 `number` 解释；number 必须是有限数；string 最长 256 字符；bool 只接受 `"true"` / `"false"`。
@@ -418,6 +427,7 @@
 | `drawRoundRect` | `x y w h rx ry` → | 绘制圆角矩形；`rx` / `ry` 负数按 0 |
 | `drawOval` | `x y w h` → | 绘制椭圆 |
 | `drawArc` | `x y w h start sweep` → | 绘制圆弧；角度单位为度 |
+| `drawSprite` | `id x y w h` → | 绘制**装饰素材**：`id` 0..63 为内置固定注册表，64..255 为用户导入贴纸；素材为透明 PNG，按当前颜色着色（SRC_IN）。越界编号静默丢弃，不整帧失败 |
 | `pathMove` | `x y` → | 路径移动到 |
 | `pathLine` | `x y` → | 路径连线到 |
 | `pathQuad` | `cx cy x y` → | 二次贝塞尔曲线到 `(x, y)`，控制点 `(cx, cy)` |
@@ -435,6 +445,7 @@
 | op | 栈 | 语义 |
 | --- | --- | --- |
 | `measureText` | `text` → `width` | 测量文字宽度（像素） |
+| `wordOverride` | `lineText line word` → `dx dy scale rotate alpha` | 查逐词覆盖表（文本优先，行号兜底）；未命中压入恒等值 `0 0 1 0 1` |
 | `end` | → | 正常结束本帧，返回成功 |
 
 ### 10.4 最小示例
@@ -503,7 +514,7 @@ done:
 
 实际程序用槽 0–5 保存 `i`、`count`、`cx`、`cy`、`p`、`s`，用槽 7 保存 `word(i)` 的词引用
 （槽 6 未用），所以 `maxLocals = 8`。`program_bounce` 为 70 条指令、7 个常量；
-`program_spin` 为 57 条指令、5 个常量、`maxLocals = 5`。两者都远低于 512 条上限。
+`program_spin` 为 57 条指令、5 个常量、`maxLocals = 5`。两者都远低于 1024 条上限。
 这两个是早期逐词示例，按单行布局编写，使用首行基线（`globalField baseline`）；
 多行块应参考下面的整块示例。
 
@@ -590,9 +601,9 @@ for i in 0..27:
   渲染线程，但会持续烧预算，应避免。
 - **native 资源上限**：save 深度 ≤16，单条路径 ≤4096 点；`restore` 不会越过 VM 开始时的
   Canvas 深度，VM 结束后宿主会把未配对的 save 全部弹掉。
-- **程序规模**：`code` 1..512 条，`constants` ≤64 项，`maxLocals` 0..24，操作数栈 ≤64。
+- **程序规模**：`code` 1..1024 条，`constants` ≤128 项，`maxLocals` 0..24，操作数栈 ≤64。
   常量字符串 ≤256 字符且过不安全字符串扫描；number 必须有限；版本必须为 `1`。未知 op、
-  未知字段名、越界的常量下标/局部槽/跳转目标都会使该效果被拒绝。保守估算字节数 ≤12 KiB，
+  未知字段名、越界的常量下标/局部槽/跳转目标都会使该效果被拒绝。保守估算字节数 ≤16 KiB，
   保证锁屏 + AOD 各带一份时仍留在配置 64 KiB 内；`tools/assemble_effect_program.py`
   会在组装时提前拒绝超过该估算的程序。
 - **坐标与状态钳制**：`translate` 的 x/y 钳制到 ±10,000 像素；`rotate` 钳制到 ±7,200 度；
@@ -604,7 +615,7 @@ for i in 0..27:
 - **与 64 KiB 的关系**：效果包导入上限是 64 KiB（`WordEffectPackStore.MAX_PACK_BYTES`）；
   选中效果后整份规格会写进 `SurfaceProfile.wordEffect`，随配置文档下发，而
   `SceneCompiler.MAX_CONFIG_BYTES` 同样是 64 KiB。程序 JSON 是逐条指令的对象数组：
-  紧凑编码下 512 条指令约 17–20 KiB；如果包文件按缩进格式保存，同样规模约 36–41 KiB，
+  紧凑编码下 1024 条指令约 34–40 KiB（编辑器导出使用紧凑 JSON）；如果按缩进格式保存，同样规模约 72–80 KiB，会超过 64 KiB 包上限，
   两个满编效果就会逼近整包上限。因此要**共享常量、复用局部槽、避免长字符串常量**，
   否则程序会挤占同一份配置里其他外观字段或其它效果的空间。
   `tools/assemble_effect_program.py` 会打印生成包的实际字节数。
@@ -667,5 +678,111 @@ program = assemble(
 工具里的 op 白名单、字段白名单与数值上限均从 `EffectProgram.kt` 复制（含 `lineCount` /
 `line` / `lineAtField`、全部新绘制/状态原语与 `blockWidth` / `blockHeight` 等字段）；
 静态栈深检查会沿所有跳转路径验证栈平衡，能提前发现“少压一个参数”或“循环出口栈深不一致”
-这类错误。它还会校验 12 KiB 估算字节数，并打印每个程序的指令数、常量数、绘制指令数与
+这类错误。它还会校验 16 KiB 估算字节数，并打印每个程序的指令数、常量数、绘制指令数与
 整包字节数。
+
+## 11. 盒模型输出模式（Boxes Output Mode）
+
+第 1–10 节的**直绘模式**（`outputMode` 缺省 `"draw"`）让程序逐帧直接调用受控绘制原语。
+本节是第二种输出模式：程序不再触碰画布，而是**输出一组定位盒**，由宿主统一渲染。
+
+### 11.1 程序字段
+
+```json
+{
+  "version": 1,
+  "outputMode": "boxes",
+  "constants": [...],
+  "code": [...],
+  "maxLocals": 8
+}
+```
+
+| 取值 | 行为 |
+| --- | --- |
+| `"draw"`（缺省） | 直绘：经 `EffectRenderSink` 直接调用绘制原语（第 10 节语义，逐字节不变）。 |
+| `"boxes"` | 盒模型：绘制指令被翻译成盒数据；宿主在绘制线程按盒统一渲染。 |
+
+- 归一化时未知值回落 `"draw"`（幂等；App 编译与 SystemUI 校验两侧结果一致，
+  不触发 `validate_rewrote_fields`）。
+- 旧程序没有该字段，解码为缺省 `"draw"`，**零迁移**。
+- 直绘入口 `EffectVm.render()` 拒绝执行 `"boxes"` 程序；盒入口 `EffectVm.collectBoxes()`
+  拒绝执行 `"draw"` 程序——模式互斥由 VM 强制，误用视为失败而非静默换道。
+
+### 11.2 指令语义
+
+与直绘完全同一套指令集与预算（100k 步/帧、4096 次绘制/测量/状态调用/帧），差别只在
+绘制/状态指令的**去向**：
+
+| 指令 | 盒模式行为 |
+| --- | --- |
+| `setColor` / `setAlpha` / `setTextSize` / `setTextAlign` / `setGradient` / `clearGradient` / `setShadow` / `clearShadow` / `setStrokeWidth` / `setFill` / `setStroke` | 更新「当前绘制状态」；emit 时快照进盒。 |
+| `save` / `restore` / `translate` / `rotate` / `scale` | 维护矩阵栈（深度上限 16，后乘语义与 Canvas 一致）；每次绘制 emit 时把**完整 6 元素矩阵**烘焙进盒。存完整矩阵而不是平移/旋转/缩放三元组：rotate→scale→rotate 一类序列会产生错切，分解会失真。 |
+| `drawText` / `drawRect` / `drawRoundRect` / `drawCircle` / `drawLine` / `drawOval` / `drawArc` | 生成对应类型盒（几何 + 状态快照 + 烘焙矩阵）。线段强制描边（与直绘一致）。 |
+| `drawSprite` | 生成贴图盒（素材编号 + 几何 + 状态快照 + 烘焙矩阵）；编号越界丢弃该盒。 |
+| `pathMove` / `pathLine` / `pathQuad` / `pathCubic` / `pathClose` / `drawPath` | 累积路径段；`drawPath` 时打包成路径盒并清空。 |
+| `clipRect` | no-op（盒可被自由摆放，逐盒裁剪语义与 MV 排版冲突；仍计入 draw 预算）。 |
+| `measureText` | 由宿主提供文本测量（计入 draw 预算），与对齐无关。 |
+
+### 11.3 盒类型与字段
+
+全部为纯数据（基础类型/字符串/数值），不含 Android `Paint`/`Path`/`Shader` 对象，
+不能指定类、资源、方法、路径、URL——与第 9 节信任边界一致：
+
+| 盒类型 | 字段 |
+| --- | --- |
+| `text` | `text` / `x` / `baseline`（y 为基线，与直绘 `drawText` 同约定） |
+| `rect` / `roundRect` / `oval` / `arc` | 左上角 `x/y` + `width/height`（roundRect 另有 `rx/ry`，arc 另有 `startAngle/sweepAngle`） |
+| `sprite` | `spriteId`（素材编号：0..63 内置，64..255 用户导入）+ 左上角 `x/y` + `width/height` |
+| `circle` | 圆心 `cx/cy` + `radius` |
+| `line` | `x1/y1/x2/y2` |
+| `path` | 有序段列表：`kind`（0=move 1=line 2=quad 3=cubic 4=close）+ 段参数 |
+
+每盒附带：
+
+- `paint`：`color` / `alpha` / `textSize` / `align` / `style`（0=fill 1=stroke）/
+  `strokeWidth` / `gradient`（六参数线性渐变，可空）/ `shadow`（radius/dx/dy/color，`set=false` 表示无）；
+- `transform`：`m0..m5` 完整仿射矩阵（行主序，列向量点变换
+  `x' = m0·x + m1·y + m2; y' = m3·x + m4·y + m5`）。
+
+坐标仍为程序坐标空间（逻辑画布像素）；变换由宿主渲染器在绘制期对每盒
+`save → concat 矩阵 → 绘制 → restore`，因此**与直绘的 Canvas 矩阵语义逐值一致**——
+同一段程序在两种模式下落点相同。
+
+### 11.4 盒预算与失败语义
+
+| 预算 | 上限 | 超限行为 |
+| --- | --- | --- |
+| 单帧盒数 | 512 | 收集失败 |
+| 单路径盒段数 | 256 | 收集失败 |
+| 单帧路径总段数 | 4096 | 收集失败 |
+| 单文字盒字符数 | 512 | 收集失败 |
+| 矩阵栈深度 | 16 | 超出部分静默忽略（与直绘 save 上限一致） |
+| 步数 / 绘制调用 / 程序字节 | 与直绘相同 | 执行失败 |
+
+失败语义优于直绘：**collectBoxes 返回 null，不提交部分盒**（直绘程序中止时可能留下
+已画的部分输出；盒模式要么整帧成功、要么整帧不画）。宿主对 null 只记节流日志，
+不回退内置路径（与直绘失败语义一致）。
+
+### 11.5 宿主渲染与三端一致
+
+- 实机与 App 预览共用 `EffectBoxRenderer`（App 侧统一渲染器），Studio 编辑器用
+  Canvas2D 版 `drawBoxesOnContext`——三端同一份求值（VM 逐值一致，有 golden 对拍）+
+  同一套盒→绘制映射。
+- 放置与自适应测量：盒模式的垂直外扩取保守常量 2em（`BOX_MODE_VERTICAL_OVERDRAW_EM`，
+  并入 `effectEdges`，与 DSL 估算取大者）；绘制期仍有整帧裁剪兜底。盒可超出歌词块，
+  但不会越出画布表面——与直绘程序同政策。
+- 字体/字距继承宿主主 Paint（盒模式暂无 `setTypeface` / `setLetterSpacing` 指令）。
+
+### 11.6 编辑器支持
+
+Word Effect Studio 的程序编辑器提供「输出模式」选择（draw / boxes）；汇编器编译时把
+所选模式写入 `program.outputMode`，导入/导出/复制/模板均保留。盒模式下编辑器预览走
+收集器 + 盒渲染器，预算超限与实机同样整块不绘制并提示。
+- 贴图编号池：0..63 为**内置素材**（`assets/deco/<id>.png`，随模块 APK 分发）；64..255 为**用户导入贴纸**——用户在 App「外观 → 自定义贴纸」导入，导入时解码校验、等比缩到 ≤1024 像素并重编码 PNG（剥元数据）存入 app 私有目录。发布配置时字节经只读 `ParcelFileDescriptor` 随配置 Bundle 下发，SystemUI 按 sha256 与尺寸/像素预算校验后才解码；效果文档里只出现编号，**不出现任何文件路径或 URL**。
+- 手动排版：Word Effect Studio 的「手动排版」面板把锚点与逐词覆盖写入 `program.wordOverrides`
+  （数值 + 行文本，≤256 条）；程序用 `wordOverride` 指令按「行文本优先、视觉行号兜底」读取，未命中返回恒等值。
+  覆盖表不占指令数，但与指令共用 16 KiB 估算预算（48 字节/条）；旧版 App 不认识该指令，需同步升级。
+- 手动贴纸：贴纸层编译为 `drawSprite`（画在文字之前），支持漂浮/呼吸/旋转/明暗/入场弹出
+  （公式基于 `globalField time`，导出后实机同源）。网页端可为本机预览导入图片，图片只存进
+  工程 JSON、**不进效果包**；实机仍需在 App「自定义贴纸」导入同一张图并使用同编号。
